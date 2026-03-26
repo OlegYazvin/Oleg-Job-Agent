@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-agent"
+version = "0.1.0"
+description = "Daily agentic workflow for direct ATS job discovery and LinkedIn outreach drafting."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "httpx>=0.28.1",
+  "openai>=2.25.0",
+  "openai-agents>=0.2.1",
+  "playwright>=1.54.0",
+  "pyotp>=2.9.0",
+  "python-docx>=1.1.2",
+  "python-dotenv>=1.0.1",
+  "pydantic>=2.10.0",
+  "selenium>=4.41.0",
+  "tenacity>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+job-agent = "job_agent.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

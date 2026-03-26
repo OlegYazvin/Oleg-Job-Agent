@@ -1,0 +1,42 @@
+{
+  "manifest_version": 2,
+  "name": "Job Agent LinkedIn Bridge",
+  "version": "0.1.0",
+  "description": "Captures LinkedIn people search and message history data from Firefox and sends it to the local Job Agent bridge.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://www.linkedin.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.linkedin.com/search/results/people/*"],
+      "js": ["content_search.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.linkedin.com/messaging/*"],
+      "js": ["content_messaging.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.linkedin.com/in/*", "https://www.linkedin.com/messaging/*"],
+      "js": ["content_compose.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_action": {
+    "default_title": "Job Agent LinkedIn Bridge",
+    "default_popup": "popup.html"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "job-agent-linkedin-bridge@local"
+    }
+  }
+}

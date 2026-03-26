@@ -1,0 +1,191 @@
+:root {
+  --paper: #f4efe6;
+  --card: #fffaf2;
+  --ink: #1e1d1a;
+  --muted: #6d6559;
+  --line: #d6c9b5;
+  --accent: #194d45;
+  --accent-soft: #dfeee9;
+  --secondary: #6f5d43;
+  --secondary-soft: #efe5d7;
+}
+
+body {
+  margin: 0;
+  font: 14px/1.45 Georgia, "Times New Roman", serif;
+  background:
+    radial-gradient(circle at top right, rgba(25, 77, 69, 0.16), transparent 34%),
+    linear-gradient(180deg, #f7f3ea 0%, var(--paper) 100%);
+  color: var(--ink);
+}
+
+.popup {
+  width: 380px;
+  max-height: 640px;
+  overflow: auto;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.hero {
+  margin-bottom: 14px;
+}
+
+.eyebrow,
+.panel-eyebrow {
+  margin: 0 0 4px;
+  color: var(--secondary);
+  font: 600 11px/1.2 "Trebuchet MS", "Gill Sans", sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 700;
+}
+
+h1 {
+  font-size: 24px;
+  line-height: 1.05;
+}
+
+h2 {
+  font-size: 18px;
+  line-height: 1.1;
+}
+
+.subhead,
+.meta,
+.status {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.panel {
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(255, 250, 242, 0.96), rgba(250, 244, 235, 0.98));
+  box-shadow: 0 10px 24px rgba(56, 42, 20, 0.08);
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.field,
+.checkbox {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.field span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.checkbox {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.checkbox span {
+  color: var(--ink);
+}
+
+input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fffdfa;
+  color: var(--ink);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+button {
+  flex: 1;
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  font: 600 13px/1.2 "Trebuchet MS", "Gill Sans", sans-serif;
+}
+
+button.secondary {
+  background: var(--secondary);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: 700 13px/1 "Trebuchet MS", "Gill Sans", sans-serif;
+}
+
+.draft-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.draft-card {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.draft-card h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.draft-role,
+.draft-targets,
+.draft-history,
+.draft-preview {
+  margin: 4px 0 0;
+}
+
+.draft-role,
+.draft-targets,
+.draft-history {
+  color: var(--muted);
+}
+
+.draft-preview {
+  color: var(--ink);
+}
+
+.draft-card .actions {
+  margin-top: 12px;
+}

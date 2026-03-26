@@ -1,0 +1,4994 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from html import unescape
+import json
+import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
+
+from agents import Agent, Runner, WebSearchTool
+from bs4 import BeautifulSoup
+import httpx
+
+from .config import Settings
+from .criteria import DEFAULT_ROLE_SEARCH_PROFILE
+from .history import (
+    load_company_watchlist_entries,
+    load_previously_reported_company_keys,
+    load_previously_reported_job_keys,
+)
+from .job_pages import USER_AGENT, JobPageSnapshot, fetch_job_page
+from .llm_provider import LLMProviderError, OllamaStructuredProvider
+from .models import DirectJobResolution, JobLead, JobLeadSearchResult, JobPosting, SearchDiagnostics, SearchFailure, SearchPassSummary
+from .status import StatusReporter
+from .storage import save_json_snapshot
+
+
+ALLOWED_JOB_HOST_FRAGMENTS = (
+    "greenhouse.io",
+    "job-boards.greenhouse.io",
+    "boards.greenhouse.io",
+    "jobs.lever.co",
+    "lever.co",
+    "ashbyhq.com",
+    "myworkdayjobs.com",
+    "jobvite.com",
+    "smartrecruiters.com",
+    "workable.com",
+    "icims.com",
+    "bamboohr.com",
+    "dayforcehcm.com",
+    "recruiting.paylocity.com",
+    "adp.com",
+    "paylocity.com",
+    "ultipro.com",
+    "portal.dynamicsats.com",
+)
+
+BLOCKED_JOB_HOST_FRAGMENTS = (
+    "linkedin.com",
+    "indeed.com",
+    "ziprecruiter.com",
+    "glassdoor.com",
+    "builtin.com",
+    "builtinchicago",
+    "wellfound.com",
+    "monster.com",
+    "careerbuilder.com",
+    "dice.com",
+    "simplyhired.com",
+    "talent.com",
+    "jooble.org",
+    "adzuna.com",
+    "remoteok.com",
+    "otta.com",
+    "startup.jobs",
+    "employbl.com",
+    "weloveproduct.co",
+    "jobsora.com",
+    "jobgether.com",
+    "themuse.com",
+    "welcometothejungle.com",
+    "joinhandshake.com",
+    "remoterocketship.com",
+    "getro.com",
+    "fitt.co",
+    "jobright.ai",
+    "grabjobs.co",
+    "disabledperson.com",
+    "apna.co",
+    "publiremote.com",
+    "tealhq.com",
+    "ladders.com",
+    "empllo.com",
+    "thepmrepo.com",
+    "thehomebase.ai",
+    "thesaraslist.com",
+    "jobs.generalcatalyst.com",
+)
+
+JOB_PATH_HINTS = (
+    "/careers/",
+    "/career/",
+    "/jobs/",
+    "/job/",
+    "/openings/",
+    "/positions/",
+    "/apply/",
+    "/requisitions/",
+    "/recruiting/",
+)
+COMPANY_JOB_QUERY_HINTS = (
+    "gh_jid",
+    "gh_src",
+    "jid",
+    "jobid",
+    "job_id",
+    "reqid",
+    "req_id",
+    "requisitionid",
+    "requisition_id",
+    "posting",
+)
+GENERIC_COMPANY_CAREERS_SEGMENTS = {
+    "jobs",
+    "job",
+    "careers",
+    "career",
+    "apply",
+    "applications",
+    "openings",
+    "positions",
+    "join-us",
+    "joinus",
+    "search",
+    "job-search",
+    "search-jobs",
+}
+GENERIC_CAREERS_TAIL_SEGMENTS = {
+    "us",
+    "eu",
+    "uk",
+    "ca",
+    "en",
+    "de",
+    "fr",
+    "es",
+    "apac",
+    "emea",
+    "locations",
+    "culture",
+    "people",
+    "team",
+}
+
+DISCOVERY_SOURCE_PRIORITY = {
+    "direct_ats": 0,
+    "company_site": 1,
+    "linkedin": 2,
+    "builtin": 3,
+    "glassdoor": 4,
+    "other": 5,
+}
+
+RECENCY_REASON_CODES = {"stale_posting", "missing_posted_date"}
+SALARY_REASON_CODES = {"missing_salary", "salary_below_min", "salary_not_base"}
+REMOTE_REASON_CODES = {"not_remote", "remote_unclear"}
+RESOLUTION_REASON_CODES = {"resolution_missing", "resolution_blocked_url", "not_specific_job_page", "fetch_non_200"}
+ADAPTIVE_FOCUS_REASON_CODES = {
+    "resolution_missing",
+    "resolution_blocked_url",
+    "fetch_non_200",
+    "not_specific_job_page",
+    "missing_posted_date",
+    "missing_salary",
+    "salary_below_min",
+    "salary_not_base",
+    "remote_unclear",
+}
+FOCUSABLE_REASON_CODES = {
+    "resolution_missing",
+    "resolution_blocked_url",
+    "fetch_non_200",
+    "not_specific_job_page",
+    "missing_salary",
+    "remote_unclear",
+}
+
+LOCAL_OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
+BUILTIN_PRIMARY_BASE_URL = "https://builtin.com"
+BUILTIN_REGIONAL_BASE_URLS = (
+    "https://www.builtinnyc.com",
+    "https://www.builtinsf.com",
+    "https://www.builtinseattle.com",
+    "https://www.builtinchicago.org",
+    "https://www.builtinla.com",
+)
+BUILTIN_CATEGORY_PAGE_COUNT = 3
+BUILTIN_HTML_CACHE: dict[str, str] = {}
+BUILTIN_LEAD_CACHE: dict[str, JobLead | None] = {}
+GREENHOUSE_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
+SEARCH_ENGINE_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+GOOGLE_HTTP_SEARCH_AVAILABLE: bool | None = None
+LINKEDIN_GUEST_SEARCH_BASE_URL = "https://www.linkedin.com/jobs/search/"
+CAREERS_HUB_HINTS = (
+    "/careers",
+    "/career",
+    "/jobs",
+    "/job",
+    "/openings",
+    "/positions",
+    "/join-us",
+    "/joinus",
+    "/company/careers",
+    "/work-with-us",
+)
+GENERIC_CAREERS_INFO_HINTS = (
+    "recruitment-fraud",
+    "recruitmentfraud",
+    "fraud",
+    "how-we-hire",
+    "how_we_hire",
+    "being-a-",
+    "being a ",
+    "career-listing",
+    "careerlisting",
+    "join?domain=",
+    "join-us",
+    "joinus",
+    "talent-community",
+    "talentcommunity",
+    "candidate/login",
+)
+COMPANY_SITE_JUNK_HOST_FRAGMENTS = (
+    "reddit.com",
+    "stackexchange.com",
+    "stackoverflow.com",
+    "mountainproject.com",
+    "quora.com",
+    "facebook.com",
+    "instagram.com",
+    "youtube.com",
+    "tiktok.com",
+    "pinterest.com",
+)
+COMPANY_RESOLUTION_URL_CACHE: dict[str, list[str]] = {}
+LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES = (
+    ("linkedin.com/jobs/view", "glassdoor.com/Job", "builtin.com/jobs"),
+    ("wellfound.com/jobs", "ziprecruiter.com/jobs", "themuse.com/jobs"),
+    ("monster.com/jobs", "startup.jobs", "jobgether.com"),
+    ("welcometothejungle.com/en/companies", "joinhandshake.com/jobs", "ycombinator.com/companies"),
+    ("dynamitejobs.com/company", "dailyremote.com/remote-job", "remote.io/remote-product-jobs"),
+    ("flexhired.com/jobs", "remoteai.io/roles", "indeed.com/viewjob"),
+)
+LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES = (
+    ("job-boards.greenhouse.io", "boards.greenhouse.io", "jobs.lever.co"),
+    ("jobs.ashbyhq.com", "myworkdayjobs.com", "jobs.smartrecruiters.com"),
+    ("jobs.jobvite.com", "jobs.workable.com", "jobs.icims.com"),
+    ("careers.bamboohr.com", "jobs.dayforcehcm.com", "recruiting.paylocity.com"),
+    ("careers.adp.com", "careers.workday.com"),
+)
+LOCAL_SEARCH_DOMAIN_BATCH_SPAN = 2
+LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT = 3
+LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT = 2
+LOCAL_SEARCH_TOTAL_QUERY_LIMIT = 14
+SEARCH_QUERY_RESULT_CACHE: dict[tuple[str, int], list[tuple[str, str, str]]] = {}
+SEED_LEADS_FILENAME = "seed-leads.json"
+NOVEL_COMPANY_TARGET_RATIO = 0.75
+SMALL_COMPANY_SCOUT_DOMAINS = (
+    "jobs.ashbyhq.com",
+    "jobs.lever.co",
+    "jobs.workable.com",
+    "boards.greenhouse.io",
+    "job-boards.greenhouse.io",
+    "careers.bamboohr.com",
+    "recruiting.paylocity.com",
+    "jobs.dayforcehcm.com",
+    "jobs.smartrecruiters.com",
+)
+SMALL_COMPANY_SCOUT_TOPICS = (
+    "AI",
+    "machine learning",
+    "generative AI",
+    "agentic AI",
+    "applied AI",
+    "LLM",
+    "AI platform",
+    "ML platform",
+)
+
+
+class SearchQueryTimeoutError(asyncio.TimeoutError):
+    def __init__(self, query: str) -> None:
+        super().__init__(f"Timed out while searching query: {query}")
+        self.query = query
+
+
+class SearchQueryExecutionError(RuntimeError):
+    def __init__(self, query: str, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.query = query
+        self.cause = cause
+
+
+class OpenAIQuotaExceededError(RuntimeError):
+    pass
+
+
+class LocalSearchBackendBlockedError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class SearchTuning:
+    attempt_number: int
+    prioritize_recency: bool = False
+    prioritize_salary: bool = False
+    prioritize_remote: bool = False
+    focus_companies: list[str] = field(default_factory=list)
+    focus_roles: list[str] = field(default_factory=list)
+
+
+def _looks_like_company_job_page(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+        return False
+    if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        return _looks_like_direct_ats_job_path(host, path)
+    if any(token in query for token in COMPANY_JOB_QUERY_HINTS):
+        return True
+    if any(hint in f"{path}/" for hint in JOB_PATH_HINTS):
+        return _has_company_job_detail_signal(parsed)
+    if host.startswith(("jobs.", "careers.", "apply.", "join.", "workat.", "recruiting.")):
+        return _has_company_job_detail_signal(parsed)
+    return False
+
+
+def _normalize_direct_job_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path.rstrip("/")
+    query = parsed.query
+
+    if "jobs.lever.co" in host and "/apply" in path:
+        path = path.split("/apply", 1)[0]
+        query = ""
+    elif "ashbyhq.com" in host:
+        segments = _path_segments(path)
+        if len(segments) >= 2:
+            path = "/" + "/".join(segments[:2])
+        elif path.endswith("/application"):
+            path = path[: -len("/application")]
+        query = ""
+    elif "greenhouse.io" in host and path.endswith("/application"):
+        path = path[: -len("/application")]
+        query = ""
+    elif "jobvite.com" in host and path.endswith("/apply"):
+        path = path[: -len("/apply")]
+        query = ""
+    elif any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        query = ""
+
+    if not path:
+        path = "/"
+
+    return urlunparse(parsed._replace(path=path, query=query, fragment=""))
+
+
+def _describe_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _path_segments(path: str) -> list[str]:
+    return [segment for segment in path.strip("/").split("/") if segment]
+
+
+def _has_company_job_detail_signal(parsed_url) -> bool:
+    full = f"{(parsed_url.netloc or '').lower()}{(parsed_url.path or '').lower()}?{(parsed_url.query or '').lower()}"
+    if any(hint in full for hint in GENERIC_CAREERS_INFO_HINTS):
+        return False
+    query = (parsed_url.query or "").lower()
+    if any(token in query for token in COMPANY_JOB_QUERY_HINTS):
+        return True
+
+    segments = _path_segments((parsed_url.path or "").lower())
+    if not segments:
+        return False
+    if len(segments) <= 2 and segments[-1] in GENERIC_CAREERS_TAIL_SEGMENTS:
+        return False
+    if len(segments) >= 2 and all(segment in GENERIC_CAREERS_TAIL_SEGMENTS for segment in segments[-2:]):
+        return False
+
+    last_segment = segments[-1]
+    if last_segment not in GENERIC_COMPANY_CAREERS_SEGMENTS:
+        return any(segment in GENERIC_COMPANY_CAREERS_SEGMENTS for segment in segments[:-1]) or len(segments) >= 2
+    return False
+
+
+def _looks_like_direct_ats_job_path(host: str, path: str) -> bool:
+    normalized_path = (path or "").rstrip("/").lower()
+    segments = _path_segments(normalized_path)
+
+    if "jobs.lever.co" in host:
+        return len(segments) >= 2 and segments[0] != "job-seeker-support"
+
+    if "ashbyhq.com" in host:
+        return len(segments) >= 2 and segments[1] not in {"jobs", "job-board", "careers"}
+
+    if "greenhouse.io" in host:
+        return "jobs" in segments and len(segments) >= 3
+
+    if "smartrecruiters.com" in host:
+        if len(segments) < 2:
+            return False
+        posting_slug = segments[1]
+        return bool(re.search(r"\d{6,}", posting_slug))
+
+    if "myworkdayjobs.com" in host:
+        return "/job/" in f"{normalized_path}/"
+
+    if "jobvite.com" in host:
+        return "/job/" in f"{normalized_path}/"
+
+    if "workable.com" in host:
+        return "/j/" in f"{normalized_path}/" or "/jobs/" in f"{normalized_path}/"
+
+    if "icims.com" in host:
+        return "/jobs/" in f"{normalized_path}/"
+
+    if "portal.dynamicsats.com" in host:
+        return "/joblisting/details/" in f"{normalized_path}/"
+
+    if any(fragment in host for fragment in ("bamboohr.com", "dayforcehcm.com", "paylocity.com", "adp.com", "ultipro.com")):
+        return any(hint in f"{normalized_path}/" for hint in JOB_PATH_HINTS)
+
+    return False
+
+
+def _looks_like_generic_job_url(url: str) -> bool:
+    raw_lower = url.lower()
+    raw_query = (urlparse(url).query or "").lower()
+    if "error=true" in raw_query or "error=true" in raw_lower:
+        return True
+    if any(hint in raw_lower for hint in GENERIC_CAREERS_INFO_HINTS):
+        return True
+
+    normalized_url = _normalize_direct_job_url(url)
+    parsed = urlparse(normalized_url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/").lower()
+
+    if "lever.co" in host and "job-seeker-support" in path:
+        return True
+    if "greenhouse.io" in host and "embed/job_board" in path:
+        return True
+
+    if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        return not _looks_like_direct_ats_job_path(host, path)
+
+    if host.startswith(("careers.", "jobs.", "apply.", "join.", "workat.", "recruiting.")):
+        if not _has_company_job_detail_signal(parsed):
+            return True
+    if any(hint in f"{path}/" for hint in JOB_PATH_HINTS) and not _has_company_job_detail_signal(parsed):
+        return True
+    return path in {"", "/", "/jobs", "/job", "/careers", "/career", "/openings", "/positions", "/global/en"}
+
+
+def _is_allowed_direct_job_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+        return False
+    if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        return True
+    return _looks_like_company_job_page(url)
+
+
+def _looks_like_careers_hub_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/").lower()
+    full = f"{host}{path}?{(parsed.query or '').lower()}"
+    if not host or any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+        return False
+    if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
+        return False
+    if any(hint in full for hint in GENERIC_CAREERS_INFO_HINTS):
+        return False
+    if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        return _looks_like_generic_job_url(url)
+    if host.startswith(("careers.", "jobs.", "apply.", "join.", "workat.", "recruiting.")):
+        return True
+    return any(hint in f"{path}/" for hint in CAREERS_HUB_HINTS)
+
+
+def _looks_like_company_homepage_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/").lower()
+    if not host or any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+        return False
+    if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
+        return False
+    if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        return False
+    return path in {"", "/", "/company", "/about", "/about-us"}
+
+
+def _today_for_timezone(timezone_name: str | None) -> date:
+    if timezone_name:
+        try:
+            return datetime.now(ZoneInfo(timezone_name)).date()
+        except ZoneInfoNotFoundError:
+            pass
+    return datetime.now(UTC).date()
+
+
+def _parse_absolute_posted_date_text(posted_date_text: str | None) -> date | None:
+    if not posted_date_text:
+        return None
+    normalized = posted_date_text.strip()
+    if not normalized:
+        return None
+
+    iso_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", normalized)
+    if iso_match:
+        try:
+            return date.fromisoformat(iso_match.group(0))
+        except ValueError:
+            return None
+
+    month_match = re.search(
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
+        r"january|february|march|april|june|july|august|september|october|november|december)"
+        r"\s+\d{1,2},?\s+\d{4}\b",
+        normalized,
+        re.I,
+    )
+    if not month_match:
+        return None
+
+    for date_format in ("%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(month_match.group(0), date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_recent_enough(
+    posted_date_iso: str | None,
+    posted_date_text: str,
+    max_age_days: int,
+    *,
+    timezone_name: str | None = None,
+) -> bool:
+    today = _today_for_timezone(timezone_name)
+    if posted_date_iso:
+        try:
+            posted_on = date.fromisoformat(posted_date_iso)
+            return posted_on >= today - timedelta(days=max_age_days)
+        except ValueError:
+            pass
+
+    absolute_posted_on = _parse_absolute_posted_date_text(posted_date_text)
+    if absolute_posted_on is not None:
+        return absolute_posted_on >= today - timedelta(days=max_age_days)
+
+    lowered = posted_date_text.lower()
+    if "today" in lowered or "yesterday" in lowered:
+        return True
+    if "this week" in lowered:
+        return True
+
+    day_match = re.search(r"(\d+)\s*(day|days)\b", lowered)
+    if day_match:
+        return int(day_match.group(1)) <= max_age_days
+
+    week_match = re.search(r"(\d+)\s*(week|weeks|wk|wks)\b", lowered)
+    if week_match:
+        return int(week_match.group(1)) * 7 <= max_age_days
+
+    compact_week_match = re.search(r"(\d+)\s*w\b", lowered)
+    if compact_week_match:
+        return int(compact_week_match.group(1)) * 7 <= max_age_days
+
+    return False
+
+
+SENIOR_TITLE_TOKENS = DEFAULT_ROLE_SEARCH_PROFILE.senior_title_tokens
+TITLE_ONLY_SALARY_INFERENCE_TOKENS = DEFAULT_ROLE_SEARCH_PROFILE.title_only_salary_inference_tokens
+AI_SIGNAL_TOKENS = DEFAULT_ROLE_SEARCH_PROFILE.ai_signal_tokens
+AI_STRONG_CONTEXT_TOKENS = DEFAULT_ROLE_SEARCH_PROFILE.ai_strong_context_tokens
+AI_OWNERSHIP_TOKENS = DEFAULT_ROLE_SEARCH_PROFILE.ai_ownership_tokens
+AI_LOW_SIGNAL_PATTERNS = DEFAULT_ROLE_SEARCH_PROFILE.ai_low_signal_patterns
+NON_US_MARKET_HINT_PATTERNS = DEFAULT_ROLE_SEARCH_PROFILE.non_us_market_hint_patterns
+
+
+def _contains_ai_signal(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        (
+            token in lowered
+            if " " in token or "/" in token or "-" in token
+            else re.search(rf"\b{re.escape(token)}\b", lowered)
+        )
+        for token in AI_SIGNAL_TOKENS
+    )
+
+
+def _sentence_split(text: str) -> list[str]:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", normalized)
+    return [part for part in parts if part] or [normalized]
+
+
+def _is_low_signal_ai_sentence(text: str) -> bool:
+    lowered = text.lower()
+    if any(pattern in lowered for pattern in AI_LOW_SIGNAL_PATTERNS):
+        return True
+    return bool(re.search(r"\b(?:is|are)\s+an?\s+ai[- ]powered\b", lowered))
+
+
+def _has_strong_ai_context(text: str) -> bool:
+    for sentence in _sentence_split(text):
+        lowered = sentence.lower()
+        if not _contains_ai_signal(lowered):
+            continue
+        if _is_low_signal_ai_sentence(lowered):
+            continue
+        has_strong_scope = any(token in lowered for token in AI_STRONG_CONTEXT_TOKENS)
+        has_ownership = any(token in lowered for token in AI_OWNERSHIP_TOKENS)
+        if has_strong_scope or has_ownership:
+            return True
+    return False
+
+
+def _is_ai_related_product_manager_text(text: str) -> bool:
+    normalized = " ".join(text.split())
+    lowered = normalized.lower()
+    product_ok = "product manager" in lowered or (re.search(r"\bproduct\b", lowered) and re.search(r"\bmanager\b", lowered))
+    if not product_ok:
+        return False
+    if len(normalized) <= 160 and _contains_ai_signal(normalized) and not _is_low_signal_ai_sentence(normalized):
+        return True
+    return _has_strong_ai_context(normalized)
+
+
+def _is_ai_related_product_manager(job: JobPosting) -> bool:
+    haystack = " ".join(
+        part
+        for part in (
+            job.role_title,
+            job.job_page_title or "",
+            " ".join(job.validation_evidence),
+        )
+        if part
+    )
+    return _is_ai_related_product_manager_text(haystack)
+
+
+def _lead_is_ai_related_product_manager(lead: JobLead) -> bool:
+    if _is_ai_related_product_manager_text(lead.role_title):
+        return True
+    if "product manager" not in lead.role_title.lower():
+        return False
+    strong_evidence_source = lead.source_type in {"builtin", "direct_ats", "company_site"} or bool(lead.direct_job_url)
+    if not strong_evidence_source:
+        return False
+    haystack = " ".join(
+        part
+        for part in (
+            lead.role_title,
+            lead.evidence_notes,
+            lead.location_hint or "",
+        )
+        if part
+    )
+    return _is_ai_related_product_manager_text(haystack)
+
+
+def _company_token_candidates(company_name: str) -> list[str]:
+    tokens = [token for token in re.findall(r"[a-z0-9]+", company_name.lower()) if len(token) >= 3]
+    compact = "".join(ch for ch in company_name.lower() if ch.isalnum())
+    if len(compact) >= 4:
+        tokens.append(compact)
+    return list(dict.fromkeys(tokens))
+
+
+def _role_token_candidates(role_title: str) -> list[str]:
+    stopwords = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "into",
+        "from",
+        "at",
+        "of",
+        "us",
+    }
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", role_title.lower().replace("ai/ml", "ai ml").replace("data/ml", "data ml"))
+        if len(token) >= 2 and token not in stopwords
+    ]
+    return list(dict.fromkeys(tokens))
+
+
+def _role_match_score(role_title: str, candidate_text: str) -> int:
+    haystack = candidate_text.lower().replace("ai/ml", "ai ml").replace("data/ml", "data ml")
+    tokens = _role_token_candidates(role_title)
+    if not tokens:
+        return 0
+    matches = 0
+    for token in tokens:
+        if re.search(rf"\b{re.escape(token)}\b", haystack):
+            matches += 1
+
+    score = matches * 2
+    if "product manager" in role_title.lower():
+        if "product manager" in haystack:
+            score += 8
+        elif re.search(r"\bproduct\b", haystack) and re.search(r"\bmanager\b", haystack):
+            score += 4
+        else:
+            score -= 8
+    if "ai" in role_title.lower() and not re.search(r"\bai\b", haystack) and "machine learning" not in haystack and not re.search(r"\bml\b", haystack):
+        score -= 2
+    if "ml" in role_title.lower() and not re.search(r"\bml\b", haystack) and "machine learning" not in haystack:
+        score -= 2
+    return score
+
+
+def _extract_experience_years_floor(text: str) -> int | None:
+    if not text:
+        return None
+    floors: list[int] = []
+
+    for match in re.finditer(r"\b(?P<years>\d{1,2})\s*\+\s*(?:years?|yrs?)\b", text, re.I):
+        floors.append(int(match.group("years")))
+    for match in re.finditer(
+        r"\b(?:at\s+least|minimum(?:\s+of)?|min\.?|over)\s*(?P<years>\d{1,2})\s*(?:years?|yrs?)\b",
+        text,
+        re.I,
+    ):
+        floors.append(int(match.group("years")))
+    for match in re.finditer(
+        r"\b(?P<min>\d{1,2})\s*(?:-|to|–|—)\s*(?P<max>\d{1,2})\s*(?:years?|yrs?)\b",
+        text,
+        re.I,
+    ):
+        floors.append(int(match.group("min")))
+    for match in re.finditer(
+        r"\b(?P<years>\d{1,2})\s*(?:years?|yrs?)\s+(?:of\s+)?(?:experience|exp)\b",
+        text,
+        re.I,
+    ):
+        floors.append(int(match.group("years")))
+
+    if not floors:
+        return None
+    return max(floors)
+
+
+def _has_senior_title_signal(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in SENIOR_TITLE_TOKENS)
+
+
+def _seniority_signal_score(*parts: str | None) -> int:
+    text = " ".join(part for part in parts if part)
+    if not text:
+        return 0
+    score = 0
+    years_floor = _extract_experience_years_floor(text)
+    if years_floor is not None:
+        if years_floor >= 9:
+            score += 2
+        elif years_floor >= 7:
+            score += 1
+    if _has_senior_title_signal(text):
+        score += 1
+    return score
+
+
+def _infer_salary_from_experience(
+    job: JobPosting,
+    snapshot: JobPageSnapshot,
+    settings: Settings,
+) -> tuple[bool, str | None, int | None]:
+    context_text = " ".join(
+        part
+        for part in (
+            job.role_title,
+            job.job_page_title or "",
+            job.location_text,
+            job.evidence_notes,
+            snapshot.location_text,
+            snapshot.text_excerpt,
+        )
+        if part
+    )
+    lowered_context = context_text.lower()
+    has_us_market_hint = bool(
+        re.search(
+            r"\b(united states|u\.s\.|usa|us-based|remote\s*[-,]?\s*(?:us|usa|united states)|within the united states)\b",
+            lowered_context,
+        )
+    )
+    has_non_us_market_hint = any(
+        re.search(rf"\b{re.escape(pattern)}\b", lowered_context) for pattern in NON_US_MARKET_HINT_PATTERNS
+    )
+    years_floor = _extract_experience_years_floor(context_text)
+    title_context = " ".join(
+        part
+        for part in (
+            job.role_title,
+            job.job_page_title or "",
+            snapshot.role_title or "",
+            snapshot.page_title or "",
+        )
+        if part
+    ).lower()
+    if years_floor is None or years_floor < 7:
+        has_high_salary_title_signal = any(token in title_context for token in TITLE_ONLY_SALARY_INFERENCE_TOKENS)
+        if not (has_us_market_hint and has_high_salary_title_signal):
+            return False, None, years_floor
+        reason = (
+            f"Inferred likely >= ${settings.min_base_salary_usd:,} base because this appears to be a US-remote "
+            f"{job.role_title} role, which is typically compensated at this level."
+        )
+        return True, reason, years_floor
+    if has_non_us_market_hint and not has_us_market_hint:
+        return False, None, years_floor
+    reason = (
+        f"Inferred likely >= ${settings.min_base_salary_usd:,} base because the posting appears to require "
+        f"at least {years_floor} years of experience."
+    )
+    return True, reason, years_floor
+
+
+def _apply_salary_inference(job: JobPosting, snapshot: JobPageSnapshot, settings: Settings) -> JobPosting:
+    inferred_ok, inference_reason, years_floor = _infer_salary_from_experience(job, snapshot, settings)
+    if not inferred_ok:
+        return job
+    merged_notes = " ".join(part for part in (job.evidence_notes, inference_reason) if part).strip()
+    inferred_salary_text = job.salary_text or inference_reason
+    return job.model_copy(
+        update={
+            "salary_inferred": True,
+            "salary_inference_reason": inference_reason,
+            "inferred_experience_years_min": years_floor,
+            "salary_text": inferred_salary_text,
+            "evidence_notes": merged_notes,
+        }
+    )
+
+
+def _salary_values(job: JobPosting) -> list[int]:
+    return [value for value in (job.base_salary_min_usd, job.base_salary_max_usd) if value is not None]
+
+
+def _salary_meets_minimum(job: JobPosting, settings: Settings) -> bool:
+    salary_values = _salary_values(job)
+    if salary_values:
+        return max(salary_values) >= settings.min_base_salary_usd
+    return bool(job.salary_inferred)
+
+
+def _matches_filters(job: JobPosting, settings: Settings) -> bool:
+    salary_ok = _salary_meets_minimum(job, settings)
+    job_url = str(job.resolved_job_url or job.direct_job_url)
+    return (
+        _is_allowed_direct_job_url(job_url)
+        and job.is_fully_remote
+        and salary_ok
+        and _is_recent_enough(
+            job.posted_date_iso,
+            job.posted_date_text,
+            settings.posted_within_days,
+            timezone_name=settings.timezone,
+        )
+        and _is_ai_related_product_manager(job)
+    )
+
+
+def _normalize_job_key(company_name: str, role_title: str) -> str:
+    normalized_company = "".join(ch for ch in company_name.lower() if ch.isalnum())
+    normalized_role = "".join(ch for ch in role_title.lower() if ch.isalnum())
+    return f"{normalized_company}:{normalized_role}"
+
+
+def _company_names_match(expected: str, observed: str) -> bool:
+    def acronym_candidates(value: str) -> set[str]:
+        candidates: set[str] = set()
+        caps = "".join(ch for ch in value if ch.isupper())
+        if len(caps) >= 2:
+            candidates.add(caps)
+        camel_parts = re.findall(r"[A-Z][a-z0-9]*", value)
+        if len(camel_parts) >= 2:
+            candidates.add("".join(part[0] for part in camel_parts).upper())
+        word_parts = re.findall(r"[A-Za-z][A-Za-z0-9]*", value)
+        if len(word_parts) >= 2:
+            candidates.add("".join(part[0] for part in word_parts).upper())
+        compact = "".join(ch for ch in value if ch.isalnum())
+        if 2 <= len(compact) <= 5 and compact.isalpha():
+            candidates.add(compact.upper())
+        return {candidate for candidate in candidates if len(candidate) >= 2}
+
+    expected_key = "".join(ch for ch in expected.lower() if ch.isalnum())
+    observed_key = "".join(ch for ch in observed.lower() if ch.isalnum())
+    if not expected_key or not observed_key:
+        return False
+    if expected_key == observed_key:
+        return True
+    if expected_key in observed_key or observed_key in expected_key:
+        return True
+    expected_acronyms = acronym_candidates(expected)
+    observed_acronyms = acronym_candidates(observed)
+    if expected_acronyms.intersection(observed_acronyms):
+        return True
+    for left in expected_acronyms:
+        for right in observed_acronyms:
+            if left.startswith(right) or right.startswith(left):
+                return True
+    expected_tokens = {token for token in re.findall(r"[a-z0-9]+", expected.lower()) if len(token) >= 3}
+    observed_tokens = {token for token in re.findall(r"[a-z0-9]+", observed.lower()) if len(token) >= 3}
+    return bool(expected_tokens and observed_tokens and expected_tokens.intersection(observed_tokens))
+
+
+def _is_weak_company_hint(value: str | None) -> bool:
+    if not value:
+        return True
+    compact = "".join(ch for ch in value.lower() if ch.isalnum())
+    if not compact:
+        return True
+    weak_tokens = {
+        "enus",
+        "ext",
+        "external",
+        "jobs",
+        "job",
+        "careers",
+        "career",
+        "apply",
+        "wl",
+        "wlcareers",
+        "hs",
+    }
+    if compact in weak_tokens or len(compact) <= 3:
+        return True
+    tokens = [token for token in re.findall(r"[a-z0-9]+", value.lower()) if token]
+    return bool(tokens) and all(token in weak_tokens or len(token) <= 2 for token in tokens)
+
+
+def _normalize_source_type(url: str) -> str:
+    host = (urlparse(url).netloc or "").lower()
+    if "linkedin.com" in host:
+        return "linkedin"
+    if "builtin" in host or "builtinchicago" in host:
+        return "builtin"
+    if "glassdoor.com" in host:
+        return "glassdoor"
+    if _is_allowed_direct_job_url(url):
+        return "direct_ats" if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS) else "company_site"
+    return "other"
+
+
+def _is_supported_discovery_source_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if "linkedin.com" in host:
+        return "/jobs/view" in path
+    if "indeed.com" in host:
+        return "/viewjob" in path or "/rc/clk" in path
+    if "glassdoor.com" in host:
+        return "/job/" in path or "joblisting.htm" in path
+    if "builtin" in host:
+        return "/job/" in path
+    if "wellfound.com" in host:
+        return "/jobs/" in path
+    if "ziprecruiter.com" in host:
+        return "/jobs/" in path
+    if "themuse.com" in host:
+        return "/jobs/" in path
+    if "monster.com" in host:
+        return "/job-openings/" in path or "/jobs/search/" not in path and "/jobs/" in path
+    if "startup.jobs" in host:
+        return bool(re.search(r"/[^/]+/[^/]+", path))
+    if "jobgether.com" in host:
+        return "/offer/" in path or "/jobs/" in path
+    if "welcometothejungle.com" in host:
+        return "/jobs" in path
+    if "joinhandshake.com" in host:
+        return "/jobs/" in path
+    if "ycombinator.com" in host:
+        return "/companies/" in path and "/jobs/" in path
+    if "dynamitejobs.com" in host:
+        return "/company/" in path and "/remote-job/" in path
+    if "dailyremote.com" in host:
+        return "/remote-job/" in path or "/job/" in path
+    if "remote.io" in host:
+        return "/remote-product-jobs/" in path or "/remote-jobs/" in path
+    if "flexhired.com" in host:
+        return "/jobs/" in path
+    if "remoteai.io" in host:
+        return "/roles/" in path
+    return False
+
+
+def _hint_is_recent(posted_date_hint: str | None, settings: Settings) -> bool | None:
+    if not posted_date_hint:
+        return None
+    lowered = posted_date_hint.lower()
+    if "day" in lowered or "today" in lowered or "yesterday" in lowered or "week" in lowered:
+        return _is_recent_enough(
+            None,
+            posted_date_hint,
+            settings.posted_within_days,
+            timezone_name=settings.timezone,
+        )
+    posted_on = _parse_absolute_posted_date_text(posted_date_hint)
+    if posted_on is None:
+        return None
+    return posted_on >= _today_for_timezone(settings.timezone) - timedelta(days=settings.posted_within_days)
+
+
+def _lead_priority(lead: JobLead, settings: Settings) -> tuple[int, int, int, int, int, int, str, str]:
+    direct_bonus = 0 if lead.direct_job_url else 1
+    source_priority = DISCOVERY_SOURCE_PRIORITY.get(lead.source_type, 9)
+    if source_priority >= DISCOVERY_SOURCE_PRIORITY["other"] and _is_supported_discovery_source_url(lead.source_url):
+        source_priority = DISCOVERY_SOURCE_PRIORITY["glassdoor"]
+
+    recent_hint = _hint_is_recent(lead.posted_date_hint, settings)
+    if recent_hint is True:
+        recency_penalty = 0
+    elif recent_hint is None:
+        recency_penalty = 1
+    else:
+        recency_penalty = 3
+
+    salary_values = [value for value in (lead.base_salary_min_usd_hint, lead.base_salary_max_usd_hint) if value is not None]
+    seniority_score = _seniority_signal_score(
+        lead.role_title,
+        lead.evidence_notes,
+        lead.salary_text_hint,
+    )
+    if salary_values and max(salary_values) >= settings.min_base_salary_usd:
+        salary_penalty = 0
+    elif salary_values:
+        salary_penalty = 4
+    else:
+        if seniority_score >= 2:
+            salary_penalty = 0
+        elif seniority_score == 1:
+            salary_penalty = 1
+        else:
+            salary_penalty = 2
+
+    seniority_penalty = 0 if seniority_score > 0 else 1
+    remote_penalty = 0 if lead.is_remote_hint else 1
+    focus_penalty = 0 if lead.source_type in {"direct_ats", "company_site"} else 1
+    return (
+        recency_penalty,
+        salary_penalty,
+        seniority_penalty,
+        remote_penalty,
+        source_priority,
+        direct_bonus + focus_penalty,
+        lead.company_name.lower(),
+        lead.role_title.lower(),
+    )
+
+
+def _normalize_company_key(company_name: str | None) -> str:
+    return "".join(character.lower() for character in str(company_name or "") if character.isalnum())
+
+
+def _company_looks_small_from_hosts(hosts: list[str]) -> bool:
+    normalized_hosts = [host.lower() for host in hosts if host]
+    return any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts)
+
+
+def _select_watchlist_focus_companies(
+    settings: Settings,
+    known_company_keys: set[str],
+    *,
+    limit: int = 10,
+) -> list[str]:
+    watchlist = load_company_watchlist_entries(settings.data_dir)
+    ranked_entries = sorted(
+        watchlist.values(),
+        key=lambda entry: (
+            0 if _normalize_company_key(entry.get("company_name")) not in known_company_keys else 1,
+            0 if _company_looks_small_from_hosts([str(item) for item in entry.get("source_hosts", [])]) else 1,
+            -int(entry.get("priority_score") or 0),
+            -int(entry.get("watch_count") or 0),
+            str(entry.get("company_name") or "").lower(),
+        ),
+    )
+    companies: list[str] = []
+    seen_company_keys: set[str] = set()
+    for entry in ranked_entries:
+        company_name = str(entry.get("company_name") or "").strip()
+        company_key = _normalize_company_key(company_name)
+        if not company_name or not company_key or company_key in known_company_keys or company_key in seen_company_keys:
+            continue
+        companies.append(company_name)
+        seen_company_keys.add(company_key)
+        if len(companies) >= limit:
+            break
+    return companies
+
+
+def _apply_company_novelty_quota(
+    leads: list[JobLead],
+    known_company_keys: set[str],
+    *,
+    min_novelty_ratio: float = NOVEL_COMPANY_TARGET_RATIO,
+    limit: int | None = None,
+) -> list[JobLead]:
+    if not leads:
+        return []
+
+    novel_leads = [lead for lead in leads if _normalize_company_key(lead.company_name) not in known_company_keys]
+    known_leads = [lead for lead in leads if _normalize_company_key(lead.company_name) in known_company_keys]
+    if not novel_leads or min_novelty_ratio <= 0:
+        ordered = [*novel_leads, *known_leads]
+        return ordered[:limit] if limit is not None else ordered
+
+    novel_block_size = max(
+        1,
+        int((min_novelty_ratio / max(1e-6, (1 - min_novelty_ratio))) + 0.999),
+    )
+    ordered: list[JobLead] = []
+    while novel_leads or known_leads:
+        for _ in range(novel_block_size):
+            if not novel_leads:
+                break
+            ordered.append(novel_leads.pop(0))
+            if limit is not None and len(ordered) >= limit:
+                return ordered
+        if known_leads:
+            ordered.append(known_leads.pop(0))
+            if limit is not None and len(ordered) >= limit:
+                return ordered
+        if not known_leads and novel_leads:
+            ordered.extend(novel_leads)
+            break
+        if not novel_leads and known_leads:
+            ordered.extend(known_leads)
+            break
+
+    return ordered[:limit] if limit is not None else ordered
+
+
+def _build_small_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    recency_terms = _current_recency_terms(settings.timezone)
+    salary_term = f"\"${settings.min_base_salary_usd:,}\""
+    domain_window = _attempt_query_window(
+        list(SMALL_COMPANY_SCOUT_DOMAINS),
+        tuning.attempt_number,
+        max(4, min(6, settings.search_round_query_limit)),
+    )
+    topic_window = _attempt_query_window(
+        list(SMALL_COMPANY_SCOUT_TOPICS),
+        tuning.attempt_number,
+        max(3, min(4, settings.search_round_query_limit)),
+    )
+    queries: list[str] = []
+    for domain in domain_window:
+        for topic in topic_window:
+            queries.append(f'site:{domain} "product manager" "{topic}" remote {recency_terms[0]}')
+            queries.append(f'site:{domain} "senior product manager" "{topic}" remote')
+            if tuning.prioritize_salary:
+                queries.append(f'site:{domain} "product manager" "{topic}" remote {salary_term}')
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 10)]
+
+
+def _base_role_queries() -> list[str]:
+    return [
+        "\"principal product manager\" AI remote",
+        "\"staff product manager\" AI remote",
+        "\"group product manager\" AI remote",
+        "\"senior product manager\" AI remote",
+        "\"lead product manager\" AI remote",
+        "\"principal product manager\" \"machine learning\" remote",
+        "\"staff product manager\" \"machine learning\" remote",
+        "\"group product manager\" \"machine learning\" remote",
+        "\"senior product manager\" \"machine learning\" remote",
+        "\"principal product manager\" \"LLM\" remote",
+        "\"staff product manager\" \"agentic\" remote",
+        "\"AI product manager\" remote",
+        "\"AI Product Manager\" remote",
+        "\"AI/ML product manager\" remote",
+        "\"machine learning product manager\" remote",
+        "\"generative AI\" \"product manager\" remote",
+        "\"LLM\" \"product manager\" remote",
+        "\"AI platform product manager\" remote",
+        "\"agentic AI\" \"product manager\" remote",
+        "\"product manager\" \"AI\" remote",
+        "\"product manager\" \"ML\" remote",
+        "\"product manager\" \"machine learning\" remote",
+        "\"product manager\" \"agentic\" remote",
+        "\"product manager\" \"applied AI\" remote",
+        "\"ML product manager\" remote",
+        "\"AI senior product manager\" remote",
+        "\"AI principal product manager\" remote",
+        "\"AI staff product manager\" remote",
+        "\"AI group product manager\" remote",
+        "\"product manager\" \"LLM\" remote",
+        "\"product manager\" \"genai\" remote",
+        "\"product manager\" \"NLP\" remote",
+        "\"product manager\" \"computer vision\" remote",
+        "\"product manager\" \"intelligent automation\" remote",
+        "\"lead product manager\" machine learning remote",
+        "\"platform product manager\" machine learning remote",
+        "\"technical product manager\" AI remote",
+        "\"technical product manager\" machine learning remote",
+        "\"product manager\" \"data science\" remote",
+        "\"product manager\" \"model platform\" remote",
+        "\"product manager\" \"ai platform\" remote",
+        "\"product manager\" \"conversational AI\" remote",
+        "\"product manager\" chatbot remote",
+        "\"product manager\" \"chat & knowledge\" remote",
+        "\"product manager\" \"ML platform\" remote",
+        "\"product manager\" \"recommendation systems\" remote",
+        "\"product manager\" perception ML remote",
+    ]
+
+
+def _current_recency_terms(timezone_name: str | None = None) -> list[str]:
+    now = datetime.now(UTC)
+    if timezone_name:
+        try:
+            now = datetime.now(ZoneInfo(timezone_name))
+        except ZoneInfoNotFoundError:
+            pass
+    current_month_year = now.strftime("%B %Y")
+    current_month = now.strftime("%B")
+    current_year = now.strftime("%Y")
+    return [
+        "\"posted this week\"",
+        "\"posted in the last week\"",
+        "\"posted 1 day ago\"",
+        "\"posted 2 days ago\"",
+        "\"posted 3 days ago\"",
+        f"\"{current_month_year}\"",
+        f"\"{current_month} {current_year}\"",
+        current_year,
+    ]
+
+
+def _salary_disclosure_terms() -> list[str]:
+    return [
+        "\"salary\"",
+        "\"base salary\"",
+        "\"pay range\"",
+        "\"compensation\"",
+        "\"annual salary\"",
+    ]
+
+
+def _salary_disclosure_regions() -> list[str]:
+    return [
+        "\"California\"",
+        "\"Colorado\"",
+        "\"New York\"",
+        "\"Washington\"",
+    ]
+
+
+def _dedupe_queries(queries: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        cleaned = " ".join(query.split())
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        deduped.append(cleaned)
+    return deduped
+
+
+def _interleave_query_groups(groups: list[list[str]]) -> list[str]:
+    queues = [deque(group) for group in groups if group]
+    ordered: list[str] = []
+    while queues:
+        next_queues: list[deque[str]] = []
+        for queue in queues:
+            ordered.append(queue.popleft())
+            if queue:
+                next_queues.append(queue)
+        queues = next_queues
+    return ordered
+
+
+def _role_query_batch_for_attempt(role_queries: list[str], attempt_number: int, batch_size: int) -> list[str]:
+    if not role_queries:
+        return []
+    size = min(batch_size, len(role_queries))
+    start = ((attempt_number - 1) * size) % len(role_queries)
+    rotated = role_queries[start:] + role_queries[:start]
+    return rotated[:size]
+
+
+def _attempt_query_window(role_queries: list[str], attempt_number: int, window_size: int) -> list[str]:
+    if not role_queries or window_size <= 0:
+        return []
+    start = (attempt_number - 1) * window_size
+    if start >= len(role_queries):
+        start %= len(role_queries)
+    rotated = role_queries[start:] + role_queries[:start]
+    return rotated[: min(window_size, len(role_queries))]
+
+
+def _build_local_role_queries() -> list[str]:
+    core_queries = [
+        "AI product manager",
+        "machine learning product manager",
+        "AI/ML product manager",
+        "generative AI product manager",
+        "genAI product manager",
+        "applied AI product manager",
+        "applied intelligence product manager",
+        "LLM product manager",
+        "AI platform product manager",
+        "machine learning platform product manager",
+        "AI agents product manager",
+        "product manager AI agents",
+        "agentic AI product manager",
+        "agentic systems product manager",
+        "AI assistant product manager",
+        "AI foundations product manager",
+        "AI systems product manager",
+        "AI features product manager",
+        "AI solutions product manager",
+        "AI factory product manager",
+        "AI control plane product manager",
+        "AI guardrails product manager",
+        "voice AI product manager",
+        "conversational AI product manager",
+        "chatbot product manager",
+        "chat and knowledge product manager",
+        "LLM operations product manager",
+        "ML platform product manager",
+        "recommendation systems product manager",
+        "perception ML product manager",
+        "technical product manager AI",
+        "technical product manager machine learning",
+        "technical product manager AI platform",
+        "technical product manager AI agents",
+    ]
+    seniorities = ["senior", "staff", "principal", "group", "lead"]
+    topics = [
+        "AI",
+        "machine learning",
+        "AI/ML",
+        "generative AI",
+        "applied AI",
+        "applied intelligence",
+        "LLM",
+        "AI platform",
+        "AI agents",
+        "agentic AI",
+        "AI foundations",
+        "AI systems",
+        "AI features",
+        "AI solutions",
+        "AI factory",
+        "AI control plane",
+        "AI guardrails",
+        "conversational AI",
+        "chatbot",
+        "chat and knowledge",
+        "LLM operations",
+        "ML platform",
+        "recommendation systems",
+        "perception ML",
+    ]
+    seniority_groups: list[list[str]] = []
+    for seniority in seniorities:
+        group: list[str] = []
+        for topic in topics:
+            group.append(f"{seniority} product manager {topic}")
+        group.append(f"{seniority} technical product manager AI")
+        group.append(f"{seniority} technical product manager machine learning")
+        seniority_groups.append(group)
+
+    topic_first_queries: list[str] = []
+    for topic in (
+        "AI",
+        "machine learning",
+        "AI/ML",
+        "LLM",
+        "AI platform",
+        "AI agents",
+        "applied AI",
+        "AI foundations",
+        "AI systems",
+    ):
+        topic_first_queries.append(f"{topic} senior product manager")
+        topic_first_queries.append(f"{topic} principal product manager")
+        topic_first_queries.append(f"{topic} staff product manager")
+
+    specialist_queries = [
+        "product manager generative AI",
+        "product manager applied AI",
+        "product manager applied intelligence",
+        "product manager LLM",
+        "product manager machine learning platform",
+        "product manager AI foundations",
+        "product manager AI systems",
+        'product manager "computer vision"',
+        'product manager "data science" "machine learning"',
+        'product manager "modeling" "machine learning"',
+        'product manager "recommendation systems"',
+        'product manager "deep learning"',
+        'product manager "semantic search"',
+        'product manager "model serving"',
+        'product manager "embeddings"',
+        "senior product manager machine learning",
+        "staff product manager machine learning",
+        "principal product manager machine learning",
+        "group product manager machine learning",
+        "lead product manager machine learning",
+        "senior product manager conversational AI",
+        "staff product manager conversational AI",
+        "principal product manager conversational AI",
+        "senior product manager chatbot",
+        "principal product manager ML platform",
+        "staff product manager ML platform",
+    ]
+
+    ordered_groups = [core_queries, *seniority_groups, topic_first_queries, specialist_queries]
+    return _dedupe_queries(_interleave_query_groups(ordered_groups))
+
+
+def _build_targeted_attempt_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    role_pool = [
+        "\"AI product manager\" remote",
+        "\"machine learning product manager\" remote",
+        "\"generative AI\" \"product manager\" remote",
+        "\"AI/ML product manager\" remote",
+        "\"senior product manager\" AI remote",
+        "\"staff product manager\" AI remote",
+        "\"principal product manager\" AI remote",
+        "\"group product manager\" AI remote",
+        "\"lead product manager\" AI remote",
+        "\"AI platform product manager\" remote",
+        "\"agentic AI\" \"product manager\" remote",
+        "\"technical product manager\" AI remote",
+    ]
+    role_batch = _role_query_batch_for_attempt(
+        role_pool,
+        tuning.attempt_number,
+        batch_size=max(4, settings.search_round_query_limit),
+    )
+    ats_domains = [
+        "boards.greenhouse.io",
+        "job-boards.greenhouse.io",
+        "jobs.lever.co",
+        "jobs.ashbyhq.com",
+        "myworkdayjobs.com",
+        "jobs.smartrecruiters.com",
+        "jobs.jobvite.com",
+    ]
+    queries: list[str] = []
+    for index, role_query in enumerate(role_batch):
+        primary_domain = ats_domains[index % len(ats_domains)]
+        secondary_domain = ats_domains[(index + 2) % len(ats_domains)]
+        queries.append(f"{role_query} site:{primary_domain} \"posted this week\"")
+        queries.append(f"{role_query} site:{secondary_domain} \"${settings.min_base_salary_usd:,}\"")
+        queries.append(f"{role_query} site:{primary_domain}")
+
+    return _dedupe_queries(queries)
+
+
+def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = None) -> list[str]:
+    tuning = tuning or SearchTuning(attempt_number=1)
+    role_queries = _base_role_queries()
+    scout_queries = _build_small_company_scout_queries(settings, tuning)
+    ats_domains = [
+        "boards.greenhouse.io",
+        "job-boards.greenhouse.io",
+        "jobs.lever.co",
+        "jobs.ashbyhq.com",
+        "myworkdayjobs.com",
+        "jobs.smartrecruiters.com",
+        "jobs.jobvite.com",
+        "jobs.workable.com",
+        "jobs.icims.com",
+        "careers.bamboohr.com",
+        "recruiting.paylocity.com",
+        "jobs.dayforcehcm.com",
+        "careers.adp.com",
+        "careers.workday.com",
+    ]
+    discovery_domains = [
+        "linkedin.com/jobs/view",
+        "builtin.com/jobs",
+        "builtinnyc.com/jobs",
+        "builtinsf.com/jobs",
+        "builtinseattle.com/jobs",
+        "builtinla.com/jobs",
+        "builtinchicago.org/jobs",
+        "builtinchicago.com/jobs",
+        "glassdoor.com/Job",
+    ]
+    seed_queries = list(settings.search_queries)
+    focus_queries: list[str] = []
+    direct_queries: list[str] = []
+    salary_queries: list[str] = []
+    recency_queries: list[str] = []
+    discovery_queries: list[str] = []
+    broad_queries: list[str] = []
+
+    recency_terms = _current_recency_terms(settings.timezone)
+    salary_terms = [f"\"${settings.min_base_salary_usd:,}\"", *_salary_disclosure_terms()]
+    salary_regions = _salary_disclosure_regions()
+
+    for role_query in role_queries:
+        if tuning.attempt_number > 1:
+            broad_queries.append(role_query)
+            broad_queries.append(f"{role_query} \"United States\"")
+
+        direct_queries.append(role_query)
+        direct_queries.append(role_query.replace(" remote", ' "Remote - US"', 1))
+
+        for domain in ats_domains:
+            direct_queries.append(f"{role_query} site:{domain}")
+            recency_queries.append(f"{role_query} site:{domain} {recency_terms[0]}")
+            salary_queries.append(f"{role_query} site:{domain} {salary_terms[0]}")
+
+        for domain in discovery_domains:
+            discovery_queries.append(f"site:{domain} {role_query} {recency_terms[0]}")
+            if tuning.attempt_number > 1:
+                discovery_queries.append(f"site:{domain} {role_query}")
+
+        for recency_term in recency_terms[:4]:
+            recency_queries.append(f"{role_query} {recency_term}")
+
+        for salary_term in salary_terms[:2]:
+            salary_queries.append(f"{role_query} {salary_term}")
+        if tuning.prioritize_salary or tuning.attempt_number > 1:
+            for salary_term in salary_terms[2:]:
+                salary_queries.append(f"{role_query} {salary_term}")
+            for salary_region in salary_regions:
+                salary_queries.append(f"{role_query} {salary_region} \"salary\"")
+                salary_queries.append(f"{role_query} {salary_region} \"base salary\"")
+
+    focus_roles = tuning.focus_roles or [
+        "\"AI Product Manager\"",
+        "\"Senior Product Manager, AI\"",
+        "\"Principal Product Manager, AI\"",
+        "\"Group Product Manager, AI\"",
+        "\"Staff Product Manager, AI\"",
+        "\"Senior Product Manager, Machine Learning\"",
+        "\"Principal Product Manager, Machine Learning\"",
+    ]
+    for company in tuning.focus_companies[:10]:
+        company_term = f"\"{company}\""
+        for role_term in focus_roles[:6]:
+            focus_queries.append(f"{company_term} {role_term} remote")
+            focus_queries.append(f"{company_term} {role_term} remote {_today_for_timezone(settings.timezone).strftime('%Y')}")
+            for domain in ats_domains:
+                focus_queries.append(f"{company_term} {role_term} remote site:{domain}")
+                if tuning.prioritize_recency:
+                    focus_queries.append(f"{company_term} {role_term} remote site:{domain} {recency_terms[0]}")
+                if tuning.prioritize_salary:
+                    focus_queries.append(f"{company_term} {role_term} remote site:{domain} {salary_terms[1]}")
+            for domain in discovery_domains:
+                focus_queries.append(f"site:{domain} {company_term} {role_term} remote")
+
+    query_groups = [
+        direct_queries,
+        recency_queries,
+        salary_queries,
+        seed_queries,
+        discovery_queries,
+    ]
+    if broad_queries:
+        query_groups.append(broad_queries)
+
+    queries = [
+        *focus_queries,
+        *scout_queries,
+        *_interleave_query_groups(query_groups),
+    ]
+    return _dedupe_queries(queries)
+
+
+def _build_query_rounds(settings: Settings, tuning: SearchTuning | None = None) -> list[list[str]]:
+    if settings.llm_provider == "ollama":
+        return _build_local_query_rounds(settings, tuning=tuning)
+
+    tuning = tuning or SearchTuning(attempt_number=1)
+    targeted_queries = _build_targeted_attempt_queries(settings, tuning)
+    fallback_queries = _build_search_query_bank(settings, tuning=tuning)
+    query_bank = _dedupe_queries([*targeted_queries, *fallback_queries])
+    max_queries = settings.max_search_rounds * settings.search_round_query_limit
+    limited_bank = query_bank[:max_queries]
+    return [
+        limited_bank[index : index + settings.search_round_query_limit]
+        for index in range(0, len(limited_bank), settings.search_round_query_limit)
+    ]
+
+
+def _build_local_query_rounds(settings: Settings, tuning: SearchTuning | None = None) -> list[list[str]]:
+    tuning = tuning or SearchTuning(attempt_number=1)
+    local_role_queries = _build_local_role_queries()
+    scout_queries = _build_small_company_scout_queries(settings, tuning)
+    per_attempt_budget = settings.max_search_rounds * settings.search_round_query_limit
+
+    focused_roles = _dedupe_queries((tuning.focus_roles or [])[:6])
+    targeted_queries = _build_targeted_attempt_queries(settings, tuning)[:per_attempt_budget]
+    local_window = _attempt_query_window(local_role_queries, tuning.attempt_number, per_attempt_budget)
+    query_bank = [
+        *focused_roles,
+        *scout_queries,
+        *_interleave_query_groups([
+            targeted_queries,
+            local_window,
+        ]),
+    ]
+    query_bank = _dedupe_queries(query_bank)
+    limited_bank = query_bank[:per_attempt_budget]
+    return [
+        limited_bank[index : index + settings.search_round_query_limit]
+        for index in range(0, len(limited_bank), settings.search_round_query_limit)
+    ]
+
+
+def _failure_counts_for_attempt(diagnostics: SearchDiagnostics, attempt_number: int) -> Counter[str]:
+    return Counter(failure.reason_code for failure in diagnostics.failures if failure.attempt_number == attempt_number)
+
+
+def _top_failure_summary(diagnostics: SearchDiagnostics, attempt_number: int, *, limit: int = 4) -> str:
+    counts = _failure_counts_for_attempt(diagnostics, attempt_number)
+    if not counts:
+        return "no failures recorded"
+    return ", ".join(f"{reason}: {count}" for reason, count in counts.most_common(limit))
+
+
+def _select_focus_companies(settings: Settings, diagnostics: SearchDiagnostics, attempt_number: int) -> list[str]:
+    candidates: Counter[str] = Counter()
+    for failure in diagnostics.failures:
+        if failure.attempt_number != attempt_number:
+            continue
+        if failure.reason_code not in FOCUSABLE_REASON_CODES:
+            continue
+        if failure.posted_date_text and _hint_is_recent(failure.posted_date_text, settings) is False:
+            continue
+        if failure.is_remote is False:
+            continue
+        if not _failure_supports_adaptive_focus(failure):
+            continue
+        if failure.company_name:
+            candidates[failure.company_name] += 1
+    return [company for company, _ in candidates.most_common(8)]
+
+
+def _normalize_role_title_to_focus_queries(role_title: str) -> list[str]:
+    normalized = role_title.lower()
+    normalized = re.sub(r"\([^)]*\)", " ", normalized)
+    normalized = re.sub(r"[^a-z0-9+/ ]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if "product manager" not in normalized and "ml product manager" not in normalized:
+        return []
+
+    seniority = ""
+    for label in ("principal", "staff", "senior", "group", "lead"):
+        if re.search(rf"\b{label}\b", normalized):
+            seniority = label
+            break
+
+    base_role = "technical product manager" if "technical product manager" in normalized else "product manager"
+
+    topic_rules = [
+        ("agentic AI", ("agentic ai",)),
+        ("AI agents", ("ai agents", "agents")),
+        ("AI assistant", ("ai assistant", "assistant")),
+        ("applied AI", ("applied ai",)),
+        ("generative AI", ("generative ai", "genai")),
+        ("LLM", ("llm",)),
+        ("AI/ML", ("ai/ml",)),
+        ("machine learning", ("machine learning", " ml ")),
+        ("AI platform", ("ai platform", "platform")),
+        ("AI", (" ai ",)),
+    ]
+    padded = f" {normalized} "
+    topics: list[str] = []
+    for label, needles in topic_rules:
+        if any(needle in padded for needle in needles):
+            topics.append(label)
+
+    if not topics and "ml product manager" in normalized:
+        topics.append("machine learning")
+
+    if not topics:
+        return []
+
+    queries = [
+        " ".join(part for part in (seniority, base_role, topic) if part).strip()
+        for topic in topics[:2]
+    ]
+    if "AI" not in topics:
+        queries.append(" ".join(part for part in (seniority, base_role, "AI") if part).strip())
+    return _dedupe_queries(queries)
+
+
+def _failure_supports_adaptive_focus(failure: SearchFailure) -> bool:
+    role_title = (failure.role_title or "").strip()
+    if not role_title:
+        return False
+    if _normalize_role_title_to_focus_queries(role_title):
+        return True
+    return _is_ai_related_product_manager_text(role_title)
+
+
+def _select_focus_roles(settings: Settings, diagnostics: SearchDiagnostics, attempt_number: int) -> list[str]:
+    candidates: Counter[str] = Counter()
+    for failure in diagnostics.failures:
+        if failure.attempt_number != attempt_number:
+            continue
+        if failure.reason_code not in FOCUSABLE_REASON_CODES:
+            continue
+        if failure.posted_date_text and _hint_is_recent(failure.posted_date_text, settings) is False:
+            continue
+        if failure.is_remote is False:
+            continue
+        if not _failure_supports_adaptive_focus(failure):
+            continue
+        if failure.role_title:
+            for query in _normalize_role_title_to_focus_queries(failure.role_title):
+                candidates[query] += 1
+    return [role for role, _ in candidates.most_common(6)]
+
+
+def _derive_next_tuning(settings: Settings, diagnostics: SearchDiagnostics, attempt_number: int) -> SearchTuning:
+    counts = _failure_counts_for_attempt(diagnostics, attempt_number)
+    return SearchTuning(
+        attempt_number=attempt_number + 1,
+        prioritize_recency=sum(count for code, count in counts.items() if code in RECENCY_REASON_CODES) >= 3,
+        prioritize_salary=sum(count for code, count in counts.items() if code in SALARY_REASON_CODES) >= 3,
+        prioritize_remote=sum(count for code, count in counts.items() if code in REMOTE_REASON_CODES) >= 2,
+        focus_companies=_select_focus_companies(settings, diagnostics, attempt_number),
+        focus_roles=_select_focus_roles(settings, diagnostics, attempt_number),
+    )
+
+
+def build_job_discovery_agent(settings: Settings, tuning: SearchTuning) -> Agent:
+    instructions = f"""
+You discover strong leads for AI-related Product Manager roles.
+
+Rules:
+- Prefer direct ATS or company careers URLs.
+- If a lead comes from LinkedIn/Built In/Glassdoor, return it only when you can also provide a matching direct_job_url.
+- Skip generic jobs index pages and ambiguous company pages.
+- Focus on US-remote roles posted in the last {settings.posted_within_days} days.
+- Prefer roles likely to meet >= ${settings.min_base_salary_usd:,} base.
+- If compensation is missing, senior roles with clear 7+ years experience requirements are strong leads.
+- Never invent company names, titles, or URLs.
+- Return at most {settings.max_leads_per_query} leads.
+
+Pass priorities:
+- recency: {tuning.prioritize_recency}
+- salary visibility: {tuning.prioritize_salary}
+- explicit remote evidence: {tuning.prioritize_remote}
+
+source_type must be one of: direct_ats, linkedin, builtin, glassdoor, company_site, other
+""".strip()
+
+    return Agent(
+        name=f"Job Discovery Agent Pass {tuning.attempt_number}",
+        model="gpt-5.1",
+        instructions=instructions,
+        tools=[
+            WebSearchTool(
+                user_location=settings.user_location,
+                search_context_size="medium",
+            )
+        ],
+        output_type=JobLeadSearchResult,
+    )
+
+
+def build_direct_job_resolution_agent(settings: Settings) -> Agent:
+    instructions = """
+Resolve each lead to the exact direct ATS or company careers posting URL.
+
+Rules:
+- Return only the specific job posting URL, not a jobs index.
+- Never return aggregator URLs (LinkedIn Jobs, Built In, Glassdoor, Indeed, ZipRecruiter, etc.).
+- Accept only when company and role clearly match; otherwise reject.
+- Keep evidence_notes brief and concrete.
+""".strip()
+
+    return Agent(
+        name="Direct Job Resolution Agent",
+        model="gpt-5.1",
+        instructions=instructions,
+        tools=[
+            WebSearchTool(
+                user_location=settings.user_location,
+                search_context_size="medium",
+            )
+        ],
+        output_type=DirectJobResolution,
+    )
+
+
+def _normalize_and_filter_discovery_leads(leads: list[JobLead], query: str) -> list[JobLead]:
+    normalized_leads: list[JobLead] = []
+    for lead in leads:
+        normalized_direct = _normalize_direct_job_url(lead.direct_job_url) if lead.direct_job_url else None
+        normalized = lead.model_copy(
+            update={
+                "source_query": query,
+                "direct_job_url": normalized_direct,
+                "source_type": _normalize_source_type(normalized_direct or lead.source_url),
+            }
+        )
+
+        if normalized.direct_job_url and not _is_allowed_direct_job_url(normalized.direct_job_url):
+            normalized = normalized.model_copy(update={"direct_job_url": None})
+
+        if not normalized.direct_job_url and not _is_supported_discovery_source_url(normalized.source_url):
+            continue
+        if "product manager" not in normalized.role_title.lower():
+            continue
+        if not _lead_is_ai_related_product_manager(normalized):
+            continue
+
+        normalized_leads.append(normalized)
+    return normalized_leads
+
+
+def _parse_money_token(value: str | None) -> int | None:
+    if not value:
+        return None
+    raw = value.strip().lower().replace(",", "").replace("$", "")
+    multiplier = 1
+    if raw.endswith("k"):
+        multiplier = 1_000
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        multiplier = 1_000_000
+        raw = raw[:-1]
+    try:
+        return int(float(raw) * multiplier)
+    except ValueError:
+        return None
+
+
+def _money_token_looks_salary(value: str | None) -> bool:
+    if not value:
+        return False
+    raw = value.strip().lower()
+    if "$" in raw or raw.endswith(("k", "m")):
+        return True
+    parsed = _parse_money_token(raw)
+    return parsed is not None and parsed >= 30_000
+
+
+def _extract_salary_hint(text: str) -> tuple[int | None, int | None, str | None]:
+    range_match = re.search(
+        r"(?P<min>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)\s*(?:-|to)\s*(?P<max>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
+        text,
+        re.I,
+    )
+    if range_match:
+        min_token = range_match.group("min")
+        max_token = range_match.group("max")
+        if _money_token_looks_salary(min_token) and _money_token_looks_salary(max_token):
+            min_value = _parse_money_token(min_token)
+            max_value = _parse_money_token(max_token)
+            return min_value, max_value, range_match.group(0).replace("  ", " ").strip()
+
+    single_match = re.search(
+        r"(?:base salary|salary|compensation|pay range)[^$]{0,80}(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
+        text,
+        re.I,
+    )
+    if single_match:
+        token = single_match.group("value")
+        if _money_token_looks_salary(token):
+            value = _parse_money_token(token)
+            return value, value, token.strip()
+    return None, None, None
+
+
+def _extract_posted_hint(text: str) -> str | None:
+    match = re.search(r"(today|yesterday|\d+\s+(?:day|days|week|weeks)\s+ago|posted this week)", text, re.I)
+    if match:
+        return match.group(1)
+    absolute_match = re.search(
+        r"\b(?P<value>(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4})\b",
+        text,
+        re.I,
+    )
+    if absolute_match:
+        raw = absolute_match.group("value")
+        for fmt in ("%b %d, %Y", "%B %d, %Y"):
+            try:
+                return datetime.strptime(raw, fmt).date().isoformat()
+            except ValueError:
+                continue
+    return None
+
+
+def _decode_search_result_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "google.com" in parsed.netloc and parsed.path == "/url":
+        encoded = parse_qs(parsed.query).get("q") or parse_qs(parsed.query).get("url")
+        if encoded:
+            return unquote(encoded[0])
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        encoded = parse_qs(parsed.query).get("uddg")
+        if encoded:
+            return unquote(encoded[0])
+    if "bing.com" in parsed.netloc and parsed.path.startswith("/ck/a"):
+        encoded = parse_qs(parsed.query).get("u")
+        if encoded:
+            raw = encoded[0]
+            if raw.startswith("a1"):
+                token = raw[2:]
+                token += "=" * (-len(token) % 4)
+                try:
+                    return base64.b64decode(token).decode()
+                except Exception:
+                    return url
+    if "search.yahoo.com" in parsed.netloc or "r.search.yahoo.com" in parsed.netloc:
+        match = re.search(r"/RU=([^/]+)/RK=", parsed.path)
+        if match:
+            return unquote(match.group(1))
+    return url
+
+
+def _company_hint_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+    if "dynamitejobs.com" in host and len(path_segments) >= 2 and path_segments[0] == "company":
+        return path_segments[1].replace("-", " ").title()
+    if "ycombinator.com" in host and len(path_segments) >= 3 and path_segments[0] == "companies":
+        return path_segments[1].replace("-", " ").title()
+    if "remoterocketship.com" in host and len(path_segments) >= 2 and path_segments[0] == "company":
+        return path_segments[1].replace("-", " ").title()
+    if "getro.com" in host and len(path_segments) >= 2 and path_segments[0] == "companies":
+        return path_segments[1].replace("-", " ").title()
+    if "myworkdayjobs.com" in host:
+        if (
+            len(path_segments) >= 2
+            and re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", path_segments[0], re.I)
+            and path_segments[1].lower() not in {"job", "jobs", "ext"}
+        ):
+            candidate = path_segments[1].replace("_", " ").replace("-", " ").title()
+            if not _is_weak_company_hint(candidate):
+                return candidate
+        host_prefix = host.split(".wd", 1)[0]
+        if host_prefix:
+            return host_prefix.replace("-", " ").title()
+    if "jobs.lever.co" in host and path_segments:
+        return path_segments[0].replace("-", " ").title()
+    if "ashbyhq.com" in host and path_segments:
+        return path_segments[0].replace("-", " ").title()
+    if "greenhouse.io" in host and path_segments:
+        return path_segments[0].replace("-", " ").title()
+    if path_segments:
+        return path_segments[0].replace("-", " ").title()
+    return (host.split(".")[0] if host else "Unknown").replace("-", " ").title()
+
+
+def _extract_role_company_from_title(title: str, url: str) -> tuple[str, str]:
+    cleaned = unescape(title).strip()
+    cleaned = re.sub(r"^\s*Job Application for\s*", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\s*\|\s*LinkedIn.*$", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\s*\|\s*Glassdoor.*$", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"^\S+\s+\S+\s+›\s+", "", cleaned).strip()
+
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+    if "dynamitejobs.com" in host and len(path_segments) >= 4 and path_segments[0] == "company":
+        company = path_segments[1].replace("-", " ").title()
+        role = path_segments[3].replace("-", " ").title()
+        return company, role
+
+    breadcrumb_parts = [part.strip() for part in re.split(r"\s+›\s+", cleaned) if part.strip()]
+    if len(breadcrumb_parts) >= 2:
+        company_hint = _company_hint_from_url(url)
+        for part in reversed(breadcrumb_parts):
+            lowered = part.lower()
+            if "product manager" in lowered:
+                role = re.sub(r"^[^A-Za-z0-9]*(?:jobs?\s*\|\s*)?", "", part).strip()
+                role = re.sub(r"^[a-f0-9-]{8,}\s+", "", role, flags=re.I).strip()
+                return company_hint, role
+
+    greenhouse_match = re.search(r"(?P<role>.+?)\s+at\s+(?P<company>.+)$", cleaned, re.I)
+    if "job application for" in title.lower() and greenhouse_match:
+        return greenhouse_match.group("company").strip(), greenhouse_match.group("role").strip()
+
+    ats_at_match = re.search(r"(?P<role>[A-Za-z0-9,&()/'’.\- ]*product manager[^@|]*)\s+@\s+(?P<company>[^|]+)$", cleaned, re.I)
+    if ats_at_match:
+        return ats_at_match.group("company").strip(), ats_at_match.group("role").strip()
+
+    separators = [" - ", " | ", " at "]
+    for separator in separators:
+        if separator not in cleaned:
+            continue
+        left, right = cleaned.split(separator, 1)
+        left = left.strip()
+        right = right.strip()
+        left_is_role = "product manager" in left.lower()
+        right_is_role = "product manager" in right.lower()
+        if left_is_role and not right_is_role:
+            return right, left
+        if right_is_role and not left_is_role:
+            return left, right
+        return left, right
+
+    company = _company_hint_from_url(url)
+    return company, cleaned
+
+
+def _lead_confidence(lead: JobLead) -> float:
+    score = 0.0
+    if lead.direct_job_url and _is_allowed_direct_job_url(lead.direct_job_url):
+        score += 0.45
+    if lead.source_type in {"direct_ats", "company_site"}:
+        score += 0.2
+    elif _is_supported_discovery_source_url(lead.source_url):
+        score += 0.1
+    if "product manager" in lead.role_title.lower():
+        score += 0.15
+    if _lead_is_ai_related_product_manager(lead):
+        score += 0.1
+    if lead.is_remote_hint:
+        score += 0.05
+    if lead.posted_date_hint:
+        score += 0.05
+    return max(0.0, min(1.0, score))
+
+
+def _is_duckduckgo_anomaly_page(status_code: int, html: str) -> bool:
+    lowered = html.lower()
+    return status_code >= 400 or "anomaly-modal" in lowered or "bots use duckduckgo too" in lowered
+
+
+def _is_google_interstitial_page(status_code: int, html: str) -> bool:
+    lowered = html.lower()
+    return (
+        status_code >= 400
+        or "httpservice/retry/enablejs" in lowered
+        or ("<title>google search</title>" in lowered and "please click" in lowered and "redirected" in lowered)
+    )
+
+
+def _extract_startpage_search_results(html: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for node in soup.select(".result"):
+        link = node.select_one("a.result-link")
+        if link is None:
+            continue
+        href = link.get("href")
+        if not href:
+            continue
+        snippet = ""
+        snippet_candidates = [p.get_text(" ", strip=True) for p in node.select("p")]
+        snippet_candidates = [candidate for candidate in snippet_candidates if len(candidate) >= 24]
+        if snippet_candidates:
+            snippet = max(snippet_candidates, key=len)
+        title = link.get_text(" ", strip=True)
+        if not title:
+            continue
+        results.append((_decode_search_result_url(href), title, snippet))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _extract_yahoo_search_results(html: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for node in soup.select(".algo"):
+        link = node.select_one(".compTitle a")
+        if link is None:
+            continue
+        href = link.get("href")
+        if not href:
+            continue
+        title = link.get_text(" ", strip=True)
+        if not title:
+            continue
+        snippet_el = node.select_one(".compText p")
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+        results.append((_decode_search_result_url(href), title, snippet))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _extract_mojeek_search_results(html: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for node in soup.select(".results-standard li"):
+        link = node.select_one("h2 a.title")
+        if link is None:
+            continue
+        href = link.get("href")
+        if not href:
+            continue
+        title = link.get_text(" ", strip=True)
+        if not title:
+            continue
+        snippet_el = node.select_one("p.s")
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+        results.append((_decode_search_result_url(href), title, snippet))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _extract_google_search_results(html: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    seen_urls: set[str] = set()
+    for link in soup.select('a[href^="/url?"], a[href^="http"]'):
+        href = link.get("href")
+        if not href:
+            continue
+        absolute_href = urljoin("https://www.google.com", href)
+        decoded = _decode_search_result_url(absolute_href)
+        if not decoded.startswith(("http://", "https://")):
+            continue
+        host = (urlparse(decoded).netloc or "").lower()
+        if not host or "google.com" in host:
+            continue
+        if decoded in seen_urls:
+            continue
+        title = link.get_text(" ", strip=True)
+        if not title:
+            continue
+        seen_urls.add(decoded)
+        results.append((decoded, title, ""))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+async def _google_search(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    global GOOGLE_HTTP_SEARCH_AVAILABLE
+    if GOOGLE_HTTP_SEARCH_AVAILABLE is False:
+        raise LocalSearchBackendBlockedError("Google returned a JS interstitial on this machine and was disabled for this run.")
+
+    search_url = "https://www.google.com/search"
+    params = {"q": query, "hl": "en", "gl": "us", "num": max(10, max_results)}
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        response = await client.get(search_url, params=params)
+
+    if _is_google_interstitial_page(response.status_code, response.text):
+        GOOGLE_HTTP_SEARCH_AVAILABLE = False
+        raise LocalSearchBackendBlockedError("Google returned an enable-JS interstitial instead of results.")
+
+    response.raise_for_status()
+    GOOGLE_HTTP_SEARCH_AVAILABLE = True
+    return _extract_google_search_results(response.text, max_results=max_results)
+
+
+async def _duckduckgo_search(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    search_url = "https://duckduckgo.com/html/"
+    params = {"q": query}
+    async with httpx.AsyncClient(
+        timeout=8.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        response = await client.get(search_url, params=params)
+
+    if _is_duckduckgo_anomaly_page(response.status_code, response.text):
+        raise LocalSearchBackendBlockedError("DuckDuckGo returned an anti-bot challenge page instead of results.")
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for node in soup.select(".result"):
+        link = node.select_one("a.result__a")
+        snippet_el = node.select_one(".result__snippet")
+        if link is None:
+            continue
+        href = link.get("href")
+        if not href:
+            continue
+        decoded = _decode_search_result_url(href)
+        title = link.get_text(" ", strip=True)
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+        results.append((decoded, title, snippet))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+async def _bing_search(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    search_url = "https://www.bing.com/search"
+    params = {"q": query, "setlang": "en-US"}
+    async with httpx.AsyncClient(
+        timeout=12.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        response = await client.get(search_url, params=params)
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for node in soup.select("li.b_algo"):
+        link = node.select_one("h2 a")
+        snippet_el = node.select_one(".b_caption p")
+        if link is None:
+            continue
+        href = link.get("href")
+        if not href:
+            continue
+        decoded = _decode_search_result_url(href)
+        title = link.get_text(" ", strip=True)
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+        results.append((decoded, title, snippet))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+async def _yahoo_search(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    search_url = "https://search.yahoo.com/search"
+    params = {"p": query}
+    async with httpx.AsyncClient(
+        timeout=12.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        response = await client.get(search_url, params=params)
+
+    response.raise_for_status()
+    return _extract_yahoo_search_results(response.text, max_results=max_results)
+
+
+async def _startpage_search(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    search_url = "https://www.startpage.com/sp/search"
+    params = {"query": query}
+    async with httpx.AsyncClient(
+        timeout=12.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        response = await client.get(search_url, params=params)
+
+    response.raise_for_status()
+    return _extract_startpage_search_results(response.text, max_results=max_results)
+
+
+async def _mojeek_search(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    search_url = "https://www.mojeek.com/search"
+    params = {"q": query}
+    async with httpx.AsyncClient(
+        timeout=12.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        response = await client.get(search_url, params=params)
+
+    response.raise_for_status()
+    return _extract_mojeek_search_results(response.text, max_results=max_results)
+
+
+async def _search_query_across_backends(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    cache_key = (query, max_results)
+    cached = SEARCH_QUERY_RESULT_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
+    async def _run_backend_group(backends: list) -> tuple[list[tuple[str, str, str]], Exception | None]:
+        merged_results: list[tuple[str, str, str]] = []
+        seen_urls: set[str] = set()
+        last_error: Exception | None = None
+        tasks = [
+            asyncio.create_task(backend(query, max_results=max(6, min(max_results, 8))))
+            for backend in backends
+        ]
+        try:
+            for task in asyncio.as_completed(tasks):
+                try:
+                    search_results = await task
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+                for url, title, snippet in search_results:
+                    normalized_url = _normalize_direct_job_url(url)
+                    if normalized_url in seen_urls:
+                        continue
+                    seen_urls.add(normalized_url)
+                    merged_results.append((normalized_url, title, snippet))
+                    if len(merged_results) >= max_results:
+                        return merged_results, last_error
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        return merged_results, last_error
+
+    primary_backends = [_bing_search, _yahoo_search, _startpage_search]
+    if GOOGLE_HTTP_SEARCH_AVAILABLE is not False:
+        primary_backends.insert(0, _google_search)
+    secondary_backends = [_duckduckgo_search] if "site:" in query.lower() else [_mojeek_search, _duckduckgo_search]
+
+    merged_results, last_error = await _run_backend_group(primary_backends)
+    if len(merged_results) < max_results and secondary_backends:
+        secondary_results, secondary_error = await _run_backend_group(secondary_backends)
+        seen_urls = {url for url, _, _ in merged_results}
+        for url, title, snippet in secondary_results:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged_results.append((url, title, snippet))
+            if len(merged_results) >= max_results:
+                break
+        if secondary_error is not None:
+            last_error = secondary_error
+
+    if not merged_results and last_error is not None:
+        raise last_error
+
+    SEARCH_QUERY_RESULT_CACHE[cache_key] = list(merged_results)
+    return merged_results
+
+
+def _score_company_site_search_result(url: str, title: str, lead: JobLead) -> int:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    full = f"{host}{path}?{(parsed.query or '').lower()}"
+    if not host:
+        return -100
+    if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+        return -100
+    if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
+        return -100
+    if any(hint in full for hint in GENERIC_CAREERS_INFO_HINTS):
+        return -50
+
+    haystack = f"{host} {path} {title.lower()}"
+    score = 0
+    company_matches = 0
+    for token in _company_token_candidates(lead.company_name):
+        if token in haystack:
+            score += 3
+            company_matches += 1
+
+    careers_hub = _looks_like_careers_hub_url(url)
+    company_homepage = _looks_like_company_homepage_url(url)
+    if careers_hub:
+        score += 5
+    elif company_homepage and company_matches >= 1:
+        score += 4
+    direct_ats = any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS)
+    if direct_ats:
+        score += 4 if _looks_like_generic_job_url(url) else 8
+    if any(hint in haystack for hint in ("career", "careers", "jobs", "join us", "join-us")):
+        score += 2
+    role_score = _role_match_score(lead.role_title, haystack)
+    if direct_ats:
+        score += role_score
+    else:
+        score += max(role_score, 0)
+    if lead.role_title.lower() in haystack:
+        score += 3
+    if direct_ats and role_score <= 0:
+        score -= 12
+    return score
+
+
+def _extract_followup_resolution_urls(base_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    base_host = (urlparse(base_url).netloc or "").lower()
+    candidates: dict[str, int] = {}
+
+    def maybe_add(raw_url: str | None, anchor_text: str = "") -> None:
+        if not raw_url:
+            return
+        cleaned_url = unescape(raw_url.strip()).replace("\\/", "/")
+        cleaned_url = cleaned_url.split('"', 1)[0].split("'", 1)[0]
+        if any(token in cleaned_url for token in ("&quot", "&gt", "&lt", "\\", "<", ">")):
+            return
+        absolute_url = _normalize_direct_job_url(urljoin(base_url, cleaned_url))
+        parsed = urlparse(absolute_url)
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return
+        if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+            return
+        if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
+            return
+        full = f"{host}{parsed.path.lower()}?{(parsed.query or '').lower()}"
+        if any(hint in full or hint in anchor_text.lower() for hint in GENERIC_CAREERS_INFO_HINTS):
+            return
+
+        score = 0
+        haystack = f"{absolute_url} {anchor_text}".lower()
+        if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+            if not _looks_like_generic_job_url(absolute_url):
+                return
+            score += 8
+        elif _looks_like_careers_hub_url(absolute_url):
+            score += 5
+        elif host == base_host and any(hint in f"{parsed.path.lower()}/" for hint in CAREERS_HUB_HINTS):
+            score += 4
+        else:
+            return
+
+        if any(token in haystack for token in ("career", "careers", "jobs", "join us", "join-us", "work with us")):
+            score += 2
+        previous = candidates.get(absolute_url)
+        if previous is None or score > previous:
+            candidates[absolute_url] = score
+
+    for link in soup.select("a[href]"):
+        maybe_add(link.get("href"), link.get_text(" ", strip=True))
+
+    for raw_url in re.findall(r"https?://[^\s\"'<>]+", html):
+        maybe_add(raw_url)
+
+    ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+    return [url for url, _ in ranked[:8]]
+
+
+async def _search_company_resolution_candidates(lead: JobLead) -> list[str]:
+    company_key = lead.company_name.strip().lower()
+    cached = COMPANY_RESOLUTION_URL_CACHE.get(company_key)
+    if cached is not None:
+        return cached
+
+    ats_domains = list(
+        dict.fromkeys(domain for batch in LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES for domain in batch)
+    )[:6]
+    normalized_role_queries = _normalize_role_title_to_focus_queries(lead.role_title)
+    role_variants = _dedupe_queries([lead.role_title, *normalized_role_queries])
+
+    direct_ats_queries: list[str] = []
+    for variant in role_variants[:3]:
+        for domain in ats_domains[:4]:
+            direct_ats_queries.append(f'site:{domain} "{lead.company_name}" "{variant}"')
+    if "product manager" in lead.role_title.lower():
+        for domain in ats_domains[:3]:
+            direct_ats_queries.append(f'site:{domain} "{lead.company_name}" "product manager"')
+        for variant in normalized_role_queries[:2]:
+            for domain in ats_domains[:2]:
+                direct_ats_queries.append(f'site:{domain} "{lead.company_name}" {variant}')
+
+    queries = [
+        *direct_ats_queries,
+        f"\"{lead.company_name}\" careers",
+        f"\"{lead.company_name}\" jobs",
+        f"\"{lead.company_name}\" \"{lead.role_title}\"",
+    ]
+    ranked_results: dict[str, int] = {}
+    async def collect_queries(query_list: list[str], *, batch_size: int, stop_after_direct_hits: int) -> int:
+        direct_hits = 0
+        unique_queries = list(dict.fromkeys(query_list))
+        for start in range(0, len(unique_queries), batch_size):
+            batch = unique_queries[start : start + batch_size]
+            tasks = {asyncio.create_task(_search_query_across_backends(query, max_results=8)): query for query in batch}
+            try:
+                for task in asyncio.as_completed(tasks):
+                    try:
+                        results = await task
+                    except Exception:
+                        continue
+                    for url, title, _snippet in results:
+                        score = _score_company_site_search_result(url, title, lead)
+                        if score <= 0:
+                            continue
+                        existing = ranked_results.get(url)
+                        if existing is None or score > existing:
+                            ranked_results[url] = score
+                        if any(fragment in (urlparse(url).netloc or "").lower() for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+                            direct_hits += 1
+                    if direct_hits >= stop_after_direct_hits:
+                        return direct_hits
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        return direct_hits
+
+    fast_queries = direct_ats_queries[:6]
+    remaining_queries = [query for query in queries if query not in fast_queries]
+    direct_hits = await collect_queries(fast_queries, batch_size=4, stop_after_direct_hits=2)
+    if direct_hits < 2:
+        direct_hits += await collect_queries(remaining_queries, batch_size=2, stop_after_direct_hits=4)
+
+    if not ranked_results:
+        fallback_queries = [
+            f"\"{lead.company_name}\"",
+            lead.company_name,
+        ]
+        await collect_queries(fallback_queries, batch_size=2, stop_after_direct_hits=1)
+
+    resolved = [url for url, _ in sorted(ranked_results.items(), key=lambda item: item[1], reverse=True)[:6]]
+    COMPANY_RESOLUTION_URL_CACHE[company_key] = resolved
+    return resolved
+
+
+def _extract_greenhouse_board_token(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if "greenhouse.io" not in host:
+        return None
+    segments = _path_segments(parsed.path)
+    if not segments:
+        return None
+    first_segment = segments[0]
+    if first_segment in {"embed", "job_board"}:
+        return None
+    return first_segment
+
+
+async def _fetch_greenhouse_board_jobs(board_token: str) -> list[dict[str, object]]:
+    cached = GREENHOUSE_BOARD_JOBS_CACHE.get(board_token)
+    if cached is not None:
+        return cached
+
+    api_url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20.0,
+        ) as client:
+            response = await client.get(api_url)
+    except httpx.RequestError:
+        GREENHOUSE_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    if response.status_code != 200:
+        GREENHOUSE_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        GREENHOUSE_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(jobs, list):
+        GREENHOUSE_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    normalized_jobs = [job for job in jobs if isinstance(job, dict)]
+    GREENHOUSE_BOARD_JOBS_CACHE[board_token] = normalized_jobs
+    return normalized_jobs
+
+
+def _greenhouse_board_job_match_score(lead: JobLead, job: dict[str, object]) -> int:
+    title = str(job.get("title") or "").strip()
+    absolute_url = str(job.get("absolute_url") or "").strip()
+    company_hint = _company_hint_from_url(absolute_url)
+    score = _role_match_score(lead.role_title, title)
+    if title.lower() == lead.role_title.lower():
+        score += 8
+    if "product manager" in title.lower():
+        score += 4
+    if _is_ai_related_product_manager_text(" ".join(part for part in (title, lead.evidence_notes) if part)):
+        score += 3
+    if company_hint and _company_names_match(lead.company_name, company_hint):
+        score += 2
+    return score
+
+
+async def _resolve_greenhouse_board_job_url_from_lead(lead: JobLead) -> str | None:
+    board_token = _extract_greenhouse_board_token(lead.direct_job_url or lead.source_url)
+    if not board_token:
+        return None
+    jobs = await _fetch_greenhouse_board_jobs(board_token)
+    if not jobs:
+        return None
+
+    best_url: str | None = None
+    best_score = 0
+    for job in jobs:
+        absolute_url = str(job.get("absolute_url") or "").strip()
+        if not absolute_url.startswith(("http://", "https://")):
+            continue
+        score = _greenhouse_board_job_match_score(lead, job)
+        if score > best_score:
+            best_score = score
+            best_url = absolute_url
+    if best_score <= 0:
+        return None
+    return _normalize_direct_job_url(best_url)
+
+
+def _jsonld_graph_nodes(payload: object) -> list[dict[str, object]]:
+    nodes: list[dict[str, object]] = []
+    if isinstance(payload, dict):
+        graph = payload.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                if isinstance(item, dict):
+                    nodes.append(item)
+        else:
+            nodes.append(payload)
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                nodes.append(item)
+    return nodes
+
+
+def _extract_builtin_search_items(html: str) -> list[tuple[str, str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    items: list[tuple[str, str, str]] = []
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        raw = script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        for node in _jsonld_graph_nodes(payload):
+            if node.get("@type") != "ItemList":
+                continue
+            for item in node.get("itemListElement", []):
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url")
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    continue
+                title = item.get("name")
+                description = item.get("description")
+                items.append((url, str(title or "").strip(), str(description or "").strip()))
+    return items
+
+
+def _extract_builtin_apply_url(html: str) -> str | None:
+    match = re.search(r'"howToApply":"(?P<url>https?:\\?/\\?/[^"]+)"', html)
+    if not match:
+        return None
+    try:
+        decoded = json.loads(f'"{match.group("url")}"')
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+
+def _extract_builtin_jobposting_payload(html: str) -> dict[str, object] | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup.select('script[type="application/ld+json"]'):
+        raw = script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for node in _jsonld_graph_nodes(payload):
+            if node.get("@type") == "JobPosting":
+                return node
+    return None
+
+
+def _extract_builtin_company(jobposting: dict[str, object]) -> str | None:
+    hiring_org = jobposting.get("hiringOrganization")
+    if isinstance(hiring_org, dict):
+        name = hiring_org.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
+def _extract_builtin_location(jobposting: dict[str, object]) -> str | None:
+    location = jobposting.get("jobLocation")
+    if isinstance(location, list):
+        parts: list[str] = []
+        for item in location:
+            if not isinstance(item, dict):
+                continue
+            address = item.get("address")
+            if not isinstance(address, dict):
+                continue
+            for value in (address.get("addressLocality"), address.get("addressRegion"), address.get("addressCountry")):
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+        return ", ".join(dict.fromkeys(parts)) if parts else None
+    if isinstance(location, dict):
+        address = location.get("address")
+        if isinstance(address, dict):
+            parts: list[str] = []
+            for value in (address.get("addressLocality"), address.get("addressRegion"), address.get("addressCountry")):
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+            return ", ".join(parts) if parts else None
+    return None
+
+
+def _extract_builtin_remote_hint(
+    location_text: str | None,
+    description_text: str,
+    *,
+    source_is_remote_listing: bool = False,
+) -> bool | None:
+    haystack = " ".join(part for part in (location_text or "", description_text) if part).lower()
+    if "hybrid" in haystack or "in-office" in haystack or "onsite" in haystack or "on-site" in haystack:
+        return False
+    if "remote" in haystack or "work from home" in haystack:
+        return True
+    if source_is_remote_listing:
+        return True
+    return None
+
+
+def _stable_text_index(text: str, modulo: int) -> int:
+    if modulo <= 0:
+        return 0
+    return sum(ord(character) for character in text) % modulo
+
+
+def _builtin_search_base_urls(query: str) -> list[str]:
+    return _dedupe_queries([BUILTIN_PRIMARY_BASE_URL, *BUILTIN_REGIONAL_BASE_URLS])
+
+
+def _builtin_category_paths_for_query(query: str) -> list[str]:
+    normalized = query.lower()
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    paths: list[str] = []
+
+    if any(token in normalized for token in ("ai", "llm", "agentic", "agent", "generative", "genai", "applied ai")):
+        paths.append("/jobs/remote/product/artificial-intelligence")
+        paths.append("/jobs/remote/artificial-intelligence")
+    if "machine learning" in normalized or "ml" in compact:
+        paths.append("/jobs/remote/product/machine-learning")
+        paths.append("/jobs/remote/machine-learning")
+    if "product manager" in normalized:
+        paths.append("/jobs/remote/product")
+
+    return _dedupe_queries(paths)
+
+
+def _builtin_category_urls_for_query(query: str) -> list[str]:
+    urls: list[str] = []
+    for base_url in _builtin_search_base_urls(query):
+        for path in _builtin_category_paths_for_query(query):
+            urls.append(f"{base_url}{path}")
+    return _dedupe_queries(urls)
+
+
+def _builtin_paginated_category_urls(url: str, page_count: int) -> list[str]:
+    effective_page_count = max(1, page_count)
+    urls = [url]
+    for page_number in range(2, effective_page_count + 1):
+        urls.append(f"{url}?page={page_number}")
+    return urls
+
+
+def _builtin_listing_looks_relevant(title: str, description: str, query: str) -> bool:
+    haystack = " ".join(part for part in (title, description, query) if part).lower()
+    if "product manager" not in haystack:
+        return False
+    return _is_ai_related_product_manager_text(haystack)
+
+
+def _chunk_queries(queries: list[str], chunk_size: int) -> list[list[str]]:
+    effective_size = max(1, chunk_size)
+    return [queries[index : index + effective_size] for index in range(0, len(queries), effective_size)]
+
+
+async def _fetch_builtin_page(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+) -> str:
+    cache_key = str(httpx.URL(url, params=params))
+    cached = BUILTIN_HTML_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    response = await client.get(url, params=params)
+    response.raise_for_status()
+    BUILTIN_HTML_CACHE[cache_key] = response.text
+    return response.text
+
+
+async def _fetch_builtin_page_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+) -> str:
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(2):
+        try:
+            return await _fetch_builtin_page(client, url, params=params)
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+    if last_error is not None:
+        raise last_error
+    raise httpx.HTTPError("Built In page fetch failed.")
+
+
+async def _fetch_builtin_job_lead(
+    client: httpx.AsyncClient,
+    detail_url: str,
+    query: str,
+    description_hint: str,
+    *,
+    source_is_remote_listing: bool = False,
+) -> JobLead | None:
+    if detail_url in BUILTIN_LEAD_CACHE:
+        cached_lead = BUILTIN_LEAD_CACHE[detail_url]
+        if cached_lead is None:
+            return None
+        return cached_lead.model_copy(update={"source_query": query})
+
+    html = await _fetch_builtin_page_with_retry(client, detail_url)
+    payload = _extract_builtin_jobposting_payload(html)
+    if not payload:
+        BUILTIN_LEAD_CACHE[detail_url] = None
+        return None
+
+    company_name = _extract_builtin_company(payload) or _company_hint_from_url(detail_url)
+    role_title = str(payload.get("title") or "").strip()
+    if not role_title:
+        company_name, role_title = _extract_role_company_from_title(detail_url, detail_url)
+
+    description_text = ""
+    description_html = payload.get("description")
+    if isinstance(description_html, str):
+        description_text = BeautifulSoup(description_html, "html.parser").get_text(" ", strip=True)
+    description_text = description_text or description_hint
+
+    direct_url = _extract_builtin_apply_url(html)
+    salary_min, salary_max, salary_text = _extract_salary_hint(description_text)
+    date_posted = payload.get("datePosted")
+    posted_hint = date_posted.strip() if isinstance(date_posted, str) and date_posted.strip() else _extract_posted_hint(description_text)
+    location_text = _extract_builtin_location(payload)
+    is_remote = _extract_builtin_remote_hint(
+        location_text,
+        description_text,
+        source_is_remote_listing=source_is_remote_listing,
+    )
+
+    lead = JobLead(
+        company_name=company_name,
+        role_title=role_title or description_hint or "Product Manager",
+        source_url=detail_url,
+        source_type="builtin",
+        direct_job_url=_normalize_direct_job_url(direct_url) if direct_url else None,
+        location_hint=location_text or ("Remote" if is_remote else None),
+        posted_date_hint=posted_hint,
+        is_remote_hint=is_remote,
+        base_salary_min_usd_hint=salary_min,
+        base_salary_max_usd_hint=salary_max,
+        salary_text_hint=salary_text,
+        source_query=query,
+        evidence_notes=(description_text or description_hint or f"Built In result for '{query}'.")[:400],
+    )
+    BUILTIN_LEAD_CACHE[detail_url] = lead.model_copy(update={"source_query": ""})
+    return lead
+
+
+def _builtin_search_terms_for_query(query: str) -> list[str]:
+    normalized = query.lower()
+    normalized = re.sub(r"site:[^\s]+", " ", normalized)
+    normalized = re.sub(r'"\$[\d,]+"', " ", normalized)
+    normalized = normalized.replace('"posted this week"', " ")
+    normalized = normalized.replace('"posted in the last week"', " ")
+    normalized = normalized.replace("remote", " ")
+    normalized = normalized.replace("/", " ")
+    normalized = normalized.replace("&", " ")
+    normalized = normalized.replace('"', " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    candidates: list[str] = []
+    if normalized:
+        candidates.append(normalized)
+
+    normalized_compact = normalized.replace(" ", "")
+    broad_terms = {
+        "aiproductmanager": "AI product manager",
+        "machinelearningproductmanager": "machine learning product manager",
+        "generativeaiproductmanager": "generative AI product manager",
+        "aimlproductmanager": "machine learning product manager",
+        "seniorproductmanagerai": "senior product manager AI",
+        "staffproductmanagerai": "staff product manager AI",
+        "principalproductmanagerai": "principal product manager AI",
+        "groupproductmanagerai": "group product manager AI",
+        "leadproductmanagerai": "lead product manager AI",
+        "technicalproductmanagerai": "technical product manager AI",
+        "aiplatformproductmanager": "AI platform product manager",
+        "agenticaiproductmanager": "agentic AI product manager",
+        "llmproductmanager": "LLM product manager",
+    }
+    for needle, fallback in broad_terms.items():
+        if needle in normalized_compact:
+            candidates.append(fallback)
+
+    seniority = None
+    for label in ("principal", "staff", "senior", "group", "lead", "technical"):
+        if re.search(rf"\b{label}\b", normalized):
+            seniority = label
+            break
+
+    if "machine learning" in normalized or "ml" in normalized_compact:
+        candidates.append("machine learning product manager")
+        candidates.append("AI product manager")
+        if seniority:
+            candidates.append(f"{seniority} product manager machine learning")
+            candidates.append(f"{seniority} product manager AI")
+
+    if "agent" in normalized:
+        candidates.append("agentic AI product manager")
+        candidates.append("AI product manager")
+        if seniority:
+            candidates.append(f"{seniority} product manager AI")
+
+    if "llm" in normalized:
+        candidates.append("LLM product manager")
+        candidates.append("AI product manager")
+
+    return _dedupe_queries(candidates)[:2]
+
+
+def _extract_linkedin_guest_search_leads(html: str, query: str) -> list[JobLead]:
+    soup = BeautifulSoup(html, "html.parser")
+    leads: list[JobLead] = []
+
+    for card in soup.select("div.base-search-card"):
+        title_el = card.select_one("h3.base-search-card__title")
+        company_el = card.select_one("h4.base-search-card__subtitle a, h4.base-search-card__subtitle")
+        link_el = card.select_one("a.base-card__full-link")
+        location_el = card.select_one(".job-search-card__location")
+        time_el = card.select_one("time.job-search-card__listdate, time.job-search-card__listdate--new, time")
+
+        role_title = title_el.get_text(" ", strip=True) if title_el else ""
+        company_name = company_el.get_text(" ", strip=True) if company_el else ""
+        source_url = _normalize_direct_job_url(link_el.get("href", "").strip()) if link_el else ""
+        location_text = location_el.get_text(" ", strip=True) if location_el else None
+        posted_hint = None
+        if time_el:
+            posted_hint = (time_el.get("datetime") or time_el.get_text(" ", strip=True) or "").strip() or None
+        if not role_title or not company_name or not source_url.startswith(("http://", "https://")):
+            continue
+
+        remote_hint = True
+        if location_text and any(token in location_text.lower() for token in ("hybrid", "on-site", "onsite", "in office")):
+            remote_hint = False
+
+        evidence_parts = [
+            f"LinkedIn guest search result for '{query}'.",
+            f"Location: {location_text}" if location_text else "",
+            f"Posted: {posted_hint}" if posted_hint else "",
+        ]
+        leads.append(
+            JobLead(
+                company_name=company_name,
+                role_title=role_title,
+                source_url=source_url,
+                source_type="linkedin",
+                direct_job_url=None,
+                location_hint=location_text,
+                posted_date_hint=posted_hint,
+                is_remote_hint=remote_hint,
+                source_query=query,
+                evidence_notes=" ".join(part for part in evidence_parts if part).strip(),
+            )
+        )
+    return leads
+
+
+async def _linkedin_guest_search(query: str, settings: Settings) -> list[JobLead]:
+    leads: list[JobLead] = []
+    seen_urls: set[str] = set()
+    max_candidates = max(settings.max_leads_per_query * 2, 20)
+    recency_seconds = settings.posted_within_days * 24 * 60 * 60
+    async with httpx.AsyncClient(
+        timeout=12.0,
+        follow_redirects=True,
+        headers=SEARCH_ENGINE_HEADERS,
+    ) as client:
+        for start in (0, 25):
+            response = await client.get(
+                LINKEDIN_GUEST_SEARCH_BASE_URL,
+                params={
+                    "keywords": query,
+                    "location": "United States",
+                    "f_WT": "2",
+                    "f_TPR": f"r{recency_seconds}",
+                    "start": str(start),
+                },
+            )
+            response.raise_for_status()
+            for lead in _extract_linkedin_guest_search_leads(response.text, query):
+                key = _lead_dedupe_key(lead)
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                leads.append(lead)
+                if len(leads) >= max_candidates:
+                    return leads
+    return leads
+
+
+async def _builtin_search(query: str, settings: Settings) -> list[JobLead]:
+    search_terms = _builtin_search_terms_for_query(query)
+    if not search_terms:
+        return []
+
+    leads: list[JobLead] = []
+    seen_detail_urls: set[str] = set()
+    max_candidates = max(settings.max_leads_per_query * 2, 12)
+    successful_searches = 0
+    last_error: Exception | None = None
+    search_base_urls = _builtin_search_base_urls(query)
+    category_urls = _builtin_category_urls_for_query(query)
+
+    async with httpx.AsyncClient(
+        timeout=20.0,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
+        for search_term in search_terms:
+            for base_url in search_base_urls:
+                try:
+                    page_html = await _fetch_builtin_page_with_retry(
+                        client,
+                        f"{base_url}/jobs",
+                        params={"search": search_term, "location": "Remote"},
+                    )
+                    successful_searches += 1
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    continue
+                for detail_url, title, description in _extract_builtin_search_items(page_html):
+                    if detail_url in seen_detail_urls or not _builtin_listing_looks_relevant(title, description, query):
+                        continue
+                    seen_detail_urls.add(detail_url)
+                    try:
+                        lead = await _fetch_builtin_job_lead(
+                            client,
+                            detail_url,
+                            query,
+                            description,
+                            source_is_remote_listing=True,
+                        )
+                    except Exception:
+                        continue
+                    if lead is None:
+                        continue
+                    leads.append(lead)
+                    if len(leads) >= max_candidates:
+                        break
+                if len(leads) >= max_candidates:
+                    break
+            if len(leads) >= max_candidates:
+                break
+
+        if len(leads) < max_candidates:
+            for category_url in category_urls:
+                for paginated_url in _builtin_paginated_category_urls(category_url, BUILTIN_CATEGORY_PAGE_COUNT):
+                    try:
+                        page_html = await _fetch_builtin_page_with_retry(client, paginated_url)
+                        successful_searches += 1
+                    except httpx.HTTPError as exc:
+                        last_error = exc
+                        continue
+                    for detail_url, title, description in _extract_builtin_search_items(page_html):
+                        if detail_url in seen_detail_urls or not _builtin_listing_looks_relevant(title, description, query):
+                            continue
+                        seen_detail_urls.add(detail_url)
+                        try:
+                            lead = await _fetch_builtin_job_lead(
+                                client,
+                                detail_url,
+                                query,
+                                description,
+                                source_is_remote_listing=True,
+                            )
+                        except Exception:
+                            continue
+                        if lead is None:
+                            continue
+                        leads.append(lead)
+                        if len(leads) >= max_candidates:
+                            break
+                    if len(leads) >= max_candidates:
+                        break
+                if len(leads) >= max_candidates:
+                    break
+    if successful_searches == 0 and last_error is not None:
+        raise last_error
+    return leads
+
+
+def _deterministic_trim_local_leads(
+    settings: Settings,
+    query: str,
+    leads: list[JobLead],
+    *,
+    limit: int | None = None,
+) -> list[JobLead]:
+    normalized = _normalize_and_filter_discovery_leads(leads, query)
+    normalized.sort(key=lambda lead: _lead_priority(lead, settings))
+    deduped: list[JobLead] = []
+    seen_role_keys: set[str] = set()
+    for lead in normalized:
+        role_key = _normalize_job_key(lead.company_name, lead.role_title)
+        if role_key in seen_role_keys:
+            continue
+        seen_role_keys.add(role_key)
+        deduped.append(lead)
+    effective_limit = settings.max_leads_per_query if limit is None else max(1, limit)
+    return deduped[:effective_limit]
+
+
+def _dedupe_round_leads(leads: list[JobLead], settings: Settings) -> list[JobLead]:
+    best_by_role: dict[str, JobLead] = {}
+    for lead in leads:
+        role_key = _normalize_job_key(lead.company_name, lead.role_title)
+        existing = best_by_role.get(role_key)
+        if existing is None or _lead_priority(lead, settings) < _lead_priority(existing, settings):
+            best_by_role[role_key] = lead
+    return sorted(best_by_role.values(), key=lambda lead: _lead_priority(lead, settings))
+
+
+def _load_seed_leads_from_file(settings: Settings) -> list[JobLead]:
+    path = settings.data_dir / SEED_LEADS_FILENAME
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    raw_leads = payload.get("leads") if isinstance(payload, dict) else payload
+    if not isinstance(raw_leads, list):
+        return []
+
+    leads: list[JobLead] = []
+    for item in raw_leads:
+        if not isinstance(item, dict):
+            continue
+        try:
+            lead = JobLead.model_validate(item)
+        except Exception:
+            continue
+        if not lead.direct_job_url or not _is_allowed_direct_job_url(lead.direct_job_url):
+            continue
+        if not _lead_is_ai_related_product_manager(lead):
+            continue
+        leads.append(lead)
+    return leads
+
+
+def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
+    if not failure.company_name or not failure.role_title or not failure.direct_job_url:
+        return None
+    direct_job_url = _normalize_direct_job_url(failure.direct_job_url)
+    if not _is_allowed_direct_job_url(direct_job_url):
+        return None
+    source_url = failure.source_url or direct_job_url
+    if not source_url.startswith(("http://", "https://")):
+        source_url = direct_job_url
+    lead = JobLead(
+        company_name=failure.company_name,
+        role_title=failure.role_title,
+        source_url=source_url,
+        source_type=_normalize_source_type(direct_job_url),
+        direct_job_url=direct_job_url,
+        location_hint="Remote" if failure.is_remote else None,
+        posted_date_hint=failure.posted_date_text,
+        is_remote_hint=failure.is_remote,
+        salary_text_hint=failure.salary_text,
+        source_query=failure.source_query,
+        evidence_notes=(failure.detail or "Historical lead from prior diagnostics.")[:400],
+    )
+    if not _lead_is_ai_related_product_manager(lead):
+        return None
+    return lead
+
+
+def _seed_lead_from_job_payload(payload: dict[str, object]) -> JobLead | None:
+    try:
+        job = JobPosting.model_validate(payload)
+    except Exception:
+        return None
+    direct_job_url = _normalize_direct_job_url(job.direct_job_url)
+    if not _is_allowed_direct_job_url(direct_job_url):
+        return None
+    lead = JobLead(
+        company_name=job.company_name,
+        role_title=job.role_title,
+        source_url=direct_job_url,
+        source_type=_normalize_source_type(direct_job_url),
+        direct_job_url=direct_job_url,
+        location_hint=job.location_text or ("Remote" if job.is_fully_remote else None),
+        posted_date_hint=job.posted_date_iso or job.posted_date_text,
+        is_remote_hint=job.is_fully_remote,
+        base_salary_min_usd_hint=job.base_salary_min_usd,
+        base_salary_max_usd_hint=job.base_salary_max_usd,
+        salary_text_hint=job.salary_text,
+        source_query=job.source_query,
+        evidence_notes=(job.evidence_notes or "Historical accepted candidate.")[:400],
+    )
+    if not _lead_is_ai_related_product_manager(lead):
+        return None
+    return lead
+
+
+def _load_historical_seed_leads(settings: Settings) -> list[JobLead]:
+    leads: list[JobLead] = []
+    for path in sorted(settings.data_dir.glob("run-*.json"), reverse=True)[:20]:
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for bundle in payload.get("bundles", []):
+            if not isinstance(bundle, dict):
+                continue
+            job_payload = bundle.get("job")
+            if isinstance(job_payload, dict):
+                lead = _seed_lead_from_job_payload(job_payload)
+                if lead is not None:
+                    leads.append(lead)
+        diagnostics = payload.get("search_diagnostics", {})
+        failures = diagnostics.get("failures") if isinstance(diagnostics, dict) else None
+        if not isinstance(failures, list):
+            continue
+        for raw_failure in failures:
+            if not isinstance(raw_failure, dict):
+                continue
+            try:
+                failure = SearchFailure.model_validate(raw_failure)
+            except Exception:
+                continue
+            lead = _seed_lead_from_failure(failure)
+            if lead is not None:
+                leads.append(lead)
+    return leads
+
+
+def _collect_replay_seed_leads(settings: Settings) -> list[JobLead]:
+    file_seed_leads = _load_seed_leads_from_file(settings)
+    curated_seed_keys = {_lead_dedupe_key(lead) for lead in file_seed_leads}
+    deduped: dict[str, JobLead] = {}
+    for lead in [*file_seed_leads, *_load_historical_seed_leads(settings)]:
+        key = _lead_dedupe_key(lead)
+        existing = deduped.get(key)
+        if existing is None or _lead_priority(lead, settings) < _lead_priority(existing, settings):
+            deduped[key] = lead
+    return sorted(
+        deduped.values(),
+        key=lambda lead: (
+            0 if _lead_dedupe_key(lead) in curated_seed_keys else 1,
+            _lead_priority(lead, settings),
+        ),
+    )
+
+
+async def _replay_seed_leads(
+    seed_leads: list[JobLead],
+    *,
+    settings: Settings,
+    diagnostics: SearchDiagnostics,
+    jobs_by_url: dict[str, JobPosting],
+    previously_reported_company_keys: set[str],
+    previously_reported_job_keys: set[str],
+    seen_lead_keys: set[str],
+    total_unique_leads: int,
+    resolved_leads_this_attempt: int,
+    stop_goal: int,
+    lead_timeout_seconds: int,
+    resolution_agent: Agent | None,
+    attempt_number: int,
+    status: StatusReporter | None,
+) -> tuple[int, int]:
+    if not seed_leads:
+        return total_unique_leads, resolved_leads_this_attempt
+
+    fresh_seed_leads: list[JobLead] = []
+    for lead in seed_leads:
+        key = _lead_dedupe_key(lead)
+        if key in seen_lead_keys:
+            continue
+        seen_lead_keys.add(key)
+        total_unique_leads += 1
+        fresh_seed_leads.append(lead)
+
+    fresh_seed_leads = _dedupe_round_leads(fresh_seed_leads, settings)
+    seed_replay_cap = min(
+        len(fresh_seed_leads),
+        max(settings.max_leads_per_query * 4, settings.max_leads_to_resolve_per_pass // 2),
+    )
+    fresh_seed_leads = _apply_company_novelty_quota(
+        fresh_seed_leads,
+        previously_reported_company_keys,
+        min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
+        limit=seed_replay_cap,
+    )
+    if status:
+        status.emit(
+            "search",
+            f"Pass {attempt_number}, replaying {len(fresh_seed_leads)} seeded ATS candidates from prior findings.",
+            attempt_number=attempt_number,
+            round_number=0,
+            unique_leads_discovered=total_unique_leads,
+            qualifying_jobs=len(jobs_by_url),
+        )
+
+    for lead_index, lead in enumerate(fresh_seed_leads, start=1):
+        if len(jobs_by_url) >= stop_goal:
+            break
+        if resolved_leads_this_attempt >= settings.max_leads_to_resolve_per_pass:
+            break
+
+        precheck_failure = _precheck_lead_hints(
+            lead,
+            settings,
+            attempt_number=attempt_number,
+            round_number=0,
+        )
+        if precheck_failure is not None:
+            _record_failure_live(
+                settings,
+                diagnostics,
+                precheck_failure,
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+
+        if not lead.direct_job_url or not _is_allowed_direct_job_url(lead.direct_job_url):
+            _record_failure_live(
+                settings,
+                diagnostics,
+                _make_failure(
+                    stage="resolution",
+                    reason_code="resolution_missing",
+                    detail="Seeded lead did not contain a valid direct ATS URL.",
+                    lead=lead,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+
+        if _normalize_direct_job_url(lead.direct_job_url) in previously_reported_job_keys:
+            _record_failure_live(
+                settings,
+                diagnostics,
+                _make_failure(
+                    stage="filter",
+                    reason_code="already_reported",
+                    detail="Skipping a previously reported job from an earlier run.",
+                    lead=lead,
+                    direct_job_url=lead.direct_job_url,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+
+        if status:
+            status.emit(
+                "search",
+                f"Revalidating seeded lead {lead_index}/{len(fresh_seed_leads)}: {lead.company_name} | {lead.role_title}",
+                attempt_number=attempt_number,
+                round_number=0,
+                lead_index=lead_index,
+                round_lead_count=len(fresh_seed_leads),
+                unique_leads_discovered=total_unique_leads,
+                qualifying_jobs=len(jobs_by_url),
+            )
+
+        resolved_leads_this_attempt += 1
+        candidate = _build_candidate_job(
+            lead,
+            DirectJobResolution(
+                accepted=True,
+                direct_job_url=lead.direct_job_url,
+                ats_platform=urlparse(lead.direct_job_url).netloc or "Unknown",
+                evidence_notes="Revalidated from replayed seed leads.",
+            ),
+        )
+        try:
+            validated, validation_failure = await asyncio.wait_for(
+                _validate_candidate(
+                    lead,
+                    candidate,
+                    settings,
+                    resolution_agent=resolution_agent,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                timeout=lead_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            _record_failure_live(
+                settings,
+                diagnostics,
+                _make_failure(
+                    stage="validation",
+                    reason_code="validation_timeout",
+                    detail=f"Validation timed out after {lead_timeout_seconds}s.",
+                    lead=lead,
+                    direct_job_url=str(candidate.direct_job_url),
+                    candidate=candidate,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+        except Exception as exc:
+            _record_failure_live(
+                settings,
+                diagnostics,
+                _make_failure(
+                    stage="validation",
+                    reason_code="validation_error",
+                    detail=f"Validation failed with an exception: {exc}",
+                    lead=lead,
+                    direct_job_url=str(candidate.direct_job_url),
+                    candidate=candidate,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+
+        if validation_failure is not None:
+            _record_failure_live(
+                settings,
+                diagnostics,
+                validation_failure,
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+
+        if validated is None:
+            continue
+
+        validated_key = _job_posting_dedupe_key(validated)
+        if validated_key in previously_reported_job_keys:
+            _record_failure_live(
+                settings,
+                diagnostics,
+                _make_failure(
+                    stage="filter",
+                    reason_code="already_reported",
+                    detail="Skipping a previously reported job from an earlier run.",
+                    lead=lead,
+                    direct_job_url=str(validated.direct_job_url),
+                    candidate=validated,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
+
+        jobs_by_url.setdefault(validated_key, validated)
+        diagnostics.unique_leads_discovered = total_unique_leads
+        _persist_search_diagnostics(settings, diagnostics)
+        if status:
+            status.emit(
+                "search",
+                f"Accepted job {len(jobs_by_url)}/{stop_goal}: {validated.company_name} | {validated.role_title}",
+                attempt_number=attempt_number,
+                round_number=0,
+                unique_leads_discovered=total_unique_leads,
+                qualifying_jobs=len(jobs_by_url),
+            )
+
+    return total_unique_leads, resolved_leads_this_attempt
+
+
+def _build_lead_from_search_result(url: str, title: str, snippet: str, query: str) -> JobLead | None:
+    normalized_url = _normalize_direct_job_url(url)
+    if not normalized_url.startswith(("http://", "https://")):
+        return None
+    company_name, role_title = _extract_role_company_from_title(title, normalized_url)
+    salary_min, salary_max, salary_text = _extract_salary_hint(snippet)
+    posted_hint = _extract_posted_hint(snippet)
+    source_type = _normalize_source_type(normalized_url)
+    direct_url = normalized_url if _is_allowed_direct_job_url(normalized_url) and not _looks_like_generic_job_url(normalized_url) else None
+    remote_haystack = " ".join(part for part in (title, snippet, normalized_url) if part).lower()
+    if any(token in remote_haystack for token in ("hybrid", "on-site", "onsite", "in office")):
+        is_remote = False
+    elif "remote" in remote_haystack or "work from home" in remote_haystack:
+        is_remote = True
+    else:
+        is_remote = None
+
+    lead = JobLead(
+        company_name=company_name or "Unknown",
+        role_title=role_title or title,
+        source_url=normalized_url,
+        source_type=source_type,
+        direct_job_url=direct_url,
+        location_hint="Remote" if is_remote else None,
+        posted_date_hint=posted_hint,
+        is_remote_hint=is_remote,
+        base_salary_min_usd_hint=salary_min,
+        base_salary_max_usd_hint=salary_max,
+        salary_text_hint=salary_text,
+        source_query=query,
+        evidence_notes=snippet[:400] if snippet else f"Search match from query '{query}'.",
+    )
+    return lead
+
+
+def _build_local_search_engine_queries(query: str) -> list[str]:
+    normalized = " ".join(query.split())
+    if not normalized:
+        return []
+
+    board_batch_index = _stable_text_index(normalized.lower(), len(LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES))
+    ats_batch_index = _stable_text_index(normalized.lower()[::-1], len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES))
+
+    board_domains: list[str] = []
+    for offset in range(min(LOCAL_SEARCH_DOMAIN_BATCH_SPAN, len(LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES))):
+        board_domains.extend(LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES[(board_batch_index + offset) % len(LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES)])
+    ats_domains: list[str] = []
+    for offset in range(min(LOCAL_SEARCH_DOMAIN_BATCH_SPAN, len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES))):
+        ats_domains.extend(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES[(ats_batch_index + offset) % len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES)])
+
+    prioritized_ats_domains = list(dict.fromkeys(ats_domains))[:LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT]
+    prioritized_board_domains = list(dict.fromkeys(board_domains))[:LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT]
+
+    queries: list[str] = []
+    for domain in prioritized_ats_domains:
+        queries.append(f"site:{domain} {normalized}")
+        queries.append(f"site:{domain} {normalized} remote")
+
+    for domain in prioritized_board_domains:
+        queries.append(f"site:{domain} {normalized}")
+        queries.append(f"site:{domain} {normalized} remote")
+
+    queries.extend(
+        [
+            f'"{normalized}" remote',
+            f"{normalized} remote",
+            f'{normalized} "$200,000"',
+            f'{normalized} "posted this week"',
+        ]
+    )
+
+    deduped = _dedupe_queries(queries)
+    return deduped[:LOCAL_SEARCH_TOTAL_QUERY_LIMIT]
+
+
+async def _run_local_search_engine_queries(query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+    queries = _build_local_search_engine_queries(query)
+    merged_results: list[tuple[str, str, str]] = []
+    seen_urls: set[str] = set()
+    useful_result_count = 0
+    last_error: Exception | None = None
+
+    for search_query in queries:
+        try:
+            search_results = await _search_query_across_backends(
+                search_query,
+                max_results=max(max_results_per_query, 14),
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        for url, title, snippet in search_results:
+            normalized_url = _normalize_direct_job_url(url)
+            if normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+            merged_results.append((normalized_url, title, snippet))
+            if (
+                _is_allowed_direct_job_url(normalized_url)
+                or _is_supported_discovery_source_url(normalized_url)
+                or _looks_like_company_job_page(normalized_url)
+            ):
+                useful_result_count += 1
+
+        if useful_result_count >= max(max_results_per_query, 12):
+            break
+
+    if not merged_results and last_error is not None:
+        raise last_error
+    return merged_results
+
+
+async def _cleanup_local_leads_with_ollama(settings: Settings, query: str, leads: list[JobLead]) -> list[JobLead]:
+    if not leads or settings.llm_provider != "ollama":
+        return leads
+    provider = OllamaStructuredProvider(settings)
+    prompt = f"""
+Search query: {query}
+
+Clean and normalize these potential job leads.
+Keep only high-confidence AI-related product manager roles.
+Prefer direct ATS URLs when present.
+Never invent fields.
+Return at most {settings.max_leads_per_query} leads.
+
+Candidates:
+{json.dumps([lead.model_dump(mode="json") for lead in leads], indent=2)}
+""".strip()
+    try:
+        async with LOCAL_OLLAMA_SEMAPHORE:
+            output = await provider.generate_structured(
+                system_prompt="You clean job lead candidates into strict structured output.",
+                user_prompt=prompt,
+                schema=JobLeadSearchResult,
+            )
+        return output.leads
+    except LLMProviderError:
+        return leads
+
+
+async def _refine_local_leads_with_ollama(
+    settings: Settings,
+    query: str,
+    candidate_pool: list[JobLead],
+    *,
+    cleanup_limit: int,
+) -> list[JobLead]:
+    if not candidate_pool or settings.llm_provider != "ollama":
+        return candidate_pool
+
+    cleanup_candidates = _deterministic_trim_local_leads(
+        settings,
+        query,
+        candidate_pool,
+        limit=max(1, cleanup_limit),
+    )
+    cleaned_leads = await _cleanup_local_leads_with_ollama(settings, query, cleanup_candidates)
+    normalized_cleaned = _normalize_and_filter_discovery_leads(cleaned_leads, query)
+    if not normalized_cleaned:
+        return candidate_pool
+    return _merge_and_dedupe_leads(normalized_cleaned, candidate_pool)
+
+
+def _merge_and_dedupe_leads(*groups: list[JobLead]) -> list[JobLead]:
+    merged: list[JobLead] = []
+    seen: set[str] = set()
+    for group in groups:
+        for lead in group:
+            key = _lead_dedupe_key(lead)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(lead)
+    return merged
+
+
+async def _search_single_query_openai(agent: Agent, query: str) -> list[JobLead]:
+    prompt = f"""
+Search seed: {query}
+Find high-confidence AI-related Product Manager leads and return concise structured results only.
+""".strip()
+    result = await Runner.run(agent, prompt)
+    return _normalize_and_filter_discovery_leads(result.final_output.leads, query)
+
+
+async def _search_single_query_local(settings: Settings, query: str) -> tuple[list[JobLead], float]:
+    async def _run_named(name: str, coro, *, timeout_seconds: float | None = None):
+        try:
+            if timeout_seconds is not None:
+                return name, await asyncio.wait_for(coro, timeout=timeout_seconds), None
+            return name, await coro, None
+        except Exception as exc:
+            return name, None, exc
+
+    builtin_leads: list[JobLead] = []
+    linkedin_leads: list[JobLead] = []
+    search_results: list[tuple[str, str, str]] = []
+    builtin_error: Exception | None = None
+    linkedin_error: Exception | None = None
+    search_error: Exception | None = None
+
+    tasks = [
+        asyncio.create_task(
+            _run_named(
+                "builtin",
+                _builtin_search(query, settings),
+                timeout_seconds=min(max(settings.per_query_timeout_seconds / 2, 12), 20),
+            )
+        ),
+        asyncio.create_task(
+            _run_named(
+                "linkedin",
+                _linkedin_guest_search(query, settings),
+                timeout_seconds=min(max(settings.per_query_timeout_seconds / 3, 8), 15),
+            )
+        ),
+        asyncio.create_task(
+            _run_named(
+                "search",
+                _run_local_search_engine_queries(
+                    query,
+                    max_results_per_query=max(settings.max_leads_per_query * 2, 12),
+                ),
+                timeout_seconds=min(max(settings.per_query_timeout_seconds, 20), 35),
+            )
+        ),
+    ]
+
+    for task in asyncio.as_completed(tasks):
+        name, result, error = await task
+        if name == "builtin":
+            builtin_error = error
+            builtin_leads = result or []
+        elif name == "linkedin":
+            linkedin_error = error
+            linkedin_leads = result or []
+        else:
+            search_error = error
+            search_results = result or []
+
+    if not search_results and builtin_error is not None and linkedin_error is not None and search_error is not None:
+        raise LocalSearchBackendBlockedError(
+            f"Built In search failed ({_describe_exception(builtin_error)}); "
+            f"LinkedIn guest search failed ({_describe_exception(linkedin_error)}); "
+            f"search engine discovery failed ({_describe_exception(search_error)})"
+        ) from search_error
+
+    leads: list[JobLead] = []
+    for url, title, snippet in search_results:
+        lead = _build_lead_from_search_result(url, title, snippet, query)
+        if lead is None:
+            continue
+        leads.append(lead)
+
+    merged_leads = _merge_and_dedupe_leads(builtin_leads, linkedin_leads, leads)
+    candidate_pool = _deterministic_trim_local_leads(
+        settings,
+        query,
+        merged_leads,
+        limit=max(settings.max_leads_per_query * 3, 18),
+    )
+    normalized = _deterministic_trim_local_leads(settings, query, candidate_pool)
+    normalized_confidences = [_lead_confidence(lead) for lead in normalized]
+    average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
+
+    should_refine_with_ollama = (
+        settings.llm_provider == "ollama"
+        and len(normalized) >= 3
+        and (
+            average_confidence < min(settings.local_confidence_threshold + 0.1, 0.9)
+            or not any(lead.direct_job_url for lead in normalized[:3])
+        )
+    )
+    if should_refine_with_ollama:
+        refined_pool = await _refine_local_leads_with_ollama(
+            settings,
+            query,
+            candidate_pool,
+            cleanup_limit=max(settings.max_leads_per_query, 8),
+        )
+        normalized = _deterministic_trim_local_leads(settings, query, refined_pool)
+        normalized_confidences = [_lead_confidence(lead) for lead in normalized]
+        average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
+    await asyncio.sleep(0.5)
+    return normalized, average_confidence
+
+
+async def _search_single_query(agent: Agent | None, settings: Settings, query: str) -> list[JobLead]:
+    if settings.llm_provider == "ollama":
+        local_leads, confidence = await _search_single_query_local(settings, query)
+        should_fallback = (
+            settings.use_openai_fallback
+            and agent is not None
+            and (not local_leads or confidence < settings.local_confidence_threshold)
+        )
+        if should_fallback:
+            fallback_leads = await _search_single_query_openai(agent, query)
+            return _merge_and_dedupe_leads(local_leads, fallback_leads)
+        return local_leads
+
+    if agent is None:
+        return []
+    return await _search_single_query_openai(agent, query)
+
+
+async def _search_query_with_context(
+    agent: Agent | None,
+    settings: Settings,
+    query: str,
+    timeout_seconds: int,
+) -> tuple[str, list[JobLead]]:
+    try:
+        return query, await asyncio.wait_for(_search_single_query(agent, settings, query), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise SearchQueryTimeoutError(query) from exc
+    except Exception as exc:
+        raise SearchQueryExecutionError(query, exc) from exc
+
+
+def _build_resolution_prompt(lead: JobLead) -> str:
+    return f"""
+Find the exact direct ATS/company-careers posting URL for this role.
+
+Company: {lead.company_name}
+Role: {lead.role_title}
+Source URL: {lead.source_url}
+Direct URL hint: {lead.direct_job_url or "none"}
+Location hint: {lead.location_hint or "unknown"}
+Posted hint: {lead.posted_date_hint or "unknown"}
+Salary hint: {lead.salary_text_hint or "unknown"}
+Notes: {lead.evidence_notes}
+""".strip()
+
+
+def _build_resolution_retry_prompt(lead: JobLead, bad_direct_url: str, failure_reason: str) -> str:
+    return f"""
+Previous candidate URL was invalid/generic.
+
+Invalid URL: {bad_direct_url}
+Failure reason: {failure_reason}
+
+Find a different exact direct ATS/company-careers posting URL for:
+- Company: {lead.company_name}
+- Role: {lead.role_title}
+- Source URL: {lead.source_url}
+""".strip()
+
+
+def _build_candidate_job(lead: JobLead, resolution: DirectJobResolution) -> JobPosting:
+    direct_job_url = _normalize_direct_job_url(resolution.direct_job_url or lead.direct_job_url or lead.source_url)
+    evidence_lines = [lead.evidence_notes, resolution.evidence_notes]
+    if lead.posted_date_hint:
+        evidence_lines.append(f"Posted hint: {lead.posted_date_hint}")
+    if lead.salary_text_hint:
+        evidence_lines.append(f"Salary hint: {lead.salary_text_hint}")
+    if lead.is_remote_hint:
+        evidence_lines.append("Remote hint from discovery source.")
+    return JobPosting(
+        company_name=lead.company_name,
+        role_title=lead.role_title,
+        direct_job_url=direct_job_url,
+        resolved_job_url=direct_job_url,
+        ats_platform=resolution.ats_platform or urlparse(direct_job_url).netloc or "Unknown",
+        location_text=lead.location_hint or ("Remote" if lead.is_remote_hint else ""),
+        is_fully_remote=lead.is_remote_hint,
+        posted_date_text=lead.posted_date_hint or "",
+        posted_date_iso=None,
+        base_salary_min_usd=lead.base_salary_min_usd_hint,
+        base_salary_max_usd=lead.base_salary_max_usd_hint,
+        salary_text=lead.salary_text_hint,
+        source_query=lead.source_query,
+        evidence_notes=" ".join(part for part in evidence_lines if part).strip(),
+        validation_evidence=[],
+    )
+
+
+def _lead_dedupe_key(lead: JobLead) -> str:
+    direct_or_source = _normalize_direct_job_url(lead.direct_job_url or lead.source_url)
+    return f"{_normalize_job_key(lead.company_name, lead.role_title)}:{direct_or_source}"
+
+
+def _job_posting_dedupe_key(job: JobPosting) -> str:
+    return _normalize_direct_job_url(str(job.resolved_job_url or job.direct_job_url))
+
+
+def _url_candidate_score(url: str, anchor_text: str, lead: JobLead) -> tuple[int, int]:
+    haystack = f"{url} {anchor_text}".lower()
+    parsed = urlparse(url)
+    query = (parsed.query or "").lower()
+    has_job_query_hint = any(token in query for token in COMPANY_JOB_QUERY_HINTS)
+    score = 0
+    for token in lead.company_name.lower().split():
+        if token and token in haystack:
+            score += 3
+    role_score = _role_match_score(lead.role_title, haystack)
+    if has_job_query_hint and role_score < 0:
+        role_score = 0
+    score += role_score
+    if has_job_query_hint:
+        score += 7
+    elif _looks_like_careers_hub_url(url):
+        score += 2
+    if _is_allowed_direct_job_url(url):
+        score += 5
+        if role_score <= 0 and not has_job_query_hint:
+            score -= 10
+    path_bonus = 1 if any(hint in url.lower() for hint in JOB_PATH_HINTS) else 0
+    return score, path_bonus
+
+
+def _link_context_text(link) -> str:
+    parts: list[str] = []
+    link_text = link.get_text(" ", strip=True)
+    if link_text:
+        parts.append(link_text)
+    for attr in ("aria-label", "title"):
+        value = link.get(attr)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+
+    current = link
+    for _ in range(3):
+        current = current.parent
+        if current is None:
+            break
+        context_text = current.get_text(" ", strip=True)
+        if context_text:
+            parts.append(context_text[:400])
+
+    return " ".join(part for part in parts if part)
+
+
+async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
+    candidate_url = _normalize_direct_job_url(lead.direct_job_url or lead.source_url)
+    if candidate_url and _is_allowed_direct_job_url(candidate_url) and not _looks_like_generic_job_url(candidate_url):
+        return candidate_url
+
+    greenhouse_board_url = await _resolve_greenhouse_board_job_url_from_lead(lead)
+    if greenhouse_board_url:
+        return greenhouse_board_url
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=15.0,
+        ) as client:
+            response = await client.get(lead.source_url)
+    except Exception:
+        return None
+
+    resolved_source = _normalize_direct_job_url(str(response.url))
+    if _is_allowed_direct_job_url(resolved_source) and not _looks_like_generic_job_url(resolved_source):
+        return resolved_source
+
+    builtin_apply_url = None
+    if _normalize_source_type(lead.source_url) == "builtin":
+        builtin_apply_url = _extract_builtin_apply_url(response.text)
+        if builtin_apply_url:
+            normalized_builtin_apply_url = _normalize_direct_job_url(builtin_apply_url)
+            parsed_builtin_apply = urlparse(normalized_builtin_apply_url)
+            builtin_apply_query = (parsed_builtin_apply.query or "").lower()
+            has_job_query_hint = any(token in builtin_apply_query for token in COMPANY_JOB_QUERY_HINTS)
+            if _is_allowed_direct_job_url(normalized_builtin_apply_url) and (
+                not _looks_like_generic_job_url(normalized_builtin_apply_url) or has_job_query_hint
+            ):
+                return normalized_builtin_apply_url
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    candidates: list[tuple[tuple[int, int], str]] = []
+    if builtin_apply_url:
+        normalized_builtin_apply_url = _normalize_direct_job_url(builtin_apply_url)
+        if _is_allowed_direct_job_url(normalized_builtin_apply_url):
+            candidates.append((_url_candidate_score(normalized_builtin_apply_url, "Apply", lead), normalized_builtin_apply_url))
+    for link in soup.select("a[href]"):
+        href = link.get("href")
+        if not href:
+            continue
+        absolute_url = _normalize_direct_job_url(urljoin(resolved_source, href))
+        if not _is_allowed_direct_job_url(absolute_url) or _looks_like_generic_job_url(absolute_url):
+            continue
+        score = _url_candidate_score(absolute_url, _link_context_text(link), lead)
+        candidates.append((score, absolute_url))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_url = candidates[0]
+    if best_score[0] <= 0:
+        return None
+    return best_url
+
+
+async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=15.0,
+        ) as client:
+            response = await client.get(lead.source_url)
+    except Exception:
+        return []
+
+    resolved_source = _normalize_direct_job_url(str(response.url))
+    candidates: dict[str, tuple[int, int]] = {}
+
+    def maybe_add(url: str | None, anchor_text: str = "") -> None:
+        if not url:
+            return
+        normalized_url = _normalize_direct_job_url(urljoin(resolved_source, url))
+        if not normalized_url or normalized_url == resolved_source:
+            return
+        if any(fragment in (urlparse(normalized_url).netloc or "").lower() for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+            return
+        if not (
+            _is_allowed_direct_job_url(normalized_url)
+            or _looks_like_careers_hub_url(normalized_url)
+            or _looks_like_company_homepage_url(normalized_url)
+        ):
+            return
+        score = _url_candidate_score(normalized_url, anchor_text, lead)
+        previous = candidates.get(normalized_url)
+        if previous is None or score > previous:
+            candidates[normalized_url] = score
+
+    if _normalize_source_type(lead.source_url) == "builtin":
+        maybe_add(_extract_builtin_apply_url(response.text), "Apply")
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for link in soup.select("a[href]"):
+        maybe_add(link.get("href"), _link_context_text(link))
+
+    for raw_url in re.findall(r"https?://[^\s\"'<>]+", response.text):
+        maybe_add(raw_url, "")
+
+    ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+    return [url for url, score in ranked if score[0] > 0][:8]
+
+
+async def _resolve_lead_via_company_careers_pages(lead: JobLead) -> DirectJobResolution | None:
+    initial_urls = await _extract_source_followup_resolution_urls(lead)
+    if len(initial_urls) < 4:
+        searched_urls = await _search_company_resolution_candidates(lead)
+        for url in searched_urls:
+            if url not in initial_urls:
+                initial_urls.append(url)
+    if not initial_urls:
+        return None
+
+    queue: deque[tuple[str, int]] = deque((url, 0) for url in initial_urls)
+    visited: set[str] = set()
+    best_direct_url: str | None = None
+    best_direct_score: tuple[int, int] | None = None
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+        timeout=15.0,
+    ) as client:
+        while queue and len(visited) < 10:
+            page_url, depth = queue.popleft()
+            normalized_page_url = _normalize_direct_job_url(page_url)
+            if normalized_page_url in visited:
+                continue
+            visited.add(normalized_page_url)
+
+            page_lead = lead.model_copy(
+                update={
+                    "source_url": normalized_page_url,
+                    "source_type": "company_site",
+                    "direct_job_url": None,
+                }
+            )
+            direct_url = await _extract_direct_job_url_from_source(page_lead)
+            if direct_url:
+                score = _url_candidate_score(direct_url, "", lead)
+                if best_direct_score is None or score > best_direct_score:
+                    best_direct_url = direct_url
+                    best_direct_score = score
+                    page_host = (urlparse(normalized_page_url).netloc or "").lower()
+                    if depth >= 2 or any(fragment in page_host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+                        break
+
+            if depth >= 2:
+                continue
+
+            try:
+                response = await client.get(normalized_page_url)
+            except Exception:
+                continue
+            if response.status_code != 200:
+                continue
+
+            followup_urls = _extract_followup_resolution_urls(str(response.url), response.text)
+            for followup_url in followup_urls:
+                if followup_url not in visited:
+                    queue.append((followup_url, depth + 1))
+
+    if not best_direct_url:
+        return None
+    return DirectJobResolution(
+        accepted=True,
+        direct_job_url=best_direct_url,
+        ats_platform=urlparse(best_direct_url).netloc,
+        evidence_notes="Resolved via company homepage/careers discovery and ATS board traversal.",
+    )
+
+
+async def _resolve_lead_to_direct_job_url(agent: Agent | None, lead: JobLead) -> DirectJobResolution | None:
+    locally_resolved_url = await _extract_direct_job_url_from_source(lead)
+    if locally_resolved_url:
+        return DirectJobResolution(
+            accepted=True,
+            direct_job_url=locally_resolved_url,
+            ats_platform=urlparse(locally_resolved_url).netloc,
+            evidence_notes="Resolved locally from the discovered source page.",
+        )
+
+    company_site_resolution = await _resolve_lead_via_company_careers_pages(lead)
+    if company_site_resolution:
+        return company_site_resolution
+
+    if agent is None:
+        return None
+
+    result = await Runner.run(agent, _build_resolution_prompt(lead))
+    resolution = result.final_output
+    if not resolution.accepted or not resolution.direct_job_url:
+        return None
+    normalized_url = _normalize_direct_job_url(resolution.direct_job_url)
+    if not _is_allowed_direct_job_url(normalized_url) or _looks_like_generic_job_url(normalized_url):
+        return None
+    return resolution.model_copy(update={"direct_job_url": normalized_url})
+
+
+async def _repair_direct_job_url(
+    agent: Agent | None,
+    lead: JobLead,
+    bad_direct_url: str,
+    failure_reason: str,
+) -> str | None:
+    retry_lead = lead.model_copy(update={"direct_job_url": None})
+    local_retry = await _extract_direct_job_url_from_source(retry_lead)
+    if local_retry and local_retry != bad_direct_url and _is_allowed_direct_job_url(local_retry):
+        return local_retry
+
+    if agent is None:
+        return None
+
+    result = await Runner.run(agent, _build_resolution_retry_prompt(lead, bad_direct_url, failure_reason))
+    resolution = result.final_output
+    if not resolution.accepted or not resolution.direct_job_url:
+        return None
+    normalized_url = _normalize_direct_job_url(resolution.direct_job_url)
+    if normalized_url == bad_direct_url:
+        return None
+    if not _is_allowed_direct_job_url(normalized_url) or _looks_like_generic_job_url(normalized_url):
+        return None
+    return normalized_url
+
+
+def _make_failure(
+    *,
+    stage: str,
+    reason_code: str,
+    detail: str,
+    lead: JobLead | None = None,
+    source_query: str | None = None,
+    direct_job_url: str | None = None,
+    candidate: JobPosting | None = None,
+    attempt_number: int,
+    round_number: int,
+) -> SearchFailure:
+    company_name = lead.company_name if lead else (candidate.company_name if candidate else None)
+    role_title = lead.role_title if lead else (candidate.role_title if candidate else None)
+    failure_source_query = source_query if source_query is not None else (lead.source_query if lead else (candidate.source_query if candidate else None))
+    source_url = lead.source_url if lead else None
+    posted_date_text = lead.posted_date_hint if lead else (candidate.posted_date_text if candidate else None)
+    salary_text = lead.salary_text_hint if lead else (candidate.salary_text if candidate else None)
+    is_remote = lead.is_remote_hint if lead else (candidate.is_fully_remote if candidate else None)
+    return SearchFailure(
+        stage=stage,  # type: ignore[arg-type]
+        reason_code=reason_code,
+        detail=detail,
+        company_name=company_name,
+        role_title=role_title,
+        source_query=failure_source_query,
+        source_url=source_url,
+        direct_job_url=direct_job_url or (candidate.direct_job_url if candidate else None),
+        posted_date_text=posted_date_text,
+        salary_text=salary_text,
+        is_remote=is_remote,
+        attempt_number=attempt_number,
+        round_number=round_number,
+    )
+
+
+def _record_failure(diagnostics: SearchDiagnostics, failure: SearchFailure) -> None:
+    diagnostics.failures.append(failure)
+
+
+def _record_failure_live(
+    settings: Settings,
+    diagnostics: SearchDiagnostics,
+    failure: SearchFailure,
+    *,
+    unique_leads_discovered: int | None = None,
+) -> None:
+    if unique_leads_discovered is not None:
+        diagnostics.unique_leads_discovered = unique_leads_discovered
+    _record_failure(diagnostics, failure)
+    _persist_search_diagnostics(settings, diagnostics)
+
+
+def _persist_search_diagnostics(settings: Settings, diagnostics: SearchDiagnostics) -> None:
+    save_json_snapshot(
+        settings.data_dir / "search-diagnostics-latest.json",
+        diagnostics.model_dump(mode="json"),
+    )
+
+
+def _precheck_lead_hints(
+    lead: JobLead,
+    settings: Settings,
+    *,
+    attempt_number: int,
+    round_number: int,
+) -> SearchFailure | None:
+    if "product manager" not in lead.role_title.lower():
+        return _make_failure(
+            stage="filter",
+            reason_code="not_product_manager_hint",
+            detail="Discovery lead title did not clearly indicate a product manager role.",
+            lead=lead,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    return None
+
+
+def _is_generic_job_board_page(snapshot: JobPageSnapshot) -> bool:
+    if _looks_like_generic_job_url(snapshot.resolved_url):
+        return True
+    page_title = (snapshot.page_title or "").lower()
+    role_title = (snapshot.role_title or "").lower()
+    text_excerpt = snapshot.text_excerpt.lower()
+    if "error=true" in snapshot.resolved_url.lower():
+        return True
+    if page_title.startswith("jobs at "):
+        return True
+    if role_title in {"jobs", "job", "current openings"}:
+        return True
+    if "current openings" in text_excerpt and "powered by greenhouse" in text_excerpt:
+        return True
+    return False
+
+
+def _is_insufficient_quota_error(exc: Exception) -> bool:
+    return "insufficient_quota" in str(exc)
+
+
+def _snapshot_remote_signal_is_low_confidence(snapshot: JobPageSnapshot) -> bool:
+    text = " ".join(
+        part for part in (snapshot.text_excerpt, " ".join(snapshot.evidence_snippets), snapshot.page_title or "") if part
+    ).lower()
+    if not text.strip():
+        return True
+    weak_patterns = (
+        "enable javascript to run this app",
+        "job you are trying to apply for has been filled",
+        "job has been filled",
+        "we're sorry",
+    )
+    return any(pattern in text for pattern in weak_patterns)
+
+
+def _snapshot_role_title_is_specific(role_title: str | None) -> bool:
+    normalized = (role_title or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in {
+        "careers",
+        "career",
+        "jobs",
+        "job",
+        "current openings",
+        "open positions",
+        "opportunities",
+    }:
+        return False
+    if normalized.startswith("careers at ") or normalized.startswith("jobs at "):
+        return False
+    return True
+
+
+def _merge_candidate_with_snapshot(candidate: JobPosting, snapshot: JobPageSnapshot) -> JobPosting:
+    remote_value = snapshot.is_fully_remote if snapshot.is_fully_remote is not None else candidate.is_fully_remote
+    if (
+        snapshot.is_fully_remote is False
+        and candidate.is_fully_remote is True
+        and _snapshot_remote_signal_is_low_confidence(snapshot)
+    ):
+        remote_value = True
+
+    merged = candidate.model_copy(
+        update={
+            "company_name": snapshot.company_name or candidate.company_name,
+            "role_title": snapshot.role_title if _snapshot_role_title_is_specific(snapshot.role_title) else candidate.role_title,
+            "direct_job_url": snapshot.resolved_url,
+            "resolved_job_url": snapshot.resolved_url,
+            "ats_platform": snapshot.ats_platform or candidate.ats_platform,
+            "location_text": snapshot.location_text or candidate.location_text,
+            "is_fully_remote": remote_value,
+            "posted_date_text": snapshot.posted_date_text or candidate.posted_date_text,
+            "posted_date_iso": snapshot.posted_date_iso or candidate.posted_date_iso,
+            "base_salary_min_usd": (
+                snapshot.base_salary_min_usd
+                if snapshot.base_salary_min_usd is not None
+                else candidate.base_salary_min_usd
+            ),
+            "base_salary_max_usd": (
+                snapshot.base_salary_max_usd
+                if snapshot.base_salary_max_usd is not None
+                else candidate.base_salary_max_usd
+            ),
+            "salary_text": snapshot.salary_text or candidate.salary_text,
+            "job_page_title": snapshot.page_title or candidate.job_page_title,
+            "validation_evidence": list(dict.fromkeys([*snapshot.evidence_snippets, *candidate.validation_evidence]))[:8],
+            "evidence_notes": " ".join(
+                part for part in (candidate.evidence_notes, " ".join(snapshot.evidence_snippets)) if part
+            ).strip(),
+        }
+    )
+    return merged
+
+
+def _salary_is_base_salary(job: JobPosting, snapshot: JobPageSnapshot) -> bool:
+    haystack = " ".join(
+        part
+        for part in (
+            job.salary_text or "",
+            snapshot.text_excerpt[:3000],
+            job.evidence_notes,
+        )
+        if part
+    ).lower()
+    if re.search(r"\bon[-\s]?target earnings?\b|\bote\b", haystack):
+        if "base salary" not in haystack:
+            return False
+    return True
+
+
+def _evaluate_merged_job(
+    job: JobPosting,
+    snapshot: JobPageSnapshot,
+    settings: Settings,
+    *,
+    expected_company_name: str | None = None,
+) -> tuple[str | None, str]:
+    job_url = str(job.resolved_job_url or job.direct_job_url)
+    if not _is_allowed_direct_job_url(job_url):
+        return "direct_url_not_allowed", "Resolved URL is not a direct ATS or company careers page."
+
+    if _is_generic_job_board_page(snapshot):
+        return "not_specific_job_page", "Resolved page is a board index or an invalid job page, not a specific posting."
+
+    if expected_company_name and not _is_weak_company_hint(expected_company_name) and not _company_names_match(expected_company_name, job.company_name):
+        return "company_mismatch", f"Resolved job company '{job.company_name}' did not match expected company '{expected_company_name}'."
+
+    if not _is_ai_related_product_manager(job):
+        return "not_ai_product_manager", "Role did not look like an AI-related product manager position."
+
+    if job.is_fully_remote is False:
+        return "not_remote", "Role was not clearly fully remote."
+    if job.is_fully_remote is not True:
+        return "remote_unclear", "Remote evidence was ambiguous rather than clearly fully remote."
+
+    if not job.posted_date_iso and not job.posted_date_text:
+        return "missing_posted_date", "No posted date was available from the direct page or trusted hints."
+
+    if not _is_recent_enough(
+        job.posted_date_iso,
+        job.posted_date_text or "",
+        settings.posted_within_days,
+        timezone_name=settings.timezone,
+    ):
+        return "stale_posting", f"Posting date '{job.posted_date_text or job.posted_date_iso}' was older than {settings.posted_within_days} days."
+
+    salary_values = _salary_values(job)
+    if salary_values and max(salary_values) < settings.min_base_salary_usd:
+        return "salary_below_min", f"Salary was below the configured minimum of ${settings.min_base_salary_usd:,}."
+
+    if salary_values and not _salary_is_base_salary(job, snapshot) and not job.salary_inferred:
+        return "salary_not_base", "Compensation looked like OTE or total compensation instead of base salary."
+
+    if not salary_values and not job.salary_inferred:
+        return "missing_salary", "No salary range was available from the direct page or trusted hints."
+
+    return None, "accepted"
+
+
+async def _validate_candidate(
+    lead: JobLead,
+    candidate: JobPosting,
+    settings: Settings,
+    *,
+    resolution_agent: Agent | None,
+    attempt_number: int,
+    round_number: int,
+) -> tuple[JobPosting | None, SearchFailure | None]:
+    snapshot = await fetch_job_page(str(candidate.direct_job_url))
+    if snapshot.status_code != 200:
+        repaired_url = await _repair_direct_job_url(
+            resolution_agent,
+            lead,
+            str(candidate.direct_job_url),
+            f"HTTP {snapshot.status_code}",
+        )
+        if repaired_url:
+            candidate = candidate.model_copy(update={"direct_job_url": repaired_url, "resolved_job_url": repaired_url})
+            snapshot = await fetch_job_page(repaired_url)
+
+    if snapshot.status_code != 200:
+        return None, _make_failure(
+            stage="validation",
+            reason_code="fetch_non_200",
+            detail=f"Direct job page returned HTTP {snapshot.status_code}.",
+            lead=lead,
+            direct_job_url=str(candidate.direct_job_url),
+            candidate=candidate,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+
+    if _is_generic_job_board_page(snapshot):
+        repaired_url = await _repair_direct_job_url(
+            resolution_agent,
+            lead,
+            str(candidate.direct_job_url),
+            "Resolved to a generic board index or invalid job page.",
+        )
+        if repaired_url:
+            candidate = candidate.model_copy(update={"direct_job_url": repaired_url, "resolved_job_url": repaired_url})
+            snapshot = await fetch_job_page(repaired_url)
+
+    merged_job = _apply_salary_inference(_merge_candidate_with_snapshot(candidate, snapshot), snapshot, settings)
+    reason_code, detail = _evaluate_merged_job(
+        merged_job,
+        snapshot,
+        settings,
+        expected_company_name=lead.company_name,
+    )
+    if reason_code:
+        return None, _make_failure(
+            stage="validation",
+            reason_code=reason_code,
+            detail=detail,
+            lead=lead,
+            direct_job_url=str(merged_job.direct_job_url),
+            candidate=merged_job,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    return merged_job, None
+
+
+async def find_matching_jobs(
+    settings: Settings,
+    status: StatusReporter | None = None,
+) -> tuple[list[JobPosting], int, SearchDiagnostics]:
+    stop_goal = max(1, settings.minimum_qualifying_jobs, settings.target_job_count)
+    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=stop_goal)
+    _persist_search_diagnostics(settings, diagnostics)
+    jobs_by_url: dict[str, JobPosting] = {}
+    previously_reported_job_keys = load_previously_reported_job_keys(settings.data_dir)
+    previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
+    seen_lead_keys: set[str] = set()
+    total_unique_leads = 0
+
+    openai_agents_enabled = settings.llm_provider == "openai" or settings.use_openai_fallback
+    resolution_agent = build_direct_job_resolution_agent(settings) if openai_agents_enabled else None
+
+    tuning = SearchTuning(
+        attempt_number=1,
+        prioritize_recency=True,
+        prioritize_salary=settings.min_base_salary_usd >= 180000,
+        prioritize_remote=True,
+        focus_companies=_select_watchlist_focus_companies(settings, previously_reported_company_keys),
+    )
+    for attempt_number in range(1, settings.max_adaptive_search_passes + 1):
+        if len(jobs_by_url) >= stop_goal:
+            break
+
+        if status:
+            status.emit(
+                "search",
+                f"Adaptive search pass {attempt_number} started.",
+                attempt_number=attempt_number,
+                target_job_count=settings.target_job_count,
+                minimum_qualifying_jobs=stop_goal,
+                qualifying_jobs=len(jobs_by_url),
+            )
+
+        discovery_agent = build_job_discovery_agent(settings, tuning) if openai_agents_enabled else None
+        query_rounds = _build_query_rounds(settings, tuning=tuning)
+        attempt_start_leads = total_unique_leads
+        resolved_leads_this_attempt = 0
+        lead_timeout_seconds = settings.per_lead_timeout_seconds
+        if settings.llm_provider == "ollama":
+            lead_timeout_seconds = max(lead_timeout_seconds, 40)
+
+        if attempt_number == 1 and len(jobs_by_url) < stop_goal:
+            total_unique_leads, resolved_leads_this_attempt = await _replay_seed_leads(
+                _collect_replay_seed_leads(settings),
+                settings=settings,
+                diagnostics=diagnostics,
+                jobs_by_url=jobs_by_url,
+                previously_reported_company_keys=previously_reported_company_keys,
+                previously_reported_job_keys=previously_reported_job_keys,
+                seen_lead_keys=seen_lead_keys,
+                total_unique_leads=total_unique_leads,
+                resolved_leads_this_attempt=resolved_leads_this_attempt,
+                stop_goal=stop_goal,
+                lead_timeout_seconds=lead_timeout_seconds,
+                resolution_agent=resolution_agent,
+                attempt_number=attempt_number,
+                status=status,
+            )
+            if len(jobs_by_url) >= stop_goal:
+                diagnostics.unique_leads_discovered = total_unique_leads
+                _persist_search_diagnostics(settings, diagnostics)
+                break
+
+        for round_number, queries in enumerate(query_rounds, start=1):
+            if len(jobs_by_url) >= stop_goal:
+                break
+            if resolved_leads_this_attempt >= settings.max_leads_to_resolve_per_pass:
+                break
+
+            if status:
+                status.emit(
+                    "search",
+                    f"Pass {attempt_number}, round {round_number} started with {len(queries)} queries.",
+                    attempt_number=attempt_number,
+                    round_number=round_number,
+                    qualifying_jobs=len(jobs_by_url),
+                )
+
+            query_timeout_seconds = settings.per_query_timeout_seconds
+            round_leads: list[JobLead] = []
+            query_batches = [queries]
+            if settings.llm_provider == "ollama":
+                query_timeout_seconds = max(query_timeout_seconds * 2, 90)
+                query_batches = _chunk_queries(queries, 3)
+
+            for query_batch in query_batches:
+                tasks = [
+                    asyncio.create_task(
+                        _search_query_with_context(
+                            discovery_agent,
+                            settings,
+                            query,
+                            query_timeout_seconds,
+                        )
+                    )
+                    for query in query_batch
+                ]
+
+                for task in asyncio.as_completed(tasks):
+                    try:
+                        query, results = await task
+                    except SearchQueryTimeoutError as exc:
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="discovery",
+                                reason_code="query_timeout",
+                                detail=f"Discovery query timed out after {query_timeout_seconds}s: {exc.query}",
+                                source_query=exc.query,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        if status:
+                            status.emit(
+                                "search",
+                                f"A discovery query timed out during pass {attempt_number}: {exc.query}",
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                                qualifying_jobs=len(jobs_by_url),
+                            )
+                        continue
+                    except SearchQueryExecutionError as exc:
+                        if _is_insufficient_quota_error(exc.cause):
+                            _record_failure_live(
+                                settings,
+                                diagnostics,
+                                _make_failure(
+                                    stage="discovery",
+                                    reason_code="openai_insufficient_quota",
+                                    detail=f"Discovery query failed because the OpenAI API quota was exhausted: {exc.cause}",
+                                    source_query=exc.query,
+                                    attempt_number=attempt_number,
+                                    round_number=round_number,
+                                ),
+                                unique_leads_discovered=total_unique_leads,
+                            )
+                            raise OpenAIQuotaExceededError(
+                                "OpenAI API quota is exhausted. Add billing or increase quota, then rerun the workflow."
+                            ) from exc
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="discovery",
+                                reason_code="query_failed",
+                                detail=f"Discovery query failed: {_describe_exception(exc.cause)}",
+                                source_query=exc.query,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        if status:
+                            status.emit(
+                                "search",
+                                f"A discovery query failed during pass {attempt_number}: {exc.query}",
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                                qualifying_jobs=len(jobs_by_url),
+                            )
+                        continue
+
+                    fresh_leads = 0
+                    for lead in results:
+                        key = _lead_dedupe_key(lead)
+                        if key in seen_lead_keys:
+                            continue
+                        seen_lead_keys.add(key)
+                        total_unique_leads += 1
+                        fresh_leads += 1
+                        round_leads.append(lead)
+
+                    if status:
+                        status.emit(
+                            "search",
+                            f"Query finished: '{query}' produced {fresh_leads} new leads.",
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                            query=query,
+                            unique_leads_discovered=total_unique_leads,
+                            qualifying_jobs=len(jobs_by_url),
+                        )
+                    diagnostics.unique_leads_discovered = total_unique_leads
+                    _persist_search_diagnostics(settings, diagnostics)
+
+            round_leads = _dedupe_round_leads(round_leads, settings)
+            remaining_resolution_budget = max(0, settings.max_leads_to_resolve_per_pass - resolved_leads_this_attempt)
+            known_company_keys_for_round = previously_reported_company_keys.union(
+                {_normalize_company_key(job.company_name) for job in jobs_by_url.values()}
+            )
+            round_leads = _apply_company_novelty_quota(
+                round_leads,
+                known_company_keys_for_round,
+                min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
+                limit=remaining_resolution_budget or None,
+            )
+            if status:
+                status.emit(
+                    "search",
+                    f"Pass {attempt_number}, round {round_number} yielded {len(round_leads)} unique leads to resolve.",
+                    attempt_number=attempt_number,
+                    round_number=round_number,
+                    unique_leads_discovered=total_unique_leads,
+                    qualifying_jobs=len(jobs_by_url),
+                )
+
+            for lead_index, lead in enumerate(round_leads, start=1):
+                if len(jobs_by_url) >= stop_goal:
+                    break
+                if resolved_leads_this_attempt >= settings.max_leads_to_resolve_per_pass:
+                    break
+
+                precheck_failure = _precheck_lead_hints(
+                    lead,
+                    settings,
+                    attempt_number=attempt_number,
+                    round_number=round_number,
+                )
+                if precheck_failure is not None:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        precheck_failure,
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                if status:
+                    status.emit(
+                        "search",
+                        f"Resolving lead {lead_index}/{len(round_leads)}: {lead.company_name} | {lead.role_title}",
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                        lead_index=lead_index,
+                        round_lead_count=len(round_leads),
+                        unique_leads_discovered=total_unique_leads,
+                        qualifying_jobs=len(jobs_by_url),
+                    )
+
+                resolved_leads_this_attempt += 1
+                try:
+                    resolution = await asyncio.wait_for(
+                        _resolve_lead_to_direct_job_url(resolution_agent, lead),
+                        timeout=lead_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="resolution",
+                            reason_code="resolution_timeout",
+                            detail=f"Resolution timed out after {lead_timeout_seconds}s.",
+                            lead=lead,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+                except Exception as exc:
+                    if _is_insufficient_quota_error(exc):
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="resolution",
+                                reason_code="openai_insufficient_quota",
+                                detail=f"Resolution failed because the OpenAI API quota was exhausted: {exc}",
+                                lead=lead,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        raise OpenAIQuotaExceededError(
+                            "OpenAI API quota is exhausted. Add billing or increase quota, then rerun the workflow."
+                        ) from exc
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="resolution",
+                            reason_code="resolution_error",
+                            detail=f"Resolution failed with an exception: {exc}",
+                            lead=lead,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                if resolution is None:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="resolution",
+                            reason_code="resolution_missing",
+                            detail="Could not resolve the discovery lead to a direct ATS or company careers URL.",
+                            lead=lead,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                if not _is_allowed_direct_job_url(resolution.direct_job_url or ""):
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="resolution",
+                            reason_code="resolution_blocked_url",
+                            detail="Resolution returned a blocked or aggregator URL.",
+                            lead=lead,
+                            direct_job_url=resolution.direct_job_url,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                normalized_resolution_url = _normalize_direct_job_url(resolution.direct_job_url or "")
+                if normalized_resolution_url in previously_reported_job_keys:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="filter",
+                            reason_code="already_reported",
+                            detail="Skipping a previously reported job from an earlier run.",
+                            lead=lead,
+                            direct_job_url=normalized_resolution_url,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                candidate = _build_candidate_job(lead, resolution)
+                try:
+                    validated, validation_failure = await asyncio.wait_for(
+                        _validate_candidate(
+                            lead,
+                            candidate,
+                            settings,
+                            resolution_agent=resolution_agent,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        timeout=lead_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="validation",
+                            reason_code="validation_timeout",
+                            detail=f"Validation timed out after {lead_timeout_seconds}s.",
+                            lead=lead,
+                            direct_job_url=str(candidate.direct_job_url),
+                            candidate=candidate,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+                except Exception as exc:
+                    if _is_insufficient_quota_error(exc):
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="validation",
+                                reason_code="openai_insufficient_quota",
+                                detail=f"Validation failed because the OpenAI API quota was exhausted: {exc}",
+                                lead=lead,
+                                direct_job_url=str(candidate.direct_job_url),
+                                candidate=candidate,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        raise OpenAIQuotaExceededError(
+                            "OpenAI API quota is exhausted. Add billing or increase quota, then rerun the workflow."
+                        ) from exc
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="validation",
+                            reason_code="validation_error",
+                            detail=f"Validation failed with an exception: {exc}",
+                            lead=lead,
+                            direct_job_url=str(candidate.direct_job_url),
+                            candidate=candidate,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                if validation_failure is not None:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        validation_failure,
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                if validated is None:
+                    continue
+
+                validated_key = _job_posting_dedupe_key(validated)
+                if validated_key in previously_reported_job_keys:
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="filter",
+                            reason_code="already_reported",
+                            detail="Skipping a previously reported job from an earlier run.",
+                            lead=lead,
+                            direct_job_url=str(validated.direct_job_url),
+                            candidate=validated,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    continue
+
+                jobs_by_url.setdefault(validated_key, validated)
+                diagnostics.unique_leads_discovered = total_unique_leads
+                _persist_search_diagnostics(settings, diagnostics)
+                if status:
+                    status.emit(
+                        "search",
+                        f"Accepted job {len(jobs_by_url)}/{stop_goal}: {validated.company_name} | {validated.role_title}",
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                        unique_leads_discovered=total_unique_leads,
+                        qualifying_jobs=len(jobs_by_url),
+                    )
+
+        diagnostics.unique_leads_discovered = total_unique_leads
+        attempt_failures = _failure_counts_for_attempt(diagnostics, attempt_number)
+        diagnostics.passes.append(
+            SearchPassSummary(
+                attempt_number=attempt_number,
+                unique_leads_discovered=total_unique_leads - attempt_start_leads,
+                qualifying_jobs=len(jobs_by_url),
+                failure_counts=dict(attempt_failures),
+                accepted_job_urls=list(jobs_by_url.keys()),
+                query_count=sum(len(query_round) for query_round in query_rounds),
+            )
+        )
+        _persist_search_diagnostics(settings, diagnostics)
+
+        if status:
+            status.emit(
+                "search",
+                f"Pass {attempt_number} completed after resolving {resolved_leads_this_attempt} leads. Top rejection reasons: {_top_failure_summary(diagnostics, attempt_number)}",
+                attempt_number=attempt_number,
+                qualifying_jobs=len(jobs_by_url),
+                unique_leads_discovered=total_unique_leads,
+            )
+
+        if len(jobs_by_url) >= stop_goal:
+            break
+
+        tuning = _derive_next_tuning(settings, diagnostics, attempt_number)
+
+    jobs = list(jobs_by_url.values())
+    jobs.sort(key=lambda item: (item.company_name.lower(), item.role_title.lower()))
+
+    if status:
+        if len(jobs) >= stop_goal:
+            status.emit(
+                "search",
+                f"Search target reached with {len(jobs)} qualifying jobs.",
+                unique_leads_discovered=total_unique_leads,
+                qualifying_jobs=len(jobs),
+            )
+        else:
+            status.emit(
+                "search",
+                f"Search finished with {len(jobs)} qualifying jobs after exhausting the configured adaptive passes.",
+                unique_leads_discovered=total_unique_leads,
+                qualifying_jobs=len(jobs),
+                top_rejection_reasons=_top_failure_summary(diagnostics, diagnostics.passes[-1].attempt_number if diagnostics.passes else 1),
+            )
+    _persist_search_diagnostics(settings, diagnostics)
+    return jobs, total_unique_leads, diagnostics

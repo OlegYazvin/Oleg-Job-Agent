@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Agent LinkedIn Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="hero">
+        <p class="eyebrow">Job Agent</p>
+        <h1>LinkedIn Draft Bridge</h1>
+        <p class="subhead">Capture search results, cache live drafts, and open prefilled LinkedIn messages.</p>
+      </header>
+
+      <section class="panel">
+        <label class="field">
+          <span>Bridge URL</span>
+          <input id="bridge-url" type="text" />
+        </label>
+        <label class="checkbox">
+          <input id="auto-capture" type="checkbox" />
+          <span>Auto-capture LinkedIn search tabs</span>
+        </label>
+        <div class="actions">
+          <button id="save-settings" type="button">Save</button>
+          <button id="ping-bridge" type="button" class="secondary">Ping Bridge</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <p class="panel-eyebrow">Live Outreach</p>
+            <h2>Cached drafts</h2>
+          </div>
+          <span id="draft-count" class="count-pill">0</span>
+        </div>
+        <div class="actions">
+          <button id="refresh-drafts" type="button">Refresh</button>
+          <button id="open-all-drafts" type="button" class="secondary">Open All Live</button>
+        </div>
+        <p id="draft-meta" class="meta"></p>
+        <div id="draft-list" class="draft-list"></div>
+      </section>
+
+      <p id="status" class="status"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

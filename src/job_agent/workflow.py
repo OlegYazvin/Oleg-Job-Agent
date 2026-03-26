@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from datetime import datetime
+from uuid import uuid4
+
+from .config import Settings
+from .drafting import draft_outreach_bundle
+from .history import record_failed_run
+from .job_search import find_matching_jobs
+from .linkedin_extension_bridge import LinkedInExtensionBridge
+from .linkedin import LinkedInClient
+from .models import JobOutreachBundle, RunManifest
+from .reports import build_live_outreach_payload, build_manifest, build_message_document, build_summary_document
+from .status import StatusReporter
+from .storage import save_run_artifacts
+
+
+async def _heartbeat(status: StatusReporter, interval_seconds: int) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        status.heartbeat("Workflow still running.")
+
+
+async def _run_daily_workflow_body(
+    settings: Settings,
+    *,
+    run_id: str,
+    status: StatusReporter | None = None,
+) -> tuple[list[JobOutreachBundle], RunManifest]:
+    jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(settings, status=status)
+    linkedin = LinkedInClient(settings)
+    bundles: list[JobOutreachBundle] = []
+
+    async def process_jobs(linkedin_context=None, extension_bridge: LinkedInExtensionBridge | None = None) -> None:
+        for index, job in enumerate(jobs, start=1):
+            if settings.linkedin_manual_review_mode:
+                manual_links = linkedin.build_manual_review_links(job.company_name, job.role_title)
+                manual_notes = [
+                    "Open the 1st- and 2nd-degree search links while logged into LinkedIn.",
+                    "In LinkedIn, apply the Current Company filter to the exact company before selecting contacts.",
+                    "Pick only contacts that currently work at the company and are relevant to hiring or PM/AI leadership.",
+                    "After selecting contacts, rerun outreach drafting against those contacts if you want personalized messages.",
+                ]
+                if status:
+                    status.emit(
+                        "linkedin",
+                        f"Prepared manual LinkedIn review links for {job.company_name} ({index}/{len(jobs)}).",
+                        qualifying_jobs=len(jobs),
+                        current_company=job.company_name,
+                        current_role=job.role_title,
+                        manual_link_count=len(manual_links),
+                    )
+                bundles.append(
+                    JobOutreachBundle(
+                        job=job,
+                        manual_review_links=manual_links,
+                        manual_review_notes=manual_notes,
+                    )
+                )
+                continue
+
+            if status:
+                status.emit(
+                    "linkedin",
+                    f"Discovering LinkedIn contacts for {job.company_name} ({index}/{len(jobs)}).",
+                    qualifying_jobs=len(jobs),
+                    current_company=job.company_name,
+                    current_role=job.role_title,
+                )
+            try:
+                discovery = await linkedin.discover_company_contacts(
+                    job.company_name,
+                    role_title=job.role_title,
+                    context=linkedin_context,
+                    extension_bridge=extension_bridge,
+                )
+            except Exception as exc:
+                print(f"LinkedIn discovery failed for {job.company_name}: {exc}")
+                discovery = None
+                if status:
+                    status.emit(
+                        "linkedin",
+                        f"LinkedIn discovery failed for {job.company_name}: {exc}",
+                        qualifying_jobs=len(jobs),
+                        current_company=job.company_name,
+                    )
+
+            if discovery is None:
+                bundle = await draft_outreach_bundle(settings, job, [], [])
+                bundles.append(bundle)
+                continue
+
+            if status:
+                status.emit(
+                    "drafting",
+                    f"Drafting outreach for {job.company_name}.",
+                    first_order_contacts=len(discovery.first_order_contacts),
+                    second_order_contacts=len(discovery.second_order_contacts),
+                    current_company=job.company_name,
+                    current_role=job.role_title,
+                )
+            bundle = await draft_outreach_bundle(
+                settings,
+                job,
+                discovery.first_order_contacts,
+                discovery.second_order_contacts,
+            )
+            bundles.append(bundle)
+
+    if settings.linkedin_manual_review_mode:
+        await process_jobs()
+    elif settings.linkedin_capture_mode == "firefox_extension":
+        async with LinkedInExtensionBridge(settings) as extension_bridge:
+            await process_jobs(extension_bridge=extension_bridge)
+    else:
+        async with linkedin.context() as linkedin_context:
+            await process_jobs(linkedin_context)
+
+    if status:
+        status.emit("reporting", "Building Word documents and saving run artifacts.", qualifying_jobs=len(jobs))
+    generated_at = datetime.now()
+    message_docx_path = build_message_document(bundles, settings.output_dir, generated_at=generated_at)
+    summary_docx_path = build_summary_document(bundles, settings.output_dir, generated_at=generated_at)
+    manifest = build_manifest(
+        run_id=run_id,
+        bundles=bundles,
+        jobs_found_by_search=jobs_found_by_search,
+        message_docx_path=message_docx_path,
+        summary_docx_path=summary_docx_path,
+        generated_at=generated_at,
+    )
+    live_outreach_payload = build_live_outreach_payload(
+        bundles,
+        run_id=run_id,
+        generated_at=generated_at,
+    )
+    save_run_artifacts(
+        settings.data_dir,
+        bundles,
+        manifest,
+        live_outreach_payload=live_outreach_payload,
+        search_diagnostics=search_diagnostics,
+        status_payload=status.snapshot() if status else None,
+    )
+    if not settings.linkedin_manual_review_mode and settings.linkedin_capture_mode == "firefox_extension":
+        await asyncio.sleep(3)
+    if status:
+        status.complete(
+            "Workflow completed successfully.",
+            jobs_found_by_search=jobs_found_by_search,
+            jobs_kept_after_validation=manifest.jobs_kept_after_validation,
+            jobs_with_any_messages=manifest.jobs_with_any_messages,
+        )
+    return bundles, manifest
+
+
+async def run_daily_workflow(
+    settings: Settings,
+    *,
+    status: StatusReporter | None = None,
+    timeout_seconds: int | None = None,
+) -> tuple[list[JobOutreachBundle], RunManifest]:
+    heartbeat_task: asyncio.Task[None] | None = None
+    run_id = status.run_id if status is not None else uuid4().hex
+    if status:
+        status.emit(
+            "starting",
+            "Starting the job search workflow.",
+            target_job_count=settings.target_job_count,
+            min_base_salary_usd=settings.min_base_salary_usd,
+            posted_within_days=settings.posted_within_days,
+        )
+        heartbeat_task = asyncio.create_task(_heartbeat(status, settings.status_heartbeat_seconds))
+
+    effective_timeout = settings.workflow_timeout_seconds if timeout_seconds is None else max(0, timeout_seconds)
+    try:
+        if effective_timeout > 0:
+            async with asyncio.timeout(effective_timeout):
+                return await _run_daily_workflow_body(settings, run_id=run_id, status=status)
+        return await _run_daily_workflow_body(settings, run_id=run_id, status=status)
+    except TimeoutError:
+        if status:
+            status.fail(
+                f"Workflow timed out after {effective_timeout} seconds.",
+                workflow_timeout_seconds=effective_timeout,
+            )
+        record_failed_run(
+            settings.data_dir,
+            run_id=run_id,
+            status_payload=status.snapshot() if status else None,
+            failure_message=f"Workflow timed out after {effective_timeout} seconds.",
+        )
+        raise
+    except asyncio.CancelledError:
+        if status:
+            status.fail("Workflow terminated before completion.")
+        record_failed_run(
+            settings.data_dir,
+            run_id=run_id,
+            status_payload=status.snapshot() if status else None,
+            failure_message="Workflow terminated before completion.",
+        )
+        raise
+    except Exception as exc:
+        if status:
+            status.fail(f"Workflow failed: {exc}")
+        record_failed_run(
+            settings.data_dir,
+            run_id=run_id,
+            status_payload=status.snapshot() if status else None,
+            failure_message=f"Workflow failed: {exc}",
+        )
+        raise
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
