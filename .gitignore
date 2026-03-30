@@ -1,0 +1,30 @@
+# Secrets and local machine auth state
+.env
+.env.local
+.env.*.local
+.secrets/
+
+# Python environments and caches
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Generated packaging metadata
+*.egg-info/
+
+# Runtime data and generated artifacts
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+job_summary.docx
+linkedin_outreach_messages.docx
+
+# Logs and lock files
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.lock
+output/.~lock*
