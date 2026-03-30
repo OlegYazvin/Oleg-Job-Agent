@@ -54,7 +54,7 @@ def build_settings(tmp_path: Path) -> Settings:
         ollama_num_ctx=1024,
         ollama_num_batch=4,
         ollama_num_predict=256,
-        ollama_degraded_model="qwen2.5:3b-instruct",
+        ollama_degraded_model="mock-smaller-ollama-model",
     )
 
 
@@ -114,8 +114,8 @@ def test_auto_tune_ollama_settings_switches_to_smaller_model_when_warm_calls_are
 
     tuned_settings, profile = auto_tune_ollama_settings(settings, run_id="run-slow")
 
-    assert tuned_settings.ollama_model == "qwen2.5:3b-instruct"
-    assert profile.model == "qwen2.5:3b-instruct"
+    assert tuned_settings.ollama_model == settings.ollama_degraded_model
+    assert profile.model == settings.ollama_degraded_model
 
 
 def test_auto_tune_ollama_settings_keeps_current_model_when_degraded_model_is_missing(
@@ -144,6 +144,81 @@ def test_auto_tune_ollama_settings_keeps_current_model_when_degraded_model_is_mi
 
     assert tuned_settings.ollama_model == settings.ollama_model
     assert profile.model == settings.ollama_model
+    assert profile.degraded is False
+
+
+def test_auto_tune_ollama_settings_recovers_stale_degraded_profile_with_probe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = build_settings(tmp_path)
+    settings.ollama_tuning_profile_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.ollama_tuning_profile_path.write_text(
+        json.dumps(
+            {
+                "model": settings.ollama_degraded_model,
+                "keep_alive": settings.ollama_keep_alive,
+                "num_ctx": 512,
+                "num_batch": 1,
+                "num_predict": 128,
+                "degraded": True,
+                "degraded_reason": "stale degraded profile",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "job_agent.ollama_runtime._available_ollama_model_names",
+        lambda _settings: {settings.ollama_model, settings.ollama_degraded_model},
+    )
+    monkeypatch.setattr(
+        "job_agent.ollama_runtime._probe_ollama_profile_sync",
+        lambda _settings, profile: (profile.model == settings.ollama_degraded_model, None, 1.25),
+    )
+
+    tuned_settings, profile = auto_tune_ollama_settings(settings, run_id="run-recover")
+
+    assert tuned_settings.ollama_model == settings.ollama_degraded_model
+    assert profile.model == settings.ollama_degraded_model
+    assert profile.degraded is False
+    entries = [
+        json.loads(line)
+        for line in settings.output_dir.joinpath("ollama-events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(entry["event"] == "probe_success" for entry in entries)
+    assert any(entry["event"] == "auto_tune_update" for entry in entries)
+
+
+def test_auto_tune_ollama_settings_ignores_stale_failure_history(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = build_settings(tmp_path)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.joinpath("ollama-events.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "timestamp": "2026-03-01T00:00:00+00:00",
+                    "event": "request_failure",
+                    "run_id": f"old-{index}",
+                    "model": settings.ollama_model,
+                    "caller": "lead_refinement",
+                    "prompt_category": "lead_cleanup",
+                    "error_type": "ReadTimeout",
+                }
+            )
+            for index in range(10)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("job_agent.ollama_runtime._available_ollama_model_names", lambda _settings: {settings.ollama_model})
+
+    tuned_settings, profile = auto_tune_ollama_settings(settings, run_id="run-current")
+
+    assert tuned_settings.ollama_num_batch == settings.ollama_num_batch
+    assert profile.num_batch == settings.ollama_num_batch
     assert profile.degraded is False
 
 

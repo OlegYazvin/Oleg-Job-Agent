@@ -167,6 +167,12 @@ def test_normalize_direct_job_url_strips_apply_suffixes() -> None:
         )
         == "https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows"
     )
+    assert (
+        _normalize_direct_job_url(
+            "https://ad.doubleclick.net/ddm/clk/606334822;414068816;h?https%3A%2F%2Fcareers.cargill.com%2Fen%2Fjob%2Fatlanta%2Fadvisor-product-manager-ai-and-data-science%2F47859%2F88787736608%3Futm_source%3Dbuiltin.com"
+        )
+        == "https://careers.cargill.com/en/job/atlanta/advisor-product-manager-ai-and-data-science/47859/88787736608"
+    )
 
 
 def test_decode_search_result_url_handles_bing_redirects() -> None:
@@ -1422,6 +1428,21 @@ def test_precheck_lead_hints_fast_rejects_stale_non_remote_and_low_salary() -> N
     assert low_salary_failure is not None
     assert low_salary_failure.reason_code == "salary_below_min"
 
+    location_specific_workday_lead = JobLead(
+        company_name="Citi",
+        role_title="Wealth - AI Product Manager - Senior Vice President",
+        source_url="https://builtin.com/job/wealth-ai-product-manager/123",
+        source_type="builtin",
+        direct_job_url=(
+            "https://citi.wd5.myworkdayjobs.com/2/job/New-York-New-York-United-States/"
+            "Wealth---AI-Product-Manager---Senior-Vice-President_25923027"
+        ),
+        evidence_notes="Remote hint from discovery source.",
+    )
+    location_failure = _precheck_lead_hints(location_specific_workday_lead, settings, attempt_number=1, round_number=1)
+    assert location_failure is not None
+    assert location_failure.reason_code == "not_remote"
+
 
 def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_without_override_hints() -> None:
     settings = build_settings()
@@ -1711,6 +1732,43 @@ def test_extract_direct_job_url_from_builtin_source_prefers_specific_company_job
 
     direct_url = asyncio.run(_extract_direct_job_url_from_source(lead))
     assert direct_url == "https://www.invoca.com/company/job-listings?gh_jid=8375510002"
+
+
+def test_extract_direct_job_url_from_linkedin_source_rejects_wrong_company_ats_links(monkeypatch) -> None:
+    lead = JobLead(
+        company_name="Vouch Insurance",
+        role_title="Senior Product Manager, Platform (AI)",
+        source_url="https://www.linkedin.com/jobs/view/4383931358",
+        source_type="linkedin",
+        evidence_notes="Remote AI product manager role.",
+    )
+
+    class FakeResponse:
+        def __init__(self, url: str, text: str) -> None:
+            self.url = url
+            self.text = text
+
+    class FakeAsyncClient:
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            assert url == lead.source_url
+            return FakeResponse(
+                url,
+                """
+                <a href="https://jobs.lever.co/finch/814e67f8-ea70-493c-84b3-f39d7e281e9a">Apply</a>
+                <a href="https://jobs.lever.co/vouch/2b7e5ccd-f64b-41c1-b443-fc8187c466b6">Correct</a>
+                """,
+            )
+
+    monkeypatch.setattr("job_agent.job_search.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
+
+    direct_url = asyncio.run(_extract_direct_job_url_from_source(lead))
+    assert direct_url == "https://jobs.lever.co/vouch/2b7e5ccd-f64b-41c1-b443-fc8187c466b6"
 
 
 def test_deterministic_trim_local_leads_collapses_duplicate_company_role_variants() -> None:

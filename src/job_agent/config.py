@@ -77,7 +77,7 @@ class Settings:
     ollama_retry_backoff_seconds: float = 3.0
     ollama_command: str = "ollama"
     firefox_extension_profile_dir: Path | None = None
-    ollama_degraded_model: str = "qwen2.5:3b-instruct"
+    ollama_degraded_model: str = "qwen2.5:7b-instruct"
     ollama_enable_auto_tune: bool = True
     ollama_degraded_for_run: bool = False
     ollama_degraded_reason: str | None = None
@@ -229,6 +229,6 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         ollama_retry_backoff_seconds=float(os.getenv("OLLAMA_RETRY_BACKOFF_SECONDS", "3")),
         ollama_command=os.getenv("OLLAMA_COMMAND", "ollama"),
         firefox_extension_profile_dir=firefox_extension_profile_dir,
-        ollama_degraded_model=os.getenv("OLLAMA_DEGRADED_MODEL", "qwen2.5:3b-instruct"),
+        ollama_degraded_model=os.getenv("OLLAMA_DEGRADED_MODEL", "qwen2.5:7b-instruct"),
         ollama_enable_auto_tune=os.getenv("OLLAMA_ENABLE_AUTO_TUNE", "true").lower() == "true",
     )

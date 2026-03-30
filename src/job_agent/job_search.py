@@ -106,6 +106,13 @@ BLOCKED_JOB_HOST_FRAGMENTS = (
     "thesaraslist.com",
     "jobs.generalcatalyst.com",
 )
+LINKEDIN_RESOLUTION_BLOCKED_HOST_FRAGMENTS = (
+    "joinleland.com",
+    "remotejobshive.com",
+    "thatstartupjob.com",
+    "tangerinefeed.net",
+    "cari.me.uk",
+)
 
 JOB_PATH_HINTS = (
     "/careers/",
@@ -160,6 +167,22 @@ GENERIC_CAREERS_TAIL_SEGMENTS = {
     "culture",
     "people",
     "team",
+}
+REDIRECT_QUERY_PARAM_NAMES = {
+    "url",
+    "u",
+    "target",
+    "target_url",
+    "targeturl",
+    "redirect",
+    "redirect_url",
+    "redirecturl",
+    "dest",
+    "destination",
+    "next",
+    "continue",
+    "joburl",
+    "job_url",
 }
 
 DISCOVERY_SOURCE_PRIORITY = {
@@ -472,8 +495,51 @@ def _looks_like_company_job_page(url: str) -> bool:
     return False
 
 
+def _unwrap_direct_job_url(url: str) -> str:
+    candidate = str(url or "").strip()
+    if not candidate:
+        return ""
+
+    seen: set[str] = set()
+    while candidate and candidate not in seen:
+        seen.add(candidate)
+
+        decoded = _decode_search_result_url(candidate)
+        if decoded != candidate:
+            candidate = decoded
+            continue
+
+        parsed = urlparse(candidate)
+        next_candidate: str | None = None
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.lower() not in REDIRECT_QUERY_PARAM_NAMES:
+                continue
+            unwrapped = unquote(unescape(value)).strip()
+            if unwrapped.startswith(("http://", "https://")) and unwrapped != candidate:
+                next_candidate = unwrapped
+                break
+
+        if next_candidate is None and (parsed.netloc or "").lower() in {"ad.doubleclick.net", "clickserve.dartsearch.net"}:
+            decoded_query = unquote(unescape(parsed.query))
+            match = re.search(r"https?://[^\s\"'<>]+", decoded_query)
+            if match:
+                next_candidate = match.group(0)
+
+        if next_candidate is None:
+            decoded_candidate = unquote(unescape(candidate))
+            match = re.search(r"https?://[^\s\"'<>]+", decoded_candidate)
+            if match and match.group(0) != candidate:
+                next_candidate = match.group(0)
+
+        if next_candidate is None:
+            break
+        candidate = next_candidate
+
+    return candidate
+
+
 def _normalize_direct_job_url(url: str) -> str:
-    parsed = urlparse(url)
+    parsed = urlparse(_unwrap_direct_job_url(url))
     host = (parsed.netloc or "").lower()
     path = parsed.path.rstrip("/")
     query = _strip_tracking_query_params(parsed.query)
@@ -504,6 +570,31 @@ def _normalize_direct_job_url(url: str) -> str:
         path = "/"
 
     return urlunparse(parsed._replace(path=path, query=query, fragment=""))
+
+
+def _direct_job_url_matches_expected_company(url: str, expected_company_name: str | None) -> bool:
+    if not expected_company_name or _is_weak_company_hint(expected_company_name):
+        return True
+    company_hint = _company_hint_from_url(url)
+    if _is_weak_company_hint(company_hint):
+        return True
+    return _company_names_match(expected_company_name, company_hint)
+
+
+def _is_linkedin_resolution_blocked_host(url: str) -> bool:
+    host = (urlparse(url).netloc or "").lower()
+    return any(fragment in host for fragment in LINKEDIN_RESOLUTION_BLOCKED_HOST_FRAGMENTS)
+
+
+def _candidate_direct_job_url_is_trustworthy(url: str, lead: JobLead) -> bool:
+    normalized = _normalize_direct_job_url(url)
+    if not normalized:
+        return False
+    if lead.source_type == "linkedin" and _is_linkedin_resolution_blocked_host(normalized):
+        return False
+    if not _is_allowed_direct_job_url(normalized) or _looks_like_generic_job_url(normalized):
+        return False
+    return _direct_job_url_matches_expected_company(normalized, lead.company_name)
 
 
 def _extract_company_board_identifier(url: str | None) -> str | None:
@@ -1240,6 +1331,10 @@ def _is_weak_company_hint(value: str | None) -> bool:
         "enus",
         "ext",
         "external",
+        "company",
+        "content",
+        "corporate",
+        "corporateinformation",
         "jobs",
         "job",
         "careers",
@@ -4448,17 +4543,36 @@ async def _cleanup_local_leads_with_ollama(
         )
         return leads
     provider = OllamaStructuredProvider(settings)
+    compact_candidates = [
+        {
+            "company_name": lead.company_name,
+            "role_title": lead.role_title,
+            "source_type": lead.source_type,
+            "source_url": lead.source_url,
+            "direct_job_url": lead.direct_job_url,
+            "location_hint": lead.location_hint,
+            "posted_date_hint": lead.posted_date_hint,
+            "is_remote_hint": lead.is_remote_hint,
+            "salary_text_hint": lead.salary_text_hint,
+            "base_salary_min_usd_hint": lead.base_salary_min_usd_hint,
+            "base_salary_max_usd_hint": lead.base_salary_max_usd_hint,
+            "evidence_notes": lead.evidence_notes[:320],
+        }
+        for lead in leads
+    ]
+    max_returned_leads = min(len(leads), max(3, min(settings.max_leads_per_query, 5)))
     prompt = f"""
 Search query: {query}
 
 Clean and normalize these potential job leads.
 Keep only high-confidence AI-related product manager roles.
+Prefer leads whose company slug/URL matches the stated company.
 Prefer direct ATS URLs when present.
-Never invent fields.
-Return at most {settings.max_leads_per_query} leads.
+Never invent fields or rewrite URLs.
+Return at most {max_returned_leads} leads.
 
 Candidates:
-{json.dumps([lead.model_dump(mode="json") for lead in leads], indent=2)}
+{json.dumps(compact_candidates, indent=2)}
 """.strip()
     try:
         async with LOCAL_OLLAMA_SEMAPHORE:
@@ -4517,7 +4631,7 @@ async def _refine_local_leads_with_ollama(
         settings,
         query,
         candidate_pool,
-        limit=max(1, cleanup_limit),
+        limit=max(1, min(cleanup_limit, 5)),
     )
     if run_id is None:
         cleaned_leads = await _cleanup_local_leads_with_ollama(settings, query, cleanup_candidates)
@@ -4795,12 +4909,19 @@ def _url_candidate_score(url: str, anchor_text: str, lead: JobLead) -> tuple[int
     parsed = urlparse(url)
     query = (parsed.query or "").lower()
     has_job_query_hint = any(token in query for token in COMPANY_JOB_QUERY_HINTS)
+    company_matches = _direct_job_url_matches_expected_company(url, lead.company_name)
     score = 0
+    if lead.source_type == "linkedin" and _is_linkedin_resolution_blocked_host(url):
+        score -= 30
+    if not company_matches:
+        score -= 24
+    else:
+        score += 4
     for token in lead.company_name.lower().split():
         if token and token in haystack:
             score += 3
     role_score = _role_match_score(lead.role_title, haystack)
-    if has_job_query_hint and role_score < 0:
+    if (has_job_query_hint or (_is_allowed_direct_job_url(url) and company_matches)) and role_score < 0:
         role_score = 0
     score += role_score
     if has_job_query_hint:
@@ -4839,11 +4960,11 @@ def _link_context_text(link) -> str:
 
 async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
     candidate_url = _normalize_direct_job_url(lead.direct_job_url or lead.source_url)
-    if candidate_url and _is_allowed_direct_job_url(candidate_url) and not _looks_like_generic_job_url(candidate_url):
+    if candidate_url and _candidate_direct_job_url_is_trustworthy(candidate_url, lead):
         return candidate_url
 
     greenhouse_board_url = await _resolve_greenhouse_board_job_url_from_lead(lead)
-    if greenhouse_board_url:
+    if greenhouse_board_url and _candidate_direct_job_url_is_trustworthy(greenhouse_board_url, lead):
         return greenhouse_board_url
 
     try:
@@ -4868,7 +4989,7 @@ async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
             parsed_builtin_apply = urlparse(normalized_builtin_apply_url)
             builtin_apply_query = (parsed_builtin_apply.query or "").lower()
             has_job_query_hint = any(token in builtin_apply_query for token in COMPANY_JOB_QUERY_HINTS)
-            if _is_allowed_direct_job_url(normalized_builtin_apply_url) and (
+            if _candidate_direct_job_url_is_trustworthy(normalized_builtin_apply_url, lead) and (
                 not _looks_like_generic_job_url(normalized_builtin_apply_url) or has_job_query_hint
             ):
                 return normalized_builtin_apply_url
@@ -4884,7 +5005,7 @@ async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
         if not href:
             continue
         absolute_url = _normalize_direct_job_url(urljoin(resolved_source, href))
-        if not _is_allowed_direct_job_url(absolute_url) or _looks_like_generic_job_url(absolute_url):
+        if not _candidate_direct_job_url_is_trustworthy(absolute_url, lead):
             continue
         score = _url_candidate_score(absolute_url, _link_context_text(link), lead)
         candidates.append((score, absolute_url))
@@ -4921,10 +5042,17 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
             return
         if any(fragment in (urlparse(normalized_url).netloc or "").lower() for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
             return
+        if lead.source_type == "linkedin" and _is_linkedin_resolution_blocked_host(normalized_url):
+            return
         if not (
             _is_allowed_direct_job_url(normalized_url)
             or _looks_like_careers_hub_url(normalized_url)
             or _looks_like_company_homepage_url(normalized_url)
+        ):
+            return
+        if _is_allowed_direct_job_url(normalized_url) and not _direct_job_url_matches_expected_company(
+            normalized_url,
+            lead.company_name,
         ):
             return
         score = _url_candidate_score(normalized_url, anchor_text, lead)
@@ -5382,7 +5510,16 @@ def _precheck_lead_hints(
             attempt_number=attempt_number,
             round_number=round_number,
         )
-    combined_location_hint = " ".join(part for part in (lead.location_hint, lead.evidence_notes) if part)
+    combined_location_hint = " ".join(
+        part
+        for part in (
+            lead.role_title,
+            lead.location_hint,
+            lead.evidence_notes,
+            _unwrap_direct_job_url(lead.direct_job_url or ""),
+        )
+        if part
+    )
     if lead.is_remote_hint is False or any(token in combined_location_hint.lower() for token in ("hybrid", "on-site", "onsite", "in office")):
         return _make_failure(
             stage="filter",
@@ -5401,6 +5538,25 @@ def _precheck_lead_hints(
             attempt_number=attempt_number,
             round_number=round_number,
         )
+    if lead.direct_job_url and _direct_job_url_has_specific_location_hint(lead.direct_job_url):
+        lowered_hints = combined_location_hint.lower()
+        strong_remote_markers = (
+            "fully remote",
+            "remote - united states",
+            "remote, united states",
+            "united states remote",
+            "remote us",
+            "work from home",
+        )
+        if not any(marker in lowered_hints for marker in strong_remote_markers):
+            return _make_failure(
+                stage="filter",
+                reason_code="not_remote",
+                detail="Lead direct URL encoded a specific location while discovery hints did not clearly establish a broadly remote role.",
+                lead=lead,
+                attempt_number=attempt_number,
+                round_number=round_number,
+            )
     salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
         lead.base_salary_min_usd_hint,
         lead.base_salary_max_usd_hint,
@@ -5665,6 +5821,11 @@ def _evaluate_merged_job(
     job_url = str(job.resolved_job_url or job.direct_job_url)
     if not _is_allowed_direct_job_url(job_url):
         return "direct_url_not_allowed", "Resolved URL is not a direct ATS or company careers page."
+
+    if expected_company_name and not _direct_job_url_matches_expected_company(job_url, expected_company_name):
+        company_hint = _company_hint_from_url(job_url)
+        if not _is_weak_company_hint(company_hint):
+            return "company_mismatch", f"Resolved job URL company hint '{company_hint}' did not match expected company '{expected_company_name}'."
 
     if _is_generic_job_board_page(snapshot):
         return "not_specific_job_page", "Resolved page is a board index or an invalid job page, not a specific posting."

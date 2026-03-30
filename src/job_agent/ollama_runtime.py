@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter, deque
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -252,8 +252,29 @@ def _recent_request_events(settings: Settings, *, limit: int = 10) -> list[dict[
         entry
         for entry in entries
         if entry.get("event") in {"request_success", "request_failure", "request_outer_timeout"}
+        and entry.get("caller") != "manual_probe"
+        and "probe" not in str(entry.get("prompt_category") or "").lower()
     ]
     return filtered[-max(1, limit) :]
+
+
+def _event_timestamp(entry: dict[str, Any]) -> datetime | None:
+    raw_value = entry.get("timestamp")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).astimezone(UTC)
+    except Exception:
+        return None
+
+
+def _recent_request_history_is_stale(events: list[dict[str, Any]], *, max_age: timedelta = timedelta(hours=2)) -> bool:
+    if not events:
+        return False
+    latest_event_at = max((timestamp for timestamp in (_event_timestamp(entry) for entry in events) if timestamp), default=None)
+    if latest_event_at is None:
+        return False
+    return datetime.now(UTC) - latest_event_at > max_age
 
 
 def _warm_success_median_seconds(events: list[dict[str, Any]]) -> float | None:
@@ -291,6 +312,66 @@ def _available_ollama_model_names(settings: Settings) -> set[str]:
     return names
 
 
+def _probe_ollama_profile_sync(settings: Settings, profile: OllamaTuningProfile) -> tuple[bool, str | None, float]:
+    timeout_seconds = max(15.0, min(45.0, settings.ollama_timeout_seconds / 2))
+    payload = {
+        "model": profile.model,
+        "prompt": "Reply with OK only.",
+        "stream": False,
+        "keep_alive": profile.keep_alive,
+        "options": {
+            "temperature": 0,
+            "num_ctx": min(profile.num_ctx, 256),
+            "num_batch": 1,
+            "num_predict": min(profile.num_predict, 32),
+        },
+    }
+    started_at = time.monotonic()
+    try:
+        _ensure_ollama_server_sync(settings, force_restart=False)
+        response = httpx.post(f"{settings.ollama_base_url.rstrip('/')}/api/generate", json=payload, timeout=timeout_seconds)
+        response.raise_for_status()
+        raw_text = str(response.json().get("response") or "").strip().lower()
+        if not raw_text.startswith("ok"):
+            raise RuntimeError("probe returned an unexpected response")
+        return True, None, round(time.monotonic() - started_at, 3)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}", round(time.monotonic() - started_at, 3)
+
+
+def _recovery_probe_candidates(
+    settings: Settings,
+    profile: OllamaTuningProfile,
+    available_models: set[str],
+) -> list[OllamaTuningProfile]:
+    candidates: list[OllamaTuningProfile] = []
+    seen_models: set[str] = set()
+
+    def maybe_add(model: str, *, prefer_ctx: int, prefer_predict: int) -> None:
+        if model in seen_models:
+            return
+        if available_models and model not in available_models:
+            return
+        candidates.append(
+            profile.model_copy(
+                update={
+                    "model": model,
+                    "num_ctx": min(profile.num_ctx, prefer_ctx),
+                    "num_batch": 1,
+                    "num_predict": min(profile.num_predict, prefer_predict),
+                    "degraded": False,
+                    "degraded_reason": None,
+                }
+            )
+        )
+        seen_models.add(model)
+
+    maybe_add(profile.model, prefer_ctx=512, prefer_predict=128)
+    maybe_add(settings.ollama_degraded_model, prefer_ctx=512, prefer_predict=128)
+    maybe_add(settings.ollama_model, prefer_ctx=768, prefer_predict=128)
+    return candidates
+
+
 def _step_down_profile(profile: OllamaTuningProfile) -> tuple[OllamaTuningProfile, str]:
     if profile.num_batch > 1:
         next_batch = max(1, profile.num_batch // 2)
@@ -311,17 +392,58 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
 
     profile = load_ollama_tuning_profile(settings)
     recent_events = _recent_request_events(settings, limit=10)
+    if _recent_request_history_is_stale(recent_events):
+        recent_events = []
+    available_models = _available_ollama_model_names(settings)
+    update_reason: str | None = None
+    single_model_mode = settings.ollama_degraded_model == settings.ollama_model
+
+    if single_model_mode and (
+        profile.model != settings.ollama_model
+        or (profile.degraded and not recent_events)
+    ):
+        profile = profile.model_copy(
+            update={
+                "model": settings.ollama_model,
+                "keep_alive": settings.ollama_keep_alive,
+                "num_ctx": settings.ollama_num_ctx,
+                "num_batch": settings.ollama_num_batch,
+                "num_predict": settings.ollama_num_predict,
+                "degraded": False,
+                "degraded_reason": None,
+            }
+        )
+        update_reason = f"Reset Ollama profile to single-model mode on {settings.ollama_model}."
+
+    if profile.degraded or (available_models and profile.model not in available_models):
+        for candidate in _recovery_probe_candidates(settings, profile, available_models):
+            success, error_message, probe_duration = _probe_ollama_profile_sync(settings, candidate)
+            record_ollama_event(
+                settings,
+                "probe_success" if success else "probe_failure",
+                run_id=run_id,
+                model=candidate.model,
+                num_ctx=candidate.num_ctx,
+                num_batch=candidate.num_batch,
+                num_predict=candidate.num_predict,
+                keep_alive=candidate.keep_alive,
+                wall_duration_seconds=probe_duration,
+                error_message=error_message,
+            )
+            if success:
+                profile = candidate
+                update_reason = f"Recovered Ollama via readiness probe using {candidate.model}."
+                break
+
     request_event_count = len(recent_events)
     if request_event_count:
         failure_count = sum(1 for entry in recent_events if entry.get("event") in {"request_failure", "request_outer_timeout"})
         outer_timeout_count = sum(1 for entry in recent_events if entry.get("event") == "request_outer_timeout")
         failure_ratio = failure_count / request_event_count
         warm_median = _warm_success_median_seconds(recent_events)
-        available_models = _available_ollama_model_names(settings)
         degraded_model_available = (
             not available_models or settings.ollama_degraded_model in available_models
         )
-        update_reason: str | None = None
 
         if warm_median is not None and warm_median > 60 and profile.model != settings.ollama_degraded_model:
             if degraded_model_available:
@@ -382,20 +504,20 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
                 )
                 update_reason = profile.degraded_reason
 
-        if update_reason:
-            record_ollama_event(
-                settings,
-                "auto_tune_update",
-                run_id=run_id,
-                model=profile.model,
-                num_ctx=profile.num_ctx,
-                num_batch=profile.num_batch,
-                num_predict=profile.num_predict,
-                keep_alive=profile.keep_alive,
-                degraded=profile.degraded,
-                degraded_reason=profile.degraded_reason,
-                reason=update_reason,
-            )
+    if update_reason:
+        record_ollama_event(
+            settings,
+            "auto_tune_update",
+            run_id=run_id,
+            model=profile.model,
+            num_ctx=profile.num_ctx,
+            num_batch=profile.num_batch,
+            num_predict=profile.num_predict,
+            keep_alive=profile.keep_alive,
+            degraded=profile.degraded,
+            degraded_reason=profile.degraded_reason,
+            reason=update_reason,
+        )
 
     profile = profile.model_copy(
         update={
