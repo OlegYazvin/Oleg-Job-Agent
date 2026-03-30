@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import asyncio
 from pathlib import Path
@@ -12,6 +13,9 @@ from job_agent.linkedin import (
     _load_linkedin_storage_state_cookies,
     _normalize_cookie_expiry,
     build_manual_review_links,
+    linkedin_cookies_authenticate,
+    linkedin_storage_state_is_authenticated,
+    sync_linkedin_cookies_to_firefox_profile,
 )
 from job_agent.linkedin_extension_bridge import ExtensionCaptureSession
 
@@ -229,6 +233,136 @@ def test_load_linkedin_auth_cookies_prefers_env_then_storage_then_firefox(tmp_pa
     assert by_name["li_at"]["value"] == "from-env"
     assert by_name["storage-only"]["value"] == "keep-me"
     assert by_name["firefox-only"]["value"] == "keep-too"
+
+
+def test_linkedin_cookies_authenticate_rejects_login_redirect(monkeypatch) -> None:
+    class _FakeResponse:
+        url = "https://www.linkedin.com/uas/login?session_redirect=https%3A%2F%2Fwww.linkedin.com%2Ffeed%2F"
+        text = "<title>LinkedIn Login, Sign in | LinkedIn</title>"
+
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str):
+            return _FakeResponse()
+
+    monkeypatch.setattr("job_agent.linkedin.httpx.Client", _FakeClient)
+
+    assert not linkedin_cookies_authenticate(
+        [{"name": "li_at", "value": "abc", "domain": ".www.linkedin.com", "path": "/"}]
+    )
+
+
+def test_linkedin_storage_state_is_authenticated_uses_http_validation(tmp_path: Path, monkeypatch) -> None:
+    storage_state_path = tmp_path / "linkedin-state.json"
+    storage_state_path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "li_at",
+                        "value": "abc123",
+                        "domain": ".www.linkedin.com",
+                        "path": "/",
+                        "expires": 2000000000,
+                        "httpOnly": True,
+                        "secure": True,
+                    },
+                    {
+                        "name": "JSESSIONID",
+                        "value": '"ajax:123"',
+                        "domain": ".www.linkedin.com",
+                        "path": "/",
+                        "expires": 2000000000,
+                        "httpOnly": False,
+                        "secure": True,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("job_agent.linkedin.linkedin_cookies_authenticate", lambda cookies, timeout_seconds=10.0: True)
+
+    assert linkedin_storage_state_is_authenticated(storage_state_path) is True
+
+
+def test_sync_linkedin_cookies_to_firefox_profile_writes_auth_cookies(tmp_path: Path) -> None:
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    db_path = profile_dir / "cookies.sqlite"
+    connection = sqlite3.connect(db_path)
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        create table moz_cookies (
+            id integer primary key,
+            originAttributes text not null default '',
+            name text,
+            value text,
+            host text,
+            path text,
+            expiry integer,
+            lastAccessed integer default 0,
+            creationTime integer default 0,
+            isSecure integer,
+            isHttpOnly integer,
+            inBrowserElement integer default 0,
+            sameSite integer default 0,
+            schemeMap integer default 0,
+            isPartitionedAttributeSet integer default 0,
+            updateTime integer default 0
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    storage_state_path = tmp_path / "linkedin-state.json"
+    storage_state_path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "li_at",
+                        "value": "abc123",
+                        "domain": ".www.linkedin.com",
+                        "path": "/",
+                        "expires": 2000000000,
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "None",
+                    },
+                    {
+                        "name": "JSESSIONID",
+                        "value": '"ajax:123"',
+                        "domain": ".www.linkedin.com",
+                        "path": "/",
+                        "expires": 2000000000,
+                        "httpOnly": False,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert sync_linkedin_cookies_to_firefox_profile(profile_dir, storage_state_path) is True
+
+    connection = sqlite3.connect(db_path)
+    cursor = connection.cursor()
+    cursor.execute("select name, host from moz_cookies where name in ('li_at','JSESSIONID') order by name")
+    assert cursor.fetchall() == [("JSESSIONID", ".www.linkedin.com"), ("li_at", ".www.linkedin.com")]
+    connection.close()
 
 
 def test_normalize_cookie_expiry_handles_milliseconds() -> None:

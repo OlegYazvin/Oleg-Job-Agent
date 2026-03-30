@@ -1,10 +1,16 @@
+import asyncio
 from datetime import UTC, datetime
 import json
 from pathlib import Path
 
 from job_agent.config import Settings
 from job_agent.models import OllamaTuningProfile
-from job_agent.ollama_runtime import auto_tune_ollama_settings, build_ollama_run_summary, record_ollama_event
+from job_agent.ollama_runtime import (
+    auto_tune_ollama_settings,
+    build_ollama_run_summary,
+    prewarm_ollama_model,
+    record_ollama_event,
+)
 
 
 def build_settings(tmp_path: Path) -> Settings:
@@ -286,3 +292,38 @@ def test_build_ollama_run_summary_aggregates_quality_counters(tmp_path: Path) ->
     assert summary.caller_breakdown["lead_refinement"] == 1
     assert summary.quality_counters["draft_count"] == 3.0
     assert summary.quality_counters["proposed_lead_count"] == 8.0
+
+
+def test_prewarm_ollama_model_restarts_once_and_records_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = build_settings(tmp_path)
+    attempts: list[tuple[str, int]] = []
+    restarts: list[bool] = []
+
+    def fake_probe(_settings: Settings, profile: OllamaTuningProfile, **kwargs: object) -> tuple[bool, str | None, float]:
+        attempts.append((profile.model, int(kwargs.get("max_num_ctx", 0))))
+        if len(attempts) == 1:
+            return False, "ReadTimeout: timed out", 12.5
+        return True, None, 5.25
+
+    async def fake_ensure(_settings: Settings, *, force_restart: bool = False) -> None:
+        restarts.append(force_restart)
+
+    monkeypatch.setattr("job_agent.ollama_runtime._probe_ollama_profile_sync", fake_probe)
+    monkeypatch.setattr("job_agent.ollama_runtime.ensure_ollama_server", fake_ensure)
+
+    success, error_message, total_duration = asyncio.run(prewarm_ollama_model(settings, run_id="run-prewarm"))
+
+    assert success is True
+    assert error_message is None
+    assert total_duration == 17.75
+    assert restarts == [True]
+    entries = [
+        json.loads(line)
+        for line in settings.output_dir.joinpath("ollama-events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["event"] for entry in entries] == ["prewarm_failure", "prewarm_success"]
+    assert entries[0]["attempt_number"] == 1
+    assert entries[1]["attempt_number"] == 2

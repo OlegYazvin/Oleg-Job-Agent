@@ -228,14 +228,16 @@ def firefox_extension_is_installed_in_profile(profile_dir: Path | None) -> bool:
 def firefox_profile_has_linkedin_auth(profile_dir: Path | None) -> bool:
     if profile_dir is None or not profile_dir.exists():
         return False
-    from .linkedin import _load_firefox_linkedin_cookies
+    from .linkedin import _load_firefox_linkedin_cookies, linkedin_cookies_authenticate
 
     try:
         cookies = _load_firefox_linkedin_cookies(profile_dir)
     except Exception:
         return False
     cookie_names = {str(cookie.get("name") or "") for cookie in cookies}
-    return "li_at" in cookie_names and "JSESSIONID" in cookie_names
+    if "li_at" not in cookie_names or "JSESSIONID" not in cookie_names:
+        return False
+    return linkedin_cookies_authenticate(cookies)
 
 
 def inspect_firefox_extension_profile(profile_dir: Path | None) -> dict[str, object]:
@@ -261,8 +263,42 @@ def inspect_firefox_extension_profile(profile_dir: Path | None) -> dict[str, obj
 
 def inspect_configured_firefox_extension_profile(settings: Settings) -> dict[str, object]:
     summary = inspect_firefox_extension_profile(settings.firefox_extension_profile_dir)
+    from .linkedin import linkedin_storage_state_is_authenticated
+
+    storage_state_path = getattr(settings, "linkedin_storage_state", None)
+    summary["storage_state_authenticated"] = (
+        linkedin_storage_state_is_authenticated(storage_state_path)
+        if isinstance(storage_state_path, Path)
+        else False
+    )
     summary["configured"] = settings.firefox_extension_profile_dir is not None
     return summary
+
+
+def _sync_configured_profile_from_storage_state(settings: Settings) -> bool:
+    from .linkedin import sync_linkedin_cookies_to_firefox_profile
+
+    profile_dir = settings.firefox_extension_profile_dir
+    if profile_dir is None:
+        return False
+    resolved_profile = profile_dir.expanduser().resolve()
+    if not resolved_profile.exists():
+        return False
+    return sync_linkedin_cookies_to_firefox_profile(resolved_profile, settings.linkedin_storage_state)
+
+
+def _resolve_extension_host_profile(settings: Settings) -> tuple[Path, bool]:
+    configured_profile = settings.firefox_extension_profile_dir
+    if configured_profile is not None:
+        resolved_profile = configured_profile.expanduser().resolve()
+        if (
+            resolved_profile.exists()
+            and firefox_profile_has_linkedin_auth(resolved_profile)
+            and not _firefox_process_running_for_profile(resolved_profile)
+        ):
+            return resolved_profile, True
+    profile_dir = host_profile_dir(settings.project_root)
+    return profile_dir, False
 
 
 def open_url_in_firefox_profile(profile_dir: Path, url: str) -> bool:
@@ -357,11 +393,16 @@ def _add_linkedin_cookies(driver: webdriver.Firefox, settings: Settings) -> None
             continue
 
 
-def _build_driver_with_retries(settings: Settings, attempts: int = HOST_DRIVER_START_RETRIES) -> webdriver.Firefox:
+def _build_driver_with_retries(
+    settings: Settings,
+    *,
+    profile_dir: Path,
+    attempts: int = HOST_DRIVER_START_RETRIES,
+) -> webdriver.Firefox:
     last_error: Exception | None = None
     for attempt_number in range(1, max(1, attempts) + 1):
         try:
-            return _build_driver(settings)
+            return _build_driver(settings, profile_dir=profile_dir)
         except Exception as exc:
             last_error = exc
             print(
@@ -374,13 +415,13 @@ def _build_driver_with_retries(settings: Settings, attempts: int = HOST_DRIVER_S
     raise last_error
 
 
-def _restart_driver(driver: webdriver.Firefox | None, settings: Settings) -> webdriver.Firefox:
+def _restart_driver(driver: webdriver.Firefox | None, settings: Settings, *, profile_dir: Path) -> webdriver.Firefox:
     if driver is not None:
         try:
             driver.quit()
         except Exception:
             pass
-    rebuilt_driver = _build_driver_with_retries(settings)
+    rebuilt_driver = _build_driver_with_retries(settings, profile_dir=profile_dir)
     _prime_driver(rebuilt_driver, settings)
     return rebuilt_driver
 
@@ -391,8 +432,7 @@ def _tail_log_excerpt(path: Path, *, lines: int = 20) -> list[str]:
     return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
 
 
-def _build_driver(settings: Settings) -> webdriver.Firefox:
-    profile_dir = host_profile_dir(settings.project_root)
+def _build_driver(settings: Settings, *, profile_dir: Path) -> webdriver.Firefox:
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     options = Options()
@@ -451,12 +491,14 @@ def run_host() -> None:
     root.mkdir(parents=True, exist_ok=True)
     log_path = host_log_path(settings.project_root)
     command_queue_path = host_command_queue_path(settings.project_root)
+    profile_dir, using_configured_profile = _resolve_extension_host_profile(settings)
     if command_queue_path.exists():
         command_queue_path.unlink()
 
     state_payload = {
         "pid": os.getpid(),
-        "profile_dir": str(host_profile_dir(settings.project_root)),
+        "profile_dir": str(profile_dir),
+        "using_configured_profile": using_configured_profile,
         "state_path": str(host_state_path(settings.project_root)),
         "log_path": str(log_path),
         "bridge_capture_mode": settings.linkedin_capture_mode,
@@ -467,7 +509,7 @@ def run_host() -> None:
     }
     _write_state_file(settings.project_root, state_payload)
 
-    driver = _build_driver_with_retries(settings)
+    driver = _build_driver_with_retries(settings, profile_dir=profile_dir)
     linked_in_authenticated = _prime_driver(driver, settings)
     state_payload["linkedin_authenticated"] = linked_in_authenticated
     state_payload["status"] = "running" if linked_in_authenticated else "login_required"
@@ -533,7 +575,7 @@ def run_host() -> None:
                         state_payload["restart_count"] = int(state_payload.get("restart_count") or 0) + 1
                         _write_state_file(settings.project_root, state_payload)
                         try:
-                            driver = _restart_driver(driver, settings)
+                            driver = _restart_driver(driver, settings, profile_dir=profile_dir)
                             linked_in_authenticated = _prime_driver(driver, settings)
                             state_payload["linkedin_authenticated"] = linked_in_authenticated
                             if not linked_in_authenticated:
@@ -576,26 +618,64 @@ def deploy_host_background() -> dict[str, object]:
     if configured_profile.get("configured"):
         extension_installed = bool(configured_profile.get("extension_installed"))
         linkedin_authenticated = bool(configured_profile.get("linkedin_authenticated"))
+        storage_state_authenticated = bool(configured_profile.get("storage_state_authenticated"))
+        process_running = bool(configured_profile.get("process_running"))
+        if not linkedin_authenticated and storage_state_authenticated and not process_running:
+            if _sync_configured_profile_from_storage_state(settings):
+                configured_profile = inspect_configured_firefox_extension_profile(settings)
+                extension_installed = bool(configured_profile.get("extension_installed"))
+                linkedin_authenticated = bool(configured_profile.get("linkedin_authenticated"))
+                storage_state_authenticated = bool(configured_profile.get("storage_state_authenticated"))
+        launch_urls: list[str]
         if not extension_installed:
-            launch_url = "about:debugging#/runtime/this-firefox"
-            next_action = (
-                "Open the real Firefox profile and use 'Load Temporary Add-on...' on "
-                "firefox_extension/manifest.json."
-            )
+            if linkedin_authenticated and not process_running:
+                host_payload = deploy_dedicated_host_background(settings)
+                host_state = host_payload.get("state") if isinstance(host_payload.get("state"), dict) else host_payload
+                if bool(host_payload.get("started") or host_payload.get("already_running")) and isinstance(host_state, dict):
+                    if bool(host_state.get("linkedin_authenticated")):
+                        return {
+                            **host_payload,
+                            "mode": "configured_profile_host",
+                            "profile": configured_profile,
+                            "next_action": "Configured Firefox profile is now running under the extension host.",
+                        }
+                launch_urls = ["about:debugging#/runtime/this-firefox"]
+                next_action = (
+                    "Automatic extension-host startup against the configured Firefox profile failed. "
+                    "Open that profile and use 'Load Temporary Add-on...' on firefox_extension/manifest.json."
+                )
+            else:
+                launch_urls = []
+                if not linkedin_authenticated:
+                    launch_urls.append("https://www.linkedin.com/feed/")
+                launch_urls.append("about:debugging#/runtime/this-firefox")
+                next_action = (
+                    "Open the real Firefox profile, sign into LinkedIn, and use "
+                    "'Load Temporary Add-on...' on firefox_extension/manifest.json."
+                )
         elif not linkedin_authenticated:
-            launch_url = "https://www.linkedin.com/feed/"
-            next_action = "Sign into LinkedIn in the configured Firefox profile."
+            launch_urls = ["https://www.linkedin.com/feed/"]
+            if storage_state_authenticated and not process_running:
+                next_action = (
+                    "Saved LinkedIn storage state looks valid, but the configured Firefox profile still did not "
+                    "validate after cookie sync. Open LinkedIn in that profile and refresh the session."
+                )
+            else:
+                next_action = "Sign into LinkedIn in the configured Firefox profile."
         else:
-            launch_url = "https://www.linkedin.com/feed/"
+            launch_urls = ["https://www.linkedin.com/feed/"]
             next_action = "Configured Firefox profile is ready for extension capture."
         launch_started = False
         profile_path = settings.firefox_extension_profile_dir
         if profile_path is not None:
-            launch_started = open_url_in_firefox_profile(profile_path, launch_url)
+            for launch_url in launch_urls:
+                if open_url_in_firefox_profile(profile_path, launch_url):
+                    launch_started = True
         return {
             "started": launch_started,
             "mode": "configured_profile",
-            "launch_url": launch_url,
+            "launch_url": launch_urls[0],
+            "launch_urls": launch_urls,
             "next_action": next_action,
             "profile": configured_profile,
         }

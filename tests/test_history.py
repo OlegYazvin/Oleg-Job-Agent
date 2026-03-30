@@ -86,6 +86,26 @@ def test_record_failed_run_writes_run_history_entry(tmp_path: Path) -> None:
     assert run_history[0]["jobs_found_by_search"] == 12
 
 
+def test_record_failed_run_uses_live_progress_fallback_metrics(tmp_path: Path) -> None:
+    record_failed_run(
+        tmp_path,
+        run_id="run-qualifying",
+        status_payload={
+            "started_at": "2026-03-30T18:33:36+00:00",
+            "updated_at": "2026-03-30T18:56:21+00:00",
+            "metrics": {
+                "unique_leads_discovered": 213,
+                "qualifying_jobs": 2,
+            },
+        },
+        failure_message="Workflow terminated before completion.",
+    )
+
+    run_history = json.loads((tmp_path / "run-history.json").read_text(encoding="utf-8"))
+    assert run_history[0]["jobs_found_by_search"] == 213
+    assert run_history[0]["jobs_kept_after_validation"] == 2
+
+
 def test_record_company_watchlist_tracks_promising_companies(tmp_path: Path) -> None:
     failure = SearchFailure(
         stage="validation",

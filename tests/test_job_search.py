@@ -49,6 +49,7 @@ from job_agent.job_search import (
     _is_duckduckgo_anomaly_page,
     _is_google_interstitial_page,
     _is_recent_enough,
+    _persist_validated_jobs_checkpoint,
     _is_supported_discovery_source_url,
     _looks_like_careers_hub_url,
     _looks_like_generic_job_url,
@@ -62,6 +63,8 @@ from job_agent.job_search import (
     _normalize_role_title_to_focus_queries,
     _normalize_direct_job_url,
     _precheck_lead_hints,
+    _query_timeout_seconds_for_query,
+    _query_timeout_skip_reason,
     _repair_direct_job_url,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
@@ -70,6 +73,8 @@ from job_agent.job_search import (
     _seed_lead_from_failure,
     _select_watchlist_focus_companies,
     _select_focus_roles,
+    _should_refine_local_leads_with_ollama,
+    _url_has_strong_expected_company_hint,
     _url_candidate_score,
 )
 from job_agent.job_pages import JobPageSnapshot
@@ -221,6 +226,22 @@ def test_company_hint_from_workday_url_uses_company_slug_or_host() -> None:
     )
 
 
+def test_company_hint_from_company_hosted_jobs_subdomain_uses_host_company_name() -> None:
+    assert _company_hint_from_url("https://jobs.dominos.com/us/jobs/supply-chain") == "Dominos"
+    assert _company_hint_from_url("https://careers.caterpillar.com/en/jobs/123") == "Caterpillar"
+
+
+def test_strong_expected_company_hint_rejects_company_hosted_mismatch() -> None:
+    assert not _url_has_strong_expected_company_hint(
+        "https://jobs.dominos.com/us/jobs/supply-chain",
+        "Domino Data Lab",
+    )
+    assert _url_has_strong_expected_company_hint(
+        "https://careers.caterpillar.com/en/jobs/12345",
+        "Caterpillar",
+    )
+
+
 def test_weak_company_hints_do_not_trigger_mismatch_rejection(monkeypatch) -> None:
     settings = build_settings()
     monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
@@ -266,6 +287,7 @@ def test_generic_job_url_detection_catches_board_indexes() -> None:
     assert _looks_like_generic_job_url("https://boards.greenhouse.io/embed/job_board?for=array")
     assert _looks_like_generic_job_url("https://careers.cisco.com/global/en")
     assert _looks_like_generic_job_url("https://careers.mastercard.com/us/en/apply")
+    assert _looks_like_generic_job_url("https://jobs.dominos.com/us/jobs/stores")
     assert _looks_like_generic_job_url("https://webflow.com/made-in-webflow/careers")
     assert _looks_like_generic_job_url("https://www.coreweave.com/careers/eu")
     assert _looks_like_generic_job_url("https://www.coreweave.com/careers/notice-on-recruitment-fraud")
@@ -970,6 +992,98 @@ def test_evaluate_merged_job_rejects_blank_workday_page_with_specific_location_s
     assert "specific location" in detail
 
 
+def test_merge_candidate_with_snapshot_keeps_host_specific_non_remote_signal(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    candidate = JobPosting(
+        company_name="GSK",
+        role_title="Senior Product Manager, GenAI Platform Products",
+        direct_job_url=(
+            "https://gsk.wd5.myworkdayjobs.com/GSKCareers/job/200-CambridgePark-Drive/"
+            "Senior-Product-Manager--GenAI-Platform-Products_431265-1"
+        ),
+        resolved_job_url=(
+            "https://gsk.wd5.myworkdayjobs.com/GSKCareers/job/200-CambridgePark-Drive/"
+            "Senior-Product-Manager--GenAI-Platform-Products_431265-1"
+        ),
+        ats_platform="Workday",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-23",
+        posted_date_iso="2026-03-23",
+        base_salary_min_usd=147675,
+        base_salary_max_usd=246125,
+        salary_text="$147,675 to $246,125",
+        evidence_notes="Remote hint from discovery source.",
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=candidate.direct_job_url,
+        resolved_url=candidate.direct_job_url,
+        ats_platform="Workday",
+        status_code=200,
+        company_name="GSK",
+        role_title="Senior Product Manager, GenAI Platform Products",
+        page_title="Senior Product Manager, GenAI Platform Products",
+        location_text="Cambridge, MA",
+        is_fully_remote=False,
+        posted_date_text="2026-03-23",
+        posted_date_iso="2026-03-23",
+        text_excerpt="Workday application page for the Cambridge office.",
+        evidence_snippets=[],
+    )
+
+    merged = _merge_candidate_with_snapshot(candidate, snapshot)
+
+    assert merged.is_fully_remote is False
+
+
+def test_evaluate_merged_job_rejects_icims_location_conflict_without_strong_remote_evidence(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    job = JobPosting(
+        company_name="Yelp",
+        role_title="Principal Product Manager - Applied ML",
+        direct_job_url="https://uscareers-yelp.icims.com/jobs/13442/principal-product-manager---applied-ml/job",
+        resolved_job_url="https://uscareers-yelp.icims.com/jobs/13442/principal-product-manager---applied-ml/job",
+        ats_platform="iCIMS",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-25",
+        posted_date_iso="2026-03-25",
+        base_salary_min_usd=220000,
+        base_salary_max_usd=260000,
+        salary_text="$220,000 - $260,000",
+        evidence_notes="Remote hint from discovery source.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="iCIMS",
+        status_code=200,
+        company_name="Yelp",
+        role_title="Principal Product Manager - Applied ML",
+        page_title="Principal Product Manager - Applied ML",
+        location_text="Chicago, IL",
+        is_fully_remote=None,
+        posted_date_text="2026-03-25",
+        posted_date_iso="2026-03-25",
+        text_excerpt="Join the Yelp Chicago team in our downtown office.",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Yelp",
+        expected_role_title="Principal Product Manager - Applied ML",
+    )
+
+    assert reason_code == "not_remote"
+    assert "host-specific remote confirmation" in detail.lower()
+
+
 def test_evaluate_merged_job_allows_trusted_source_fallback_for_generic_brand_page(monkeypatch) -> None:
     settings = build_settings()
     monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
@@ -1194,7 +1308,7 @@ def test_extract_salary_hint_ignores_experience_ranges() -> None:
 
 def test_query_bank_includes_direct_and_aggregator_discovery_sources() -> None:
     settings = build_settings()
-    query_bank = _build_search_query_bank(settings)
+    query_bank = _build_search_query_bank(settings, SearchTuning(attempt_number=2))
     assert any("site:boards.greenhouse.io" in query for query in query_bank)
     assert any("site:linkedin.com/jobs/view" in query for query in query_bank)
     assert any("site:builtin.com/jobs" in query for query in query_bank)
@@ -1442,6 +1556,232 @@ def test_precheck_lead_hints_fast_rejects_stale_non_remote_and_low_salary() -> N
     location_failure = _precheck_lead_hints(location_specific_workday_lead, settings, attempt_number=1, round_number=1)
     assert location_failure is not None
     assert location_failure.reason_code == "not_remote"
+
+
+def test_precheck_lead_hints_rejects_mismatched_direct_job_url_company() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Vouch Insurance",
+        role_title="Senior Product Manager, Platform (AI)",
+        source_url="https://builtin.com/job/senior-product-manager-platform-ai/123",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/finch/abc123",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-24",
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="Built In role with a mismatched apply URL.",
+    )
+
+    failure = _precheck_lead_hints(lead, settings, attempt_number=1, round_number=1)
+
+    assert failure is not None
+    assert failure.reason_code == "company_mismatch"
+    assert "finch" in failure.detail.lower()
+
+
+def test_precheck_lead_hints_rejects_company_hosted_direct_job_url_mismatch() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url="https://www.workatastartup.com/jobs/123",
+        source_type="company_site",
+        direct_job_url="https://jobs.dominos.com/us/jobs/supply-chain",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-29",
+        salary_text_hint="$250,000",
+        evidence_notes="Remote startup AI product role with salary disclosure.",
+    )
+
+    failure = _precheck_lead_hints(lead, settings, attempt_number=1, round_number=1)
+
+    assert failure is not None
+    assert failure.reason_code == "company_mismatch"
+    assert "dominos" in failure.detail.lower()
+
+
+def test_query_timeout_seconds_for_query_keeps_broad_queries_tighter_than_targeted_queries() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+
+    broad_timeout = _query_timeout_seconds_for_query(settings, "principal product manager AI")
+    targeted_timeout = _query_timeout_seconds_for_query(
+        settings,
+        'site:workatastartup.com/jobs "principal product manager" "AI" remote "posted this week"',
+    )
+
+    assert broad_timeout < targeted_timeout
+    assert broad_timeout <= 25
+    assert targeted_timeout <= 45
+
+
+def test_build_search_query_bank_defers_generic_discovery_domains_until_later_attempts() -> None:
+    settings = build_settings()
+
+    first_attempt_queries = _build_search_query_bank(settings, SearchTuning(attempt_number=1))
+    second_attempt_queries = _build_search_query_bank(settings, SearchTuning(attempt_number=2))
+
+    assert not any("site:linkedin.com/jobs/view" in query for query in first_attempt_queries)
+    assert any("site:linkedin.com/jobs/view" in query for query in second_attempt_queries)
+
+
+def test_query_timeout_skip_reason_repeats_and_broad_circuit_breaker() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query="AI product manager remote",
+                attempt_number=1,
+                round_number=1,
+            ),
+            *[
+                SearchFailure(
+                    stage="discovery",
+                    reason_code="query_timeout",
+                    detail="timed out",
+                    source_query=f"principal product manager AI remote {index}",
+                    attempt_number=1,
+                    round_number=1,
+                )
+                for index in range(1, 7)
+            ],
+        ],
+    )
+
+    repeated_reason = _query_timeout_skip_reason(
+        diagnostics,
+        "AI product manager remote",
+        attempt_number=1,
+    )
+    circuit_breaker_reason = _query_timeout_skip_reason(
+        diagnostics,
+        "staff product manager AI",
+        attempt_number=1,
+    )
+    targeted_reason = _query_timeout_skip_reason(
+        diagnostics,
+        'site:jobs.lever.co "staff product manager" "AI" remote',
+        attempt_number=1,
+    )
+
+    assert repeated_reason is not None
+    assert "already timed out" in repeated_reason.lower()
+    assert circuit_breaker_reason is not None
+    assert "circuit breaker" in circuit_breaker_reason.lower()
+    assert targeted_reason is None
+
+
+def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+
+    assert _should_refine_local_leads_with_ollama(
+        settings,
+        query="principal product manager AI",
+        candidate_pool_count=12,
+        average_confidence=0.93,
+        cleanup_signal_count=1,
+        low_trust_source_count=1,
+        trustworthy_direct_url_count=4,
+    )
+    assert not _should_refine_local_leads_with_ollama(
+        settings,
+        query='"senior product manager" "AI" remote "series a"',
+        candidate_pool_count=12,
+        average_confidence=0.97,
+        cleanup_signal_count=0,
+        low_trust_source_count=0,
+        trustworthy_direct_url_count=5,
+    )
+    assert _should_refine_local_leads_with_ollama(
+        settings,
+        query='"senior product manager" "AI" remote',
+        candidate_pool_count=4,
+        average_confidence=0.965,
+        cleanup_signal_count=1,
+        low_trust_source_count=1,
+        trustworthy_direct_url_count=2,
+    )
+
+
+def test_persist_validated_jobs_checkpoint_writes_current_jobs(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5, unique_leads_discovered=42)
+    jobs_by_url = {
+        "https://microsoft.ai/job/principal-product-manager": JobPosting(
+            company_name="Microsoft AI",
+            role_title="Principal Product Manager",
+            direct_job_url="https://microsoft.ai/job/principal-product-manager",
+            resolved_job_url="https://microsoft.ai/job/principal-product-manager",
+            ats_platform="Microsoft AI",
+            location_text="Remote - United States",
+            is_fully_remote=True,
+            posted_date_text="2026-03-29",
+            posted_date_iso="2026-03-29",
+            salary_text="$220,000 - $260,000",
+            evidence_notes="Direct company role.",
+        )
+    }
+
+    _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id="run-checkpoint", diagnostics=diagnostics)
+
+    latest_payload = json.loads((tmp_path / "validated-jobs-checkpoint-latest.json").read_text(encoding="utf-8"))
+    run_payload = json.loads((tmp_path / "validated-jobs-checkpoint-run-checkpoint.json").read_text(encoding="utf-8"))
+    assert latest_payload["qualifying_job_count"] == 1
+    assert latest_payload["unique_leads_discovered"] == 42
+    assert latest_payload["jobs"][0]["company_name"] == "Microsoft AI"
+    assert run_payload["run_id"] == "run-checkpoint"
+
+
+def test_evaluate_merged_job_rejects_generic_company_home_or_benefits_page(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    job = JobPosting(
+        company_name="Applied Systems",
+        role_title="Senior Product Manager, AI",
+        direct_job_url="https://careers-appliedsystems.icims.com/jobs/intro",
+        resolved_job_url="https://careers-appliedsystems.icims.com/jobs/intro",
+        ats_platform="iCIMS",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-26",
+        posted_date_iso="2026-03-26",
+        base_salary_min_usd=210000,
+        base_salary_max_usd=235000,
+        salary_text="$210,000 - $235,000",
+        evidence_notes="Discovery source had the full role and salary evidence.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="iCIMS",
+        status_code=200,
+        company_name="Applied Systems",
+        role_title=None,
+        page_title="Careers | Applied Systems",
+        location_text=None,
+        is_fully_remote=None,
+        posted_date_text=None,
+        posted_date_iso=None,
+        text_excerpt="Learn about our benefits and career opportunities at Applied Systems.",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Applied Systems",
+        expected_role_title="Senior Product Manager, AI",
+    )
+
+    assert reason_code == "not_specific_job_page"
+    assert "specific posting" in detail.lower()
 
 
 def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_without_override_hints() -> None:

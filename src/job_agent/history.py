@@ -573,6 +573,11 @@ def record_failed_run(
     status_payload: Mapping[str, Any] | None = None,
     failure_message: str | None = None,
 ) -> None:
+    metrics = dict((status_payload or {}).get("metrics", {}) or {})
+    jobs_found_by_search = int(metrics.get("jobs_found_by_search") or metrics.get("unique_leads_discovered") or 0)
+    jobs_kept_after_validation = int(
+        metrics.get("jobs_kept_after_validation") or metrics.get("qualifying_jobs") or 0
+    )
     _upsert_run_history_entry(
         data_dir,
         {
@@ -581,10 +586,8 @@ def record_failed_run(
             "started_at": status_payload.get("started_at") if status_payload else None,
             "ended_at": status_payload.get("updated_at") if status_payload else _utc_now_iso(),
             "message": failure_message or (status_payload.get("message") if status_payload else "Workflow failed."),
-            "jobs_found_by_search": int((status_payload or {}).get("metrics", {}).get("jobs_found_by_search", 0) or 0),
-            "jobs_kept_after_validation": int(
-                (status_payload or {}).get("metrics", {}).get("jobs_kept_after_validation", 0) or 0
-            ),
+            "jobs_found_by_search": jobs_found_by_search,
+            "jobs_kept_after_validation": jobs_kept_after_validation,
             "jobs_with_any_messages": int((status_payload or {}).get("metrics", {}).get("jobs_with_any_messages", 0) or 0),
             "message_docx_path": None,
             "summary_docx_path": None,

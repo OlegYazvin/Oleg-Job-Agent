@@ -40,6 +40,8 @@ ATS_HOST_MAP = {
     "jobs.lever.co": "Lever",
     "ashbyhq.com": "Ashby",
     "myworkdayjobs.com": "Workday",
+    "careers.workday.com": "Workday",
+    "icims.com": "iCIMS",
     "jobvite.com": "Jobvite",
     "smartrecruiters.com": "SmartRecruiters",
     "recruitee.com": "Recruitee",

@@ -159,6 +159,22 @@ def test_inspect_configured_firefox_extension_profile_reports_ready(monkeypatch,
     assert payload["temporary_extension_loaded"] is True
 
 
+def test_resolve_extension_host_profile_prefers_authenticated_configured_profile_when_not_running(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    configured_profile = tmp_path / "real-profile"
+    configured_profile.mkdir()
+    settings = SimpleNamespace(project_root=tmp_path, firefox_extension_profile_dir=configured_profile)
+    monkeypatch.setattr(host_module, "firefox_profile_has_linkedin_auth", lambda profile: True)
+    monkeypatch.setattr(host_module, "_firefox_process_running_for_profile", lambda profile: False)
+
+    profile_dir, using_configured_profile = host_module._resolve_extension_host_profile(settings)
+
+    assert profile_dir == configured_profile.resolve()
+    assert using_configured_profile is True
+
+
 def test_open_url_in_firefox_profile_prefers_live_running_instance_for_temporary_addon(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -215,3 +231,158 @@ def test_deploy_host_background_prefers_configured_profile(monkeypatch, tmp_path
     assert payload["mode"] == "configured_profile"
     assert payload["started"] is True
     assert opened == [(profile_dir, "https://www.linkedin.com/feed/")]
+
+
+def test_deploy_host_background_starts_host_on_authenticated_configured_profile_without_extension(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "real-profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr(
+        host_module,
+        "load_settings",
+        lambda require_openai=False: SimpleNamespace(project_root=tmp_path, firefox_extension_profile_dir=profile_dir),
+    )
+    monkeypatch.setattr(
+        host_module,
+        "inspect_configured_firefox_extension_profile",
+        lambda settings: {
+            "configured": True,
+            "path": str(profile_dir),
+            "exists": True,
+            "process_running": False,
+            "extension_installed": False,
+            "linkedin_authenticated": True,
+            "ready": False,
+            "extension_id": host_module.FIREFOX_EXTENSION_ID,
+        },
+    )
+    monkeypatch.setattr(
+        host_module,
+        "deploy_dedicated_host_background",
+        lambda settings=None: {
+            "started": True,
+            "pid": 4242,
+            "profile_dir": str(profile_dir),
+            "linkedin_authenticated": True,
+            "ready_at": "2026-03-30T10:00:00+00:00",
+        },
+    )
+
+    payload = host_module.deploy_host_background()
+
+    assert payload["mode"] == "configured_profile_host"
+    assert payload["started"] is True
+    assert payload["profile"]["path"] == str(profile_dir)
+
+
+def test_deploy_host_background_attempts_storage_state_sync_for_configured_profile(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "real-profile"
+    profile_dir.mkdir()
+    inspect_calls = {"count": 0}
+    monkeypatch.setattr(
+        host_module,
+        "load_settings",
+        lambda require_openai=False: SimpleNamespace(
+            project_root=tmp_path,
+            firefox_extension_profile_dir=profile_dir,
+            linkedin_storage_state=tmp_path / "linkedin-state.json",
+        ),
+    )
+
+    def fake_inspect(settings):
+        inspect_calls["count"] += 1
+        if inspect_calls["count"] == 1:
+            return {
+                "configured": True,
+                "path": str(profile_dir),
+                "exists": True,
+                "process_running": False,
+                "extension_installed": True,
+                "linkedin_authenticated": False,
+                "storage_state_authenticated": True,
+                "ready": False,
+                "extension_id": host_module.FIREFOX_EXTENSION_ID,
+            }
+        return {
+            "configured": True,
+            "path": str(profile_dir),
+            "exists": True,
+            "process_running": False,
+            "extension_installed": True,
+            "linkedin_authenticated": True,
+            "storage_state_authenticated": True,
+            "ready": True,
+            "extension_id": host_module.FIREFOX_EXTENSION_ID,
+        }
+
+    monkeypatch.setattr(host_module, "inspect_configured_firefox_extension_profile", fake_inspect)
+    monkeypatch.setattr(host_module, "_sync_configured_profile_from_storage_state", lambda settings: True)
+    opened: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        host_module,
+        "open_url_in_firefox_profile",
+        lambda profile, url: opened.append((profile, url)) or True,
+    )
+
+    payload = host_module.deploy_host_background()
+
+    assert payload["mode"] == "configured_profile"
+    assert payload["started"] is True
+    assert opened == [(profile_dir, "https://www.linkedin.com/feed/")]
+
+
+def test_deploy_host_background_bootstraps_real_profile_for_auth_and_extension(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "real-profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr(
+        host_module,
+        "load_settings",
+        lambda require_openai=False: SimpleNamespace(
+            project_root=tmp_path,
+            firefox_extension_profile_dir=profile_dir,
+            linkedin_storage_state=tmp_path / "linkedin-state.json",
+        ),
+    )
+    monkeypatch.setattr(
+        host_module,
+        "inspect_configured_firefox_extension_profile",
+        lambda settings: {
+            "configured": True,
+            "path": str(profile_dir),
+            "exists": True,
+            "process_running": False,
+            "extension_installed": False,
+            "linkedin_authenticated": False,
+            "storage_state_authenticated": False,
+            "ready": False,
+            "extension_id": host_module.FIREFOX_EXTENSION_ID,
+        },
+    )
+    opened: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        host_module,
+        "open_url_in_firefox_profile",
+        lambda profile, url: opened.append((profile, url)) or True,
+    )
+
+    payload = host_module.deploy_host_background()
+
+    assert payload["mode"] == "configured_profile"
+    assert payload["started"] is True
+    assert payload["launch_urls"] == [
+        "https://www.linkedin.com/feed/",
+        "about:debugging#/runtime/this-firefox",
+    ]
+    assert "sign into linkedin" in payload["next_action"].lower()
+    assert opened == [
+        (profile_dir, "https://www.linkedin.com/feed/"),
+        (profile_dir, "about:debugging#/runtime/this-firefox"),
+    ]

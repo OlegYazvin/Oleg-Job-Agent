@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import contextlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
@@ -10,8 +11,10 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 from urllib.parse import quote, urlparse, urlunparse
 
+import httpx
 from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 import pyotp
 
@@ -1353,6 +1356,127 @@ def _load_firefox_linkedin_cookies(profile_dir: Path | None = None) -> list[dict
         except Exception:
             pass
         shutil.rmtree(copied_db.parent, ignore_errors=True)
+
+
+def linkedin_cookies_authenticate(
+    cookies: list[dict[str, object]],
+    *,
+    timeout_seconds: float = 10.0,
+) -> bool:
+    if not cookies:
+        return False
+
+    jar = httpx.Cookies()
+    for cookie in cookies:
+        name = str(cookie.get("name") or "").strip()
+        value = cookie.get("value")
+        domain = str(cookie.get("domain") or "").strip()
+        if not name or value is None or "linkedin.com" not in domain:
+            continue
+        jar.set(name, str(value), domain=domain, path=str(cookie.get("path") or "/"))
+
+    if not jar:
+        return False
+
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=timeout_seconds,
+            cookies=jar,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            response = client.get("https://www.linkedin.com/feed/")
+    except httpx.HTTPError:
+        return False
+
+    final_url = str(response.url or "")
+    lowered = response.text.lower()
+    if "/uas/login" in final_url or "linkedin login" in lowered:
+        return False
+    if "checkpoint/challenge" in final_url or "checkpoint/challenge" in lowered:
+        return False
+    return "linkedin.com/feed" in final_url or "voyager-web" in lowered or "feed" in final_url
+
+
+def linkedin_storage_state_is_authenticated(storage_state_path: Path) -> bool:
+    return linkedin_cookies_authenticate(_load_linkedin_storage_state_cookies(storage_state_path))
+
+
+def sync_linkedin_cookies_to_firefox_profile(profile_dir: Path, storage_state_path: Path) -> bool:
+    selected_names = {"li_at", "JSESSIONID"}
+    cookies = [
+        cookie
+        for cookie in _load_linkedin_storage_state_cookies(storage_state_path)
+        if str(cookie.get("name") or "") in selected_names
+    ]
+    if not cookies:
+        return False
+
+    db_path = profile_dir / "cookies.sqlite"
+    if not db_path.exists():
+        return False
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(db_path, timeout=2.0)
+        cursor = connection.cursor()
+        cursor.execute("pragma table_info(moz_cookies)")
+        columns = {str(row[1]) for row in cursor.fetchall()}
+        if not columns:
+            return False
+
+        base_columns = [
+            "originAttributes",
+            "name",
+            "value",
+            "host",
+            "path",
+            "expiry",
+            "lastAccessed",
+            "creationTime",
+            "isSecure",
+            "isHttpOnly",
+            "inBrowserElement",
+            "sameSite",
+            "schemeMap",
+        ]
+        optional_columns = [column for column in ("isPartitionedAttributeSet", "updateTime") if column in columns]
+        insert_columns = [column for column in base_columns if column in columns] + optional_columns
+        placeholders = ", ".join("?" for _ in insert_columns)
+        now_us = int(time.time() * 1_000_000)
+        same_site_map = {"lax": 1, "strict": 2, "Lax": 1, "Strict": 2}
+
+        cursor.execute("delete from moz_cookies where host like '%linkedin.com' and name in ('li_at','JSESSIONID')")
+        for cookie in cookies:
+            values_by_column = {
+                "originAttributes": "",
+                "name": str(cookie["name"]),
+                "value": str(cookie["value"]),
+                "host": str(cookie.get("domain") or ".www.linkedin.com"),
+                "path": str(cookie.get("path") or "/"),
+                "expiry": int(cookie.get("expires") or 0),
+                "lastAccessed": now_us,
+                "creationTime": now_us,
+                "isSecure": 1 if cookie.get("secure", True) else 0,
+                "isHttpOnly": 1 if cookie.get("httpOnly", False) else 0,
+                "inBrowserElement": 0,
+                "sameSite": same_site_map.get(str(cookie.get("sameSite") or ""), 0),
+                "schemeMap": 0,
+                "isPartitionedAttributeSet": 0,
+                "updateTime": now_us,
+            }
+            cursor.execute(
+                f"insert into moz_cookies ({', '.join(insert_columns)}) values ({placeholders})",
+                tuple(values_by_column[column] for column in insert_columns),
+            )
+        connection.commit()
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                connection.close()
 
 
 def _load_env_linkedin_cookies(settings: Settings) -> list[dict[str, object]]:

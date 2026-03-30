@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime
 from uuid import uuid4
 
@@ -12,7 +13,12 @@ from .job_search import find_matching_jobs
 from .linkedin_extension_bridge import LinkedInExtensionBridge
 from .linkedin import LinkedInClient
 from .models import JobOutreachBundle, RunManifest
-from .ollama_runtime import auto_tune_ollama_settings, build_ollama_run_summary, save_ollama_run_summary
+from .ollama_runtime import (
+    auto_tune_ollama_settings,
+    build_ollama_run_summary,
+    prewarm_ollama_model,
+    save_ollama_run_summary,
+)
 from .reports import (
     build_live_outreach_payload,
     build_manifest,
@@ -51,6 +57,47 @@ async def _run_daily_workflow_body(
                 ollama_degraded_for_run=settings.ollama_degraded_for_run,
                 ollama_degraded_reason=settings.ollama_degraded_reason,
             )
+        if settings.ollama_degraded_for_run:
+            if status:
+                status.emit(
+                    "starting",
+                    "Skipping Ollama prewarm because optional Ollama steps are already degraded for this run.",
+                    ollama_model=settings.ollama_model,
+                    ollama_degraded_reason=settings.ollama_degraded_reason,
+                )
+        else:
+            prewarm_ok, prewarm_error, prewarm_duration = await prewarm_ollama_model(settings, run_id=run_id)
+            if prewarm_ok:
+                if status:
+                    status.emit(
+                        "starting",
+                        "Prewarmed Ollama model for this run.",
+                        ollama_model=settings.ollama_model,
+                        ollama_prewarm_duration_seconds=prewarm_duration,
+                    )
+            else:
+                degraded_reason = f"Ollama prewarm failed before search: {prewarm_error or 'unknown error'}"
+                settings = replace(
+                    settings,
+                    ollama_degraded_for_run=True,
+                    ollama_degraded_reason=degraded_reason,
+                )
+                if tuning_profile is not None:
+                    tuning_profile = tuning_profile.model_copy(
+                        update={
+                            "degraded": True,
+                            "degraded_reason": degraded_reason,
+                        }
+                    )
+                if status:
+                    status.emit(
+                        "starting",
+                        "Ollama prewarm failed; optional Ollama steps will be skipped for this run.",
+                        ollama_model=settings.ollama_model,
+                        ollama_prewarm_duration_seconds=prewarm_duration,
+                        ollama_degraded_for_run=True,
+                        ollama_degraded_reason=degraded_reason,
+                    )
 
     jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(settings, status=status, run_id=run_id)
     linkedin = LinkedInClient(settings)

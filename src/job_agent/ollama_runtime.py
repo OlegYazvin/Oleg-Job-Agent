@@ -26,6 +26,7 @@ _REQUEST_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 _QUALITY_EVENT_TYPES = {
     "lead_refinement_outcome",
     "lead_refinement_rejection",
+    "lead_refinement_skip",
     "drafting_outcome",
     "drafting_template_fallback",
     "drafting_openai_fallback",
@@ -312,18 +313,26 @@ def _available_ollama_model_names(settings: Settings) -> set[str]:
     return names
 
 
-def _probe_ollama_profile_sync(settings: Settings, profile: OllamaTuningProfile) -> tuple[bool, str | None, float]:
-    timeout_seconds = max(15.0, min(45.0, settings.ollama_timeout_seconds / 2))
+def _probe_ollama_profile_sync(
+    settings: Settings,
+    profile: OllamaTuningProfile,
+    *,
+    timeout_seconds: float | None = None,
+    max_num_ctx: int | None = None,
+    max_num_predict: int | None = None,
+    prompt: str = "Reply with OK only.",
+) -> tuple[bool, str | None, float]:
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else max(15.0, min(45.0, settings.ollama_timeout_seconds / 2))
     payload = {
         "model": profile.model,
-        "prompt": "Reply with OK only.",
+        "prompt": prompt,
         "stream": False,
         "keep_alive": profile.keep_alive,
         "options": {
             "temperature": 0,
-            "num_ctx": min(profile.num_ctx, 256),
+            "num_ctx": min(profile.num_ctx, max_num_ctx or 256),
             "num_batch": 1,
-            "num_predict": min(profile.num_predict, 32),
+            "num_predict": min(profile.num_predict, max_num_predict or 32),
         },
     }
     started_at = time.monotonic()
@@ -762,3 +771,56 @@ def _ensure_ollama_server_sync(settings: Settings, *, force_restart: bool) -> No
 async def ensure_ollama_server(settings: Settings, *, force_restart: bool = False) -> None:
     async with _runtime_lock(settings):
         await asyncio.to_thread(_ensure_ollama_server_sync, settings, force_restart=force_restart)
+
+
+async def prewarm_ollama_model(
+    settings: Settings,
+    *,
+    run_id: str | None = None,
+) -> tuple[bool, str | None, float]:
+    if settings.llm_provider != "ollama":
+        return True, None, 0.0
+
+    profile = _current_profile_from_settings(settings)
+    timeout_seconds = max(60.0, min(120.0, settings.ollama_timeout_seconds))
+    probe_kwargs = {
+        "timeout_seconds": timeout_seconds,
+        "max_num_ctx": min(profile.num_ctx, 256),
+        "max_num_predict": min(profile.num_predict, 24),
+        "prompt": "Reply with OK only.",
+    }
+    total_duration = 0.0
+
+    async def run_probe(attempt_number: int, *, restarted: bool = False) -> tuple[bool, str | None]:
+        nonlocal total_duration
+        success, error_message, probe_duration = await asyncio.to_thread(
+            _probe_ollama_profile_sync,
+            settings,
+            profile,
+            **probe_kwargs,
+        )
+        total_duration = round(total_duration + probe_duration, 3)
+        record_ollama_event(
+            settings,
+            "prewarm_success" if success else "prewarm_failure",
+            run_id=run_id,
+            attempt_number=attempt_number,
+            model=profile.model,
+            keep_alive=profile.keep_alive,
+            num_ctx=probe_kwargs["max_num_ctx"],
+            num_batch=1,
+            num_predict=probe_kwargs["max_num_predict"],
+            wall_duration_seconds=probe_duration,
+            timeout_seconds=timeout_seconds,
+            restarted_before_probe=restarted,
+            error_message=error_message,
+        )
+        return success, error_message
+
+    success, error_message = await run_probe(1)
+    if success or not settings.ollama_restart_on_failure:
+        return success, error_message, total_duration
+
+    await ensure_ollama_server(settings, force_restart=True)
+    success, error_message = await run_probe(2, restarted=True)
+    return success, error_message, total_duration

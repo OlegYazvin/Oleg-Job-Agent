@@ -112,6 +112,7 @@ LINKEDIN_RESOLUTION_BLOCKED_HOST_FRAGMENTS = (
     "thatstartupjob.com",
     "tangerinefeed.net",
     "cari.me.uk",
+    "tracxn.com",
 )
 
 JOB_PATH_HINTS = (
@@ -167,6 +168,20 @@ GENERIC_CAREERS_TAIL_SEGMENTS = {
     "culture",
     "people",
     "team",
+    "stores",
+    "retail",
+    "restaurants",
+}
+GENERIC_HOST_SUBDOMAIN_PREFIXES = {
+    "www",
+    "jobs",
+    "job",
+    "careers",
+    "career",
+    "apply",
+    "join",
+    "workat",
+    "recruiting",
 }
 REDIRECT_QUERY_PARAM_NAMES = {
     "url",
@@ -217,6 +232,7 @@ FOCUSABLE_REASON_CODES = {
     "missing_salary",
     "remote_unclear",
 }
+BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD = 6
 
 LOCAL_OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
 BUILTIN_PRIMARY_BASE_URL = "https://builtin.com"
@@ -539,7 +555,10 @@ def _unwrap_direct_job_url(url: str) -> str:
 
 
 def _normalize_direct_job_url(url: str) -> str:
-    parsed = urlparse(_unwrap_direct_job_url(url))
+    unwrapped_url = _unwrap_direct_job_url(url)
+    if not unwrapped_url:
+        return ""
+    parsed = urlparse(unwrapped_url)
     host = (parsed.netloc or "").lower()
     path = parsed.path.rstrip("/")
     query = _strip_tracking_query_params(parsed.query)
@@ -595,6 +614,53 @@ def _candidate_direct_job_url_is_trustworthy(url: str, lead: JobLead) -> bool:
     if not _is_allowed_direct_job_url(normalized) or _looks_like_generic_job_url(normalized):
         return False
     return _direct_job_url_matches_expected_company(normalized, lead.company_name)
+
+
+def _lead_direct_job_url_precheck_failure(
+    lead: JobLead,
+    *,
+    attempt_number: int,
+    round_number: int,
+) -> SearchFailure | None:
+    normalized_url = _normalize_direct_job_url(lead.direct_job_url or "")
+    if not normalized_url:
+        return None
+    if lead.source_type == "linkedin" and _is_linkedin_resolution_blocked_host(normalized_url):
+        return _make_failure(
+            stage="resolution",
+            reason_code="resolution_blocked_url",
+            detail="Lead direct URL pointed at a blocked LinkedIn resolution host instead of a real ATS or company careers page.",
+            lead=lead,
+            direct_job_url=normalized_url,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    if _looks_like_generic_job_url(normalized_url):
+        return _make_failure(
+            stage="resolution",
+            reason_code="not_specific_job_page",
+            detail="Lead direct URL pointed at a generic careers page rather than a specific job posting.",
+            lead=lead,
+            direct_job_url=normalized_url,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    if not _direct_job_url_matches_expected_company(normalized_url, lead.company_name):
+        company_hint = _company_hint_from_url(normalized_url)
+        if not _is_weak_company_hint(company_hint):
+            return _make_failure(
+                stage="resolution",
+                reason_code="company_mismatch",
+                detail=(
+                    f"Lead direct URL company hint '{company_hint}' did not match expected company "
+                    f"'{lead.company_name}'."
+                ),
+                lead=lead,
+                direct_job_url=normalized_url,
+                attempt_number=attempt_number,
+                round_number=round_number,
+            )
+    return None
 
 
 def _extract_company_board_identifier(url: str | None) -> str | None:
@@ -741,6 +807,12 @@ def _has_company_job_detail_signal(parsed_url) -> bool:
         return False
     if len(segments) <= 2 and segments[-1] in GENERIC_CAREERS_TAIL_SEGMENTS:
         return False
+    if (
+        segments[-1] in GENERIC_CAREERS_TAIL_SEGMENTS
+        and len(segments) <= 3
+        and any(segment in GENERIC_COMPANY_CAREERS_SEGMENTS for segment in segments[:-1])
+    ):
+        return False
     if len(segments) >= 2 and all(segment in GENERIC_CAREERS_TAIL_SEGMENTS for segment in segments[-2:]):
         return False
 
@@ -852,8 +924,8 @@ def _looks_like_careers_hub_url(url: str) -> bool:
     if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
         return _looks_like_generic_job_url(url)
     if host.startswith(("careers.", "jobs.", "apply.", "join.", "workat.", "recruiting.")):
-        return True
-    return any(hint in f"{path}/" for hint in CAREERS_HUB_HINTS)
+        return not _has_company_job_detail_signal(parsed)
+    return any(hint in f"{path}/" for hint in CAREERS_HUB_HINTS) and not _has_company_job_detail_signal(parsed)
 
 
 def _looks_like_company_homepage_url(url: str) -> bool:
@@ -2284,7 +2356,11 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
         "builtinchicago.com/jobs",
         "glassdoor.com/Job",
     ]
-    seed_queries = list(settings.search_queries)
+    seed_queries = [
+        query
+        for query in settings.search_queries
+        if tuning.attempt_number > 1 or not _query_targets_generic_discovery_domain(query)
+    ]
     focus_queries: list[str] = []
     direct_queries: list[str] = []
     salary_queries: list[str] = []
@@ -2326,7 +2402,7 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
                 salary_queries.append(f"{role_query} {salary_region} \"salary\"")
                 salary_queries.append(f"{role_query} {salary_region} \"base salary\"")
 
-    focus_queries.extend(_build_focus_company_queries(settings, tuning, include_site_domains=True))
+    focus_queries.extend(_build_focus_company_queries(settings, tuning, include_site_domains=tuning.attempt_number > 1))
     for company in tuning.focus_companies[:10]:
         company_term = f"\"{company}\""
         for role_term in (tuning.focus_roles or _default_focus_role_terms())[:6]:
@@ -2338,9 +2414,10 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
         recency_queries,
         salary_queries,
         seed_queries,
-        discovery_queries,
     ]
-    if broad_queries:
+    if tuning.attempt_number > 1:
+        query_groups.append(discovery_queries)
+    if tuning.attempt_number > 2 and broad_queries:
         query_groups.append(broad_queries)
 
     queries = [
@@ -2397,6 +2474,116 @@ def _build_local_query_rounds(settings: Settings, tuning: SearchTuning | None = 
         limited_bank[index : index + settings.search_round_query_limit]
         for index in range(0, len(limited_bank), settings.search_round_query_limit)
     ]
+
+
+def _query_uses_structured_source_hint(query: str) -> bool:
+    lowered = query.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "site:",
+            "workatastartup.com",
+            "ycombinator.com/companies",
+            "getro.com",
+            "builtin.com",
+            "greenhouse",
+            "ashby",
+            "lever",
+            "smartrecruiters",
+            "recruitee",
+            "tellent",
+            "jobscore",
+            "workday",
+            "icims",
+        )
+    )
+
+
+def _query_targets_generic_discovery_domain(query: str) -> bool:
+    lowered = query.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "site:linkedin.com/jobs/view",
+            "site:builtin.com/jobs",
+            "site:builtinnyc.com/jobs",
+            "site:builtinsf.com/jobs",
+            "site:builtinseattle.com/jobs",
+            "site:builtinla.com/jobs",
+            "site:builtinchicago.org/jobs",
+            "site:builtinchicago.com/jobs",
+            "site:glassdoor.com/job",
+        )
+    )
+
+
+def _query_is_broad_generic(query: str) -> bool:
+    lowered = query.lower()
+    if _query_uses_structured_source_hint(query):
+        return False
+    if any(token in lowered for token in ("series a", "series b", "seed stage", "portfolio company", "venture backed", "vertical ai", "early stage")):
+        return False
+    quoted_phrases = re.findall(r'"[^"]+"', query)
+    if len(quoted_phrases) >= 2:
+        return False
+    return True
+
+
+def _query_timeout_seconds_for_query(settings: Settings, query: str) -> int:
+    base_timeout = max(10, settings.per_query_timeout_seconds)
+    if settings.llm_provider != "ollama":
+        return base_timeout
+    if _query_is_broad_generic(query):
+        return min(max(base_timeout - 15, 15), 25)
+    if _query_uses_structured_source_hint(query):
+        return min(max(base_timeout, 30), 45)
+    return min(max(base_timeout - 5, 20), 35)
+
+
+def _timed_out_queries(diagnostics: SearchDiagnostics, *, attempt_number: int | None = None) -> set[str]:
+    queries: set[str] = set()
+    for failure in diagnostics.failures:
+        if failure.reason_code != "query_timeout" or not failure.source_query:
+            continue
+        if attempt_number is not None and failure.attempt_number != attempt_number:
+            continue
+        normalized_query = " ".join(failure.source_query.split())
+        if normalized_query:
+            queries.add(normalized_query)
+    return queries
+
+
+def _broad_generic_query_timeout_count(diagnostics: SearchDiagnostics, *, attempt_number: int) -> int:
+    return sum(
+        1
+        for failure in diagnostics.failures
+        if failure.reason_code == "query_timeout"
+        and failure.attempt_number == attempt_number
+        and failure.source_query
+        and _query_is_broad_generic(failure.source_query)
+    )
+
+
+def _query_timeout_skip_reason(
+    diagnostics: SearchDiagnostics,
+    query: str,
+    *,
+    attempt_number: int,
+) -> str | None:
+    normalized_query = " ".join(query.split())
+    if not normalized_query:
+        return None
+    if normalized_query in _timed_out_queries(diagnostics):
+        return "The same discovery query already timed out earlier in this run."
+    if not _query_is_broad_generic(normalized_query):
+        return None
+    broad_timeout_count = _broad_generic_query_timeout_count(diagnostics, attempt_number=attempt_number)
+    if broad_timeout_count >= BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD:
+        return (
+            "The broad-query timeout circuit breaker is open after "
+            f"{broad_timeout_count} broad discovery query timeouts in this pass."
+        )
+    return None
 
 
 def _failure_counts_for_attempt(diagnostics: SearchDiagnostics, attempt_number: int) -> Counter[str]:
@@ -2757,6 +2944,56 @@ def _decode_search_result_url(url: str) -> str:
 
 
 def _company_hint_from_url(url: str) -> str:
+    def host_company_hint(host: str) -> str | None:
+        labels = [label for label in host.lower().split(".") if label]
+        if not labels:
+            return None
+        ats_vendor_labels = {
+            "icims",
+            "greenhouse",
+            "lever",
+            "ashbyhq",
+            "smartrecruiters",
+            "recruitee",
+            "tellent",
+            "jobscore",
+            "jobvite",
+            "workable",
+            "bamboohr",
+            "dayforcehcm",
+            "paylocity",
+            "adp",
+            "myworkdayjobs",
+            "workday",
+        }
+
+        def clean_label(label: str) -> str:
+            cleaned = re.sub(
+                r"^(?:[a-z]{2,3})?(?:careers|career|jobs|job|apply|join|workat|recruiting)[-_]?",
+                "",
+                label,
+            )
+            cleaned = re.sub(r"^(?:www)[-_]?", "", cleaned)
+            return cleaned.strip("-_")
+
+        candidate_labels = list(labels[:-1]) if len(labels) > 1 else list(labels)
+        for label in reversed(candidate_labels):
+            cleaned = clean_label(label)
+            if not cleaned or cleaned in GENERIC_HOST_SUBDOMAIN_PREFIXES or cleaned in ats_vendor_labels:
+                continue
+            normalized = cleaned.replace("-", " ").replace("_", " ").strip()
+            if normalized:
+                return normalized.title()
+
+        if len(labels) >= 3 and len(labels[-1]) == 2 and len(labels[-2]) <= 3:
+            candidate = labels[-3]
+        elif len(labels) >= 2:
+            candidate = labels[-2]
+        else:
+            candidate = labels[0]
+        normalized = clean_label(candidate).replace("-", " ").replace("_", " ").strip()
+        return normalized.title() if normalized else None
+
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
     path_segments = [segment for segment in parsed.path.split("/") if segment]
@@ -2794,9 +3031,21 @@ def _company_hint_from_url(url: str) -> str:
         return path_segments[0].replace("-", " ").title()
     if "greenhouse.io" in host and path_segments:
         return path_segments[0].replace("-", " ").title()
+    host_hint = host_company_hint(host)
+    if not _is_weak_company_hint(host_hint):
+        return str(host_hint)
     if path_segments:
         return path_segments[0].replace("-", " ").title()
     return (host.split(".")[0] if host else "Unknown").replace("-", " ").title()
+
+
+def _url_has_strong_expected_company_hint(url: str, expected_company_name: str | None) -> bool:
+    if not expected_company_name or _is_weak_company_hint(expected_company_name):
+        return False
+    company_hint = _company_hint_from_url(url)
+    if _is_weak_company_hint(company_hint):
+        return False
+    return _company_names_match(expected_company_name, company_hint)
 
 
 def _extract_role_company_from_title(title: str, url: str) -> tuple[str, str]:
@@ -2876,6 +3125,74 @@ def _lead_confidence(lead: JobLead) -> float:
     if lead.posted_date_hint:
         score += 0.05
     return max(0.0, min(1.0, score))
+
+
+def _lead_needs_local_cleanup(lead: JobLead) -> bool:
+    if lead.source_type in {"linkedin", "builtin", "other"}:
+        return True
+    if not lead.direct_job_url:
+        return True
+    normalized_direct_url = _normalize_direct_job_url(lead.direct_job_url)
+    if not _candidate_direct_job_url_is_trustworthy(normalized_direct_url, lead):
+        return True
+    return _looks_like_generic_job_url(normalized_direct_url)
+
+
+def _ollama_refinement_mode_for_local_leads(
+    settings: Settings,
+    *,
+    query: str,
+    candidate_pool_count: int,
+    average_confidence: float,
+    cleanup_signal_count: int,
+    low_trust_source_count: int,
+    trustworthy_direct_url_count: int,
+) -> str | None:
+    if settings.llm_provider != "ollama" or candidate_pool_count < 3:
+        return None
+    if average_confidence < min(settings.local_confidence_threshold + 0.1, 0.9):
+        return "low_confidence"
+    if trustworthy_direct_url_count == 0:
+        return "no_trustworthy_direct_urls"
+    if cleanup_signal_count >= 2 or low_trust_source_count >= 3:
+        return "high_noise"
+    if (
+        3 <= candidate_pool_count <= 6
+        and cleanup_signal_count >= 1
+        and low_trust_source_count >= 1
+        and average_confidence < 0.98
+    ):
+        return "borderline_bundle"
+    if (
+        candidate_pool_count >= 8
+        and cleanup_signal_count >= 1
+        and low_trust_source_count >= 1
+        and average_confidence < 0.95
+        and _query_is_broad_generic(query)
+    ):
+        return "broad_generic"
+    return None
+
+
+def _should_refine_local_leads_with_ollama(
+    settings: Settings,
+    *,
+    query: str,
+    candidate_pool_count: int,
+    average_confidence: float,
+    cleanup_signal_count: int,
+    low_trust_source_count: int,
+    trustworthy_direct_url_count: int,
+) -> bool:
+    return _ollama_refinement_mode_for_local_leads(
+        settings,
+        query=query,
+        candidate_pool_count=candidate_pool_count,
+        average_confidence=average_confidence,
+        cleanup_signal_count=cleanup_signal_count,
+        low_trust_source_count=low_trust_source_count,
+        trustworthy_direct_url_count=trustworthy_direct_url_count,
+    ) is not None
 
 
 def _is_duckduckgo_anomaly_page(status_code: int, html: str) -> bool:
@@ -3710,12 +4027,32 @@ async def _fetch_builtin_job_lead(
     if remote_restriction_note and is_remote:
         location_hint = f"Remote - {remote_restriction_note.split(': ', 1)[1].rstrip('.')}"
 
+    normalized_direct_url = _normalize_direct_job_url(direct_url) if direct_url else None
+    if normalized_direct_url:
+        provisional_lead = JobLead(
+            company_name=company_name,
+            role_title=role_title or description_hint or "Product Manager",
+            source_url=detail_url,
+            source_type="builtin",
+            direct_job_url=normalized_direct_url,
+            location_hint=location_hint,
+            posted_date_hint=posted_hint,
+            is_remote_hint=is_remote,
+            base_salary_min_usd_hint=salary_min,
+            base_salary_max_usd_hint=salary_max,
+            salary_text_hint=salary_text,
+            source_query=query,
+            evidence_notes="",
+        )
+        if not _candidate_direct_job_url_is_trustworthy(normalized_direct_url, provisional_lead):
+            normalized_direct_url = None
+
     lead = JobLead(
         company_name=company_name,
         role_title=role_title or description_hint or "Product Manager",
         source_url=detail_url,
         source_type="builtin",
-        direct_job_url=_normalize_direct_job_url(direct_url) if direct_url else None,
+        direct_job_url=normalized_direct_url,
         location_hint=location_hint,
         posted_date_hint=posted_hint,
         is_remote_hint=is_remote,
@@ -4385,6 +4722,7 @@ async def _replay_seed_leads(
         jobs_by_url.setdefault(validated_key, validated)
         diagnostics.unique_leads_discovered = total_unique_leads
         _persist_search_diagnostics(settings, diagnostics)
+        _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
         if status:
             status.emit(
                 "search",
@@ -4393,6 +4731,7 @@ async def _replay_seed_leads(
                 round_number=0,
                 unique_leads_discovered=total_unique_leads,
                 qualifying_jobs=len(jobs_by_url),
+                jobs_kept_after_validation=len(jobs_by_url),
             )
 
     return total_unique_leads, resolved_leads_this_attempt
@@ -4446,6 +4785,7 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
     normalized = " ".join(query.split())
     if not normalized:
         return []
+    broad_generic_query = _query_is_broad_generic(normalized)
 
     board_batch_index = _stable_text_index(normalized.lower(), len(LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES))
     ats_batch_index = _stable_text_index(normalized.lower()[::-1], len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES))
@@ -4457,8 +4797,10 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
     for offset in range(min(LOCAL_SEARCH_DOMAIN_BATCH_SPAN, len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES))):
         ats_domains.extend(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES[(ats_batch_index + offset) % len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES)])
 
-    prioritized_ats_domains = list(dict.fromkeys(ats_domains))[:LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT]
-    prioritized_board_domains = list(dict.fromkeys(board_domains))[:LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT]
+    ats_limit = max(2, LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT - 1) if broad_generic_query else LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT
+    board_limit = LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT
+    prioritized_ats_domains = list(dict.fromkeys(ats_domains))[:ats_limit]
+    prioritized_board_domains = list(dict.fromkeys(board_domains))[:board_limit]
 
     queries: list[str] = []
     for domain in prioritized_ats_domains:
@@ -4469,19 +4811,22 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
         queries.append(f"site:{domain} {normalized}")
         queries.append(f"site:{domain} {normalized} remote")
 
-    queries.extend(
-        [
-            f'"{normalized}" remote',
-            f"{normalized} remote",
-            f'{normalized} "$200,000"',
-            f'{normalized} "posted this week"',
-            f'site:workatastartup.com/jobs {normalized} remote',
-            f'site:getro.com/companies {normalized} remote',
-        ]
-    )
+    broad_query_expansions = [
+        f"{normalized} remote",
+        f'{normalized} "$200,000"',
+        f'site:workatastartup.com/jobs {normalized} remote',
+        f'site:getro.com/companies {normalized} remote',
+    ]
+    targeted_query_expansions = [
+        f'"{normalized}" remote',
+        *broad_query_expansions,
+        f'{normalized} "posted this week"',
+    ]
+    queries.extend(broad_query_expansions if broad_generic_query else targeted_query_expansions)
 
     deduped = _dedupe_queries(queries)
-    return deduped[:LOCAL_SEARCH_TOTAL_QUERY_LIMIT]
+    total_limit = 12 if broad_generic_query else LOCAL_SEARCH_TOTAL_QUERY_LIMIT
+    return deduped[:total_limit]
 
 
 async def _run_local_search_engine_queries(query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
@@ -4622,6 +4967,10 @@ async def _refine_local_leads_with_ollama(
     candidate_pool: list[JobLead],
     *,
     cleanup_limit: int,
+    refinement_mode: str | None = None,
+    pre_refinement_average_confidence: float | None = None,
+    pre_refinement_cleanup_signal_count: int | None = None,
+    pre_refinement_trustworthy_direct_url_count: int | None = None,
     run_id: str | None = None,
 ) -> list[JobLead]:
     if not candidate_pool or settings.llm_provider != "ollama" or settings.ollama_degraded_for_run:
@@ -4639,8 +4988,40 @@ async def _refine_local_leads_with_ollama(
         cleaned_leads = await _cleanup_local_leads_with_ollama(settings, query, cleanup_candidates, run_id=run_id)
     normalized_cleaned = _normalize_and_filter_discovery_leads(cleaned_leads, query)
     if not normalized_cleaned:
+        record_ollama_event(
+            settings,
+            "lead_refinement_outcome",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_merge",
+            query=query,
+            refinement_mode=refinement_mode or "standard",
+            forced_borderline=bool(refinement_mode == "borderline_bundle"),
+            proposed_lead_count=len(candidate_pool),
+            returned_lead_count=0,
+            merged_lead_count=len(candidate_pool),
+            used_output_count=0,
+            discarded_output_count=len(cleaned_leads),
+            cleanup_limit=cleanup_limit,
+            pre_average_confidence=round(pre_refinement_average_confidence or 0.0, 3),
+            post_average_confidence=round(pre_refinement_average_confidence or 0.0, 3),
+            pre_cleanup_signal_count=pre_refinement_cleanup_signal_count or 0,
+            post_cleanup_signal_count=pre_refinement_cleanup_signal_count or 0,
+            pre_trustworthy_direct_url_count=pre_refinement_trustworthy_direct_url_count or 0,
+            post_trustworthy_direct_url_count=pre_refinement_trustworthy_direct_url_count or 0,
+        )
         return candidate_pool
     merged = _merge_and_dedupe_leads(normalized_cleaned, candidate_pool)
+    post_refinement_confidences = [_lead_confidence(lead) for lead in merged]
+    post_refinement_average_confidence = (
+        sum(post_refinement_confidences) / len(post_refinement_confidences) if post_refinement_confidences else 0.0
+    )
+    post_refinement_cleanup_signal_count = sum(1 for lead in merged[:5] if _lead_needs_local_cleanup(lead))
+    post_refinement_trustworthy_direct_url_count = sum(
+        1
+        for lead in merged[:5]
+        if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
+    )
     record_ollama_event(
         settings,
         "lead_refinement_outcome",
@@ -4648,11 +5029,20 @@ async def _refine_local_leads_with_ollama(
         caller="lead_refinement",
         prompt_category="lead_merge",
         query=query,
+        refinement_mode=refinement_mode or "standard",
+        forced_borderline=bool(refinement_mode == "borderline_bundle"),
         proposed_lead_count=len(candidate_pool),
         returned_lead_count=len(normalized_cleaned),
         merged_lead_count=len(merged),
         used_output_count=len(normalized_cleaned),
         discarded_output_count=max(0, len(candidate_pool) - len(merged)),
+        cleanup_limit=cleanup_limit,
+        pre_average_confidence=round(pre_refinement_average_confidence or 0.0, 3),
+        post_average_confidence=round(post_refinement_average_confidence, 3),
+        pre_cleanup_signal_count=pre_refinement_cleanup_signal_count or 0,
+        post_cleanup_signal_count=post_refinement_cleanup_signal_count,
+        pre_trustworthy_direct_url_count=pre_refinement_trustworthy_direct_url_count or 0,
+        post_trustworthy_direct_url_count=post_refinement_trustworthy_direct_url_count,
     )
     return merged
 
@@ -4763,26 +5153,56 @@ async def _search_single_query_local(
     normalized = _deterministic_trim_local_leads(settings, query, candidate_pool)
     normalized_confidences = [_lead_confidence(lead) for lead in normalized]
     average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
-
-    should_refine_with_ollama = (
-        settings.llm_provider == "ollama"
-        and len(normalized) >= 3
-        and (
-            average_confidence < min(settings.local_confidence_threshold + 0.1, 0.9)
-            or not any(lead.direct_job_url for lead in normalized[:3])
-        )
+    cleanup_window = normalized[:5]
+    cleanup_signal_count = sum(1 for lead in cleanup_window if _lead_needs_local_cleanup(lead))
+    low_trust_source_count = sum(1 for lead in cleanup_window if lead.source_type in {"linkedin", "builtin", "other"})
+    trustworthy_direct_url_count = sum(
+        1
+        for lead in cleanup_window
+        if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
     )
-    if should_refine_with_ollama:
+
+    refinement_mode = _ollama_refinement_mode_for_local_leads(
+        settings,
+        query=query,
+        candidate_pool_count=len(candidate_pool),
+        average_confidence=average_confidence,
+        cleanup_signal_count=cleanup_signal_count,
+        low_trust_source_count=low_trust_source_count,
+        trustworthy_direct_url_count=trustworthy_direct_url_count,
+    )
+    if refinement_mode is not None:
+        cleanup_limit = 3 if refinement_mode == "borderline_bundle" else max(settings.max_leads_per_query, 8)
         refined_pool = await _refine_local_leads_with_ollama(
             settings,
             query,
             candidate_pool,
-            cleanup_limit=max(settings.max_leads_per_query, 8),
+            cleanup_limit=cleanup_limit,
+            refinement_mode=refinement_mode,
+            pre_refinement_average_confidence=average_confidence,
+            pre_refinement_cleanup_signal_count=cleanup_signal_count,
+            pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
             run_id=run_id,
         )
         normalized = _deterministic_trim_local_leads(settings, query, refined_pool)
         normalized_confidences = [_lead_confidence(lead) for lead in normalized]
         average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
+    elif settings.llm_provider == "ollama" and run_id is not None:
+        record_ollama_event(
+            settings,
+            "lead_refinement_skip",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            query=query,
+            refinement_mode="skipped",
+            candidate_pool_count=len(candidate_pool),
+            normalized_lead_count=len(normalized),
+            average_confidence=round(average_confidence, 3),
+            cleanup_signal_count=cleanup_signal_count,
+            low_trust_source_count=low_trust_source_count,
+            trustworthy_direct_url_count=trustworthy_direct_url_count,
+        )
     await asyncio.sleep(0.5)
     return normalized, average_confidence
 
@@ -5485,6 +5905,26 @@ def _persist_search_diagnostics(settings: Settings, diagnostics: SearchDiagnosti
     )
 
 
+def _persist_validated_jobs_checkpoint(
+    settings: Settings,
+    jobs_by_url: dict[str, JobPosting],
+    *,
+    run_id: str | None,
+    diagnostics: SearchDiagnostics,
+) -> None:
+    jobs = sorted(jobs_by_url.values(), key=lambda item: (item.company_name.lower(), item.role_title.lower()))
+    payload = {
+        "run_id": run_id,
+        "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "qualifying_job_count": len(jobs),
+        "unique_leads_discovered": diagnostics.unique_leads_discovered,
+        "jobs": [job.model_dump(mode="json") for job in jobs],
+    }
+    save_json_snapshot(settings.data_dir / "validated-jobs-checkpoint-latest.json", payload)
+    if run_id:
+        save_json_snapshot(settings.data_dir / f"validated-jobs-checkpoint-{run_id}.json", payload)
+
+
 def _precheck_lead_hints(
     lead: JobLead,
     settings: Settings,
@@ -5492,6 +5932,13 @@ def _precheck_lead_hints(
     attempt_number: int,
     round_number: int,
 ) -> SearchFailure | None:
+    direct_url_failure = _lead_direct_job_url_precheck_failure(
+        lead,
+        attempt_number=attempt_number,
+        round_number=round_number,
+    )
+    if direct_url_failure is not None:
+        return direct_url_failure
     if "product manager" not in lead.role_title.lower():
         return _make_failure(
             stage="filter",
@@ -5612,21 +6059,90 @@ def _snapshot_remote_signal_is_low_confidence(snapshot: JobPageSnapshot) -> bool
     return any(pattern in text for pattern in weak_patterns)
 
 
+def _host_requires_strict_remote_confirmation(url: str) -> bool:
+    host = (urlparse(url).netloc or "").lower()
+    return any(fragment in host for fragment in ("myworkdayjobs.com", "careers.workday.com", "icims.com"))
+
+
+def _snapshot_location_is_specific_non_remote(location_text: str | None) -> bool:
+    lowered = (location_text or "").lower().strip()
+    if not lowered:
+        return False
+    if any(token in lowered for token in ("remote", "virtual", "telecommute", "telecommuting", "work from home")):
+        return False
+    if any(token in lowered for token in ("hybrid", "on-site", "onsite", "in office", "office")):
+        return True
+    if re.search(r"\b[a-z0-9 .&'-]+,\s*[a-z]{2}\b", lowered):
+        return True
+    if re.search(r"\b[a-z0-9 .&'-]+,\s*[a-z ]+\b", lowered):
+        return True
+    return bool(re.search(r"\b\d{2,}\s+[a-z0-9 .'-]+", lowered))
+
+
+def _snapshot_has_strong_remote_evidence(snapshot: JobPageSnapshot) -> bool:
+    haystack = " ".join(
+        part
+        for part in (
+            snapshot.location_text,
+            snapshot.page_title or "",
+            snapshot.text_excerpt[:2500],
+            " ".join(snapshot.evidence_snippets[:6]),
+        )
+        if part
+    ).lower()
+    if not haystack.strip():
+        return False
+    if any(token in haystack for token in ("hybrid", "on-site", "onsite", "in office", "required in office")):
+        return False
+    return any(
+        token in haystack
+        for token in (
+            "fully remote",
+            "100% remote",
+            "remote-first",
+            "remote only",
+            "remote-only",
+            "remote role",
+            "remote position",
+            "remote opportunity",
+            "remote - united states",
+            "remote, united states",
+            "united states remote",
+            "work persona : remote",
+            "work persona: remote",
+            "work from home",
+            "work from anywhere",
+            "virtual role",
+            "virtual position",
+        )
+    )
+
+
+def _snapshot_has_host_specific_remote_conflict(job_url: str, snapshot: JobPageSnapshot) -> bool:
+    if not _host_requires_strict_remote_confirmation(job_url):
+        return False
+    if _direct_job_url_has_specific_location_hint(job_url) and not _snapshot_has_strong_remote_evidence(snapshot):
+        return True
+    if _snapshot_location_is_specific_non_remote(snapshot.location_text) and not _snapshot_has_strong_remote_evidence(snapshot):
+        return True
+    return False
+
+
 def _direct_job_url_has_specific_location_hint(url: str) -> bool:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
     path = (parsed.path or "").lower()
-    if "myworkdayjobs.com" not in host:
-        return False
-    match = re.search(r"/job/([^/]+)/", path)
-    if not match:
-        return False
-    location_slug = match.group(1).strip("-")
-    if not location_slug:
-        return False
-    if any(token in location_slug for token in ("remote", "virtual", "work-from-home", "work_from_home")):
-        return False
-    return location_slug.count("-") >= 2
+    if "myworkdayjobs.com" in host:
+        match = re.search(r"/job/([^/]+)/", path)
+        if not match:
+            return False
+        location_slug = match.group(1).strip("-")
+        if not location_slug:
+            return False
+        if any(token in location_slug for token in ("remote", "virtual", "work-from-home", "work_from_home")):
+            return False
+        return location_slug.count("-") >= 2
+    return False
 
 
 def _snapshot_role_title_is_specific(role_title: str | None) -> bool:
@@ -5668,6 +6184,79 @@ def _snapshot_looks_like_generic_brand_page(snapshot: JobPageSnapshot, company_n
         return True
     company_key = _normalize_company_key(company_name)
     return bool(company_key) and any(_normalize_company_key(candidate) == company_key for candidate in title_candidates if candidate)
+
+
+def _snapshot_is_non_specific_company_page(
+    snapshot: JobPageSnapshot,
+    *,
+    expected_company_name: str | None = None,
+    expected_role_title: str | None = None,
+    allow_trusted_source_role_fallback: bool = False,
+) -> bool:
+    resolved_host = (urlparse(snapshot.resolved_url).netloc or "").lower()
+    normalized_path = (urlparse(snapshot.resolved_url).path or "").rstrip("/").lower()
+    generic_brand_page = _snapshot_looks_like_generic_brand_page(snapshot, expected_company_name or snapshot.company_name)
+    if _is_generic_job_board_page(snapshot):
+        if not allow_trusted_source_role_fallback:
+            return True
+        if normalized_path in {
+            "",
+            "/",
+            "/home",
+            "/intro",
+            "/benefits",
+            "/v2/global/en/home",
+            "/en/about/careers/benefits",
+        }:
+            return True
+    if normalized_path in {
+        "",
+        "/",
+        "/home",
+        "/intro",
+        "/benefits",
+        "/v2/global/en/home",
+        "/en/about/careers/benefits",
+    }:
+        return True
+
+    if _looks_like_company_homepage_url(snapshot.resolved_url) and not _snapshot_role_title_is_specific(snapshot.role_title):
+        return True
+
+    if not any(fragment in resolved_host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
+        if (
+            expected_role_title
+            and not _snapshot_supports_expected_role(expected_role_title, snapshot)
+            and not (allow_trusted_source_role_fallback and generic_brand_page)
+        ):
+            return True
+        if (
+            not any(
+                _snapshot_role_title_is_specific(candidate)
+                for candidate in (snapshot.role_title, snapshot.page_title)
+            )
+            and not (allow_trusted_source_role_fallback and generic_brand_page)
+        ):
+            return True
+
+    if _looks_like_careers_hub_url(snapshot.resolved_url) and expected_role_title and not _snapshot_supports_expected_role(
+        expected_role_title,
+        snapshot,
+    ):
+        return not allow_trusted_source_role_fallback
+
+    if generic_brand_page:
+        if allow_trusted_source_role_fallback:
+            return False
+        if expected_role_title and not _snapshot_supports_expected_role(expected_role_title, snapshot):
+            return True
+        return _looks_like_generic_job_url(snapshot.resolved_url)
+
+    generic_page_title = " ".join(str(snapshot.page_title or "").lower().split())
+    if generic_page_title in {"careers", "career", "jobs", "job application", "benefits", "home"}:
+        return True
+
+    return False
 
 
 def _lead_has_trusted_source_fallback_evidence(lead: JobLead, settings: Settings) -> bool:
@@ -5758,6 +6347,7 @@ def _merge_candidate_with_snapshot(candidate: JobPosting, snapshot: JobPageSnaps
         snapshot.is_fully_remote is False
         and candidate.is_fully_remote is True
         and _snapshot_remote_signal_is_low_confidence(snapshot)
+        and not _snapshot_has_host_specific_remote_conflict(str(snapshot.resolved_url or candidate.direct_job_url), snapshot)
     ):
         remote_value = True
 
@@ -5827,7 +6417,12 @@ def _evaluate_merged_job(
         if not _is_weak_company_hint(company_hint):
             return "company_mismatch", f"Resolved job URL company hint '{company_hint}' did not match expected company '{expected_company_name}'."
 
-    if _is_generic_job_board_page(snapshot):
+    if _snapshot_is_non_specific_company_page(
+        snapshot,
+        expected_company_name=expected_company_name,
+        expected_role_title=expected_role_title,
+        allow_trusted_source_role_fallback=allow_trusted_source_role_fallback,
+    ):
         return "not_specific_job_page", "Resolved page is a board index or an invalid job page, not a specific posting."
 
     if expected_company_name and not _is_weak_company_hint(expected_company_name) and not _company_names_match(expected_company_name, job.company_name):
@@ -5847,6 +6442,9 @@ def _evaluate_merged_job(
 
     if not _is_ai_related_product_manager(job):
         return "not_ai_product_manager", "Role did not look like an AI-related product manager position."
+
+    if job.is_fully_remote and _snapshot_has_host_specific_remote_conflict(job_url, snapshot):
+        return "not_remote", "Resolved page encoded a specific location or office signal without strong host-specific remote confirmation."
 
     if (
         job.is_fully_remote is True
@@ -5968,6 +6566,7 @@ async def _validate_candidate(
     allow_trusted_source_role_fallback = (
         _snapshot_looks_like_generic_brand_page(snapshot, lead.company_name)
         and _lead_has_trusted_source_fallback_evidence(lead, settings)
+        and _url_has_strong_expected_company_hint(snapshot.resolved_url, lead.company_name)
     )
     reason_code, detail = _evaluate_merged_job(
         merged_job,
@@ -6002,6 +6601,7 @@ async def _validate_candidate(
                 repaired_allow_trusted_source_role_fallback = (
                     _snapshot_looks_like_generic_brand_page(repaired_snapshot, lead.company_name)
                     and _lead_has_trusted_source_fallback_evidence(lead, settings)
+                    and _url_has_strong_expected_company_hint(repaired_snapshot.resolved_url, lead.company_name)
                 )
                 repaired_reason_code, repaired_detail = _evaluate_merged_job(
                     repaired_merged_job,
@@ -6047,6 +6647,7 @@ async def find_matching_jobs(
     diagnostics = SearchDiagnostics(minimum_qualifying_jobs=stop_goal)
     _persist_search_diagnostics(settings, diagnostics)
     jobs_by_url: dict[str, JobPosting] = {}
+    _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
     previously_reported_job_keys = load_previously_reported_job_keys(settings.data_dir)
     previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
     company_watchlist = load_company_watchlist_entries(settings.data_dir)
@@ -6124,25 +6725,58 @@ async def find_matching_jobs(
                     qualifying_jobs=len(jobs_by_url),
                 )
 
-            query_timeout_seconds = settings.per_query_timeout_seconds
             round_leads: list[JobLead] = []
             query_batches = [queries]
             if settings.llm_provider == "ollama":
-                query_timeout_seconds = max(query_timeout_seconds * 2, 90)
                 query_batches = _chunk_queries(queries, 3)
 
             for query_batch in query_batches:
+                runnable_queries: list[str] = []
+                for query in query_batch:
+                    skip_reason = _query_timeout_skip_reason(
+                        diagnostics,
+                        query,
+                        attempt_number=attempt_number,
+                    )
+                    if skip_reason is None:
+                        runnable_queries.append(query)
+                        continue
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="discovery",
+                            reason_code="query_skipped_timeout_budget",
+                            detail=skip_reason,
+                            source_query=query,
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    if status:
+                        status.emit(
+                            "search",
+                            f"Skipping a low-yield discovery query during pass {attempt_number}: {query}",
+                            attempt_number=attempt_number,
+                            round_number=round_number,
+                            qualifying_jobs=len(jobs_by_url),
+                        )
+
+                if not runnable_queries:
+                    continue
+
                 tasks = [
                     asyncio.create_task(
                         _search_query_with_context(
                             discovery_agent,
                             settings,
                             query,
-                            query_timeout_seconds,
+                            _query_timeout_seconds_for_query(settings, query),
                             run_id=run_id,
                         )
                     )
-                    for query in query_batch
+                    for query in runnable_queries
                 ]
 
                 for task in asyncio.as_completed(tasks):
@@ -6155,7 +6789,10 @@ async def find_matching_jobs(
                             _make_failure(
                                 stage="discovery",
                                 reason_code="query_timeout",
-                                detail=f"Discovery query timed out after {query_timeout_seconds}s: {exc.query}",
+                                detail=(
+                                    "Discovery query timed out after "
+                                    f"{_query_timeout_seconds_for_query(settings, exc.query)}s: {exc.query}"
+                                ),
                                 source_query=exc.query,
                                 attempt_number=attempt_number,
                                 round_number=round_number,
@@ -6551,6 +7188,7 @@ async def find_matching_jobs(
                 jobs_by_url.setdefault(validated_key, validated)
                 diagnostics.unique_leads_discovered = total_unique_leads
                 _persist_search_diagnostics(settings, diagnostics)
+                _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
                 if status:
                     status.emit(
                         "search",
@@ -6559,6 +7197,7 @@ async def find_matching_jobs(
                         round_number=round_number,
                         unique_leads_discovered=total_unique_leads,
                         qualifying_jobs=len(jobs_by_url),
+                        jobs_kept_after_validation=len(jobs_by_url),
                     )
 
         diagnostics.unique_leads_discovered = total_unique_leads
