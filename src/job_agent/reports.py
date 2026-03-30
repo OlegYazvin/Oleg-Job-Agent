@@ -6,7 +6,7 @@ import shutil
 
 from docx import Document
 
-from .models import JobOutreachBundle, RunManifest
+from .models import JobOutreachBundle, NearMissJob, RunManifest
 
 
 def _add_paragraph_block(document: Document, lines: list[str]) -> None:
@@ -126,6 +126,44 @@ def build_summary_document(
     return path
 
 
+def build_near_miss_document(
+    near_misses: list[NearMissJob],
+    output_dir: Path,
+    *,
+    generated_at: datetime | None = None,
+) -> Path:
+    generated_at = generated_at or datetime.now()
+    document = Document()
+    document.add_heading("Job Near Misses", level=0)
+    document.add_paragraph(f"Generated at: {generated_at.isoformat(timespec='seconds')}")
+
+    if not near_misses:
+        document.add_paragraph("No strong near-miss jobs were captured in this run.")
+
+    for item in near_misses:
+        document.add_heading(f"{item.company_name} | {item.role_title}", level=1)
+        document.add_paragraph(f"Reason: {item.reason_code}")
+        document.add_paragraph(f"Why close: {item.why_close}")
+        if item.direct_job_url:
+            document.add_paragraph(f"Job link: {item.direct_job_url}")
+        elif item.source_url:
+            document.add_paragraph(f"Source link: {item.source_url}")
+        if item.salary_text:
+            document.add_paragraph(f"Salary: {item.salary_text}")
+        if item.posted_date_text:
+            document.add_paragraph(f"Posted: {item.posted_date_text}")
+        if item.supporting_evidence:
+            document.add_paragraph("Supporting evidence")
+            for evidence in item.supporting_evidence:
+                document.add_paragraph(evidence)
+        document.add_paragraph(f"Detail: {item.detail}")
+
+    path = output_dir / f"job_near_misses-{_timestamp_slug(generated_at)}.docx"
+    document.save(path)
+    _write_latest_alias(path, output_dir / "job_near_misses.docx")
+    return path
+
+
 def _normalize_name(value: str) -> str:
     return "".join(char.lower() for char in value if char.isalnum())
 
@@ -220,6 +258,21 @@ def build_live_outreach_payload(
     }
 
 
+def build_near_miss_payload(
+    near_misses: list[NearMissJob],
+    *,
+    run_id: str,
+    generated_at: datetime | None = None,
+) -> dict[str, object]:
+    generated_at = generated_at or datetime.now()
+    return {
+        "run_id": run_id,
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "near_miss_count": len(near_misses),
+        "items": [item.model_dump(mode="json") for item in near_misses],
+    }
+
+
 def build_manifest(
     *,
     run_id: str,
@@ -227,6 +280,10 @@ def build_manifest(
     jobs_found_by_search: int,
     message_docx_path: Path,
     summary_docx_path: Path,
+    near_misses: list[NearMissJob] | None = None,
+    near_miss_docx_path: Path | None = None,
+    near_miss_json_path: Path | None = None,
+    ollama_summary_json_path: Path | None = None,
     generated_at: datetime | None = None,
 ) -> RunManifest:
     generated_at = generated_at or datetime.now()
@@ -240,4 +297,8 @@ def build_manifest(
         jobs_with_any_messages=sum(
             1 for bundle in bundles if bundle.first_order_messages or bundle.second_order_messages
         ),
+        near_miss_docx_path=str(near_miss_docx_path) if near_miss_docx_path else None,
+        near_miss_json_path=str(near_miss_json_path) if near_miss_json_path else None,
+        ollama_summary_json_path=str(ollama_summary_json_path) if ollama_summary_json_path else None,
+        near_miss_count=len(near_misses or []),
     )

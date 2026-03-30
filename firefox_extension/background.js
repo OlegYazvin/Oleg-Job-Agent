@@ -9,8 +9,15 @@ const DEFAULT_SETTINGS = {
 };
 
 const LIVE_OUTREACH_PATH = "/api/linkedin-extension/live-outreach";
+const BRIDGE_RETRY_DELAYS_MS = [600, 1500, 3000];
+const HISTORY_BATCH_SIZE = 4;
+const MAX_HISTORY_ATTEMPTS = 3;
 const historyQueues = new Map();
 const activeHistoryRuns = new Set();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function getSettings() {
   const stored = await browser.storage.local.get(DEFAULT_SETTINGS);
@@ -38,26 +45,40 @@ async function setCachedLiveOutreach(payload) {
   });
 }
 
+async function fetchWithRetry(url, options = {}, retryDelays = BRIDGE_RETRY_DELAYS_MS) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        throw new Error(`Bridge request failed: ${response.status}`);
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retryDelays.length) {
+        break;
+      }
+      await sleep(retryDelays[attempt]);
+    }
+  }
+  throw lastError || new Error("Bridge request failed.");
+}
+
 async function postToBridge(path, payload) {
   const settings = await getSettings();
-  const response = await fetch(`${settings.bridgeBaseUrl}${path}`, {
+  await fetchWithRetry(`${settings.bridgeBaseUrl}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
   });
-  if (!response.ok) {
-    throw new Error(`Bridge request failed: ${response.status}`);
-  }
 }
 
 async function fetchLiveOutreachFromBridge() {
   const settings = await getSettings();
-  const response = await fetch(`${settings.bridgeBaseUrl}${LIVE_OUTREACH_PATH}`);
-  if (!response.ok) {
-    throw new Error(`Live outreach fetch failed: ${response.status}`);
-  }
+  const response = await fetchWithRetry(`${settings.bridgeBaseUrl}${LIVE_OUTREACH_PATH}`);
   const payload = await response.json();
   if (payload && typeof payload === "object") {
     await setCachedLiveOutreach(payload);
@@ -96,35 +117,87 @@ function queueHistoryTargets(sessionId, contacts) {
     if (contact.connection_degree === "1st" && contact.name && contact.profile_url) {
       const key = normalizeProfileUrl(contact.profile_url) || normalizeName(contact.name);
       if (key) {
-        queue.set(key, { name: contact.name, profile_url: normalizeProfileUrl(contact.profile_url) });
+        const existing = queue.get(key) || {};
+        queue.set(key, {
+          name: contact.name || existing.name || "",
+          profile_url: normalizeProfileUrl(contact.profile_url) || existing.profile_url || "",
+          attempts: Number(existing.attempts || 0),
+        });
       }
     }
     for (const connectorName of contact.connected_first_order_names || []) {
       const normalizedName = normalizeName(connectorName);
       if (normalizedName && !queue.has(normalizedName)) {
-        queue.set(normalizedName, { name: connectorName, profile_url: "" });
+        queue.set(normalizedName, { name: connectorName, profile_url: "", attempts: 0 });
       }
     }
     for (const [connectorName, connectorProfileUrl] of Object.entries(contact.connected_first_order_profile_urls || {})) {
       const key = normalizeProfileUrl(connectorProfileUrl) || normalizeName(connectorName);
       if (key) {
-        queue.set(key, { name: connectorName, profile_url: normalizeProfileUrl(connectorProfileUrl) });
+        const existing = queue.get(key) || {};
+        queue.set(key, {
+          name: connectorName || existing.name || "",
+          profile_url: normalizeProfileUrl(connectorProfileUrl) || existing.profile_url || "",
+          attempts: Number(existing.attempts || 0),
+        });
       }
     }
   }
 }
 
-function takeHistoryBatch(sessionId, size = 6) {
+function takeHistoryBatch(sessionId, size = HISTORY_BATCH_SIZE) {
   const queue = ensureQueue(sessionId);
   const batch = [];
   for (const [key, value] of queue.entries()) {
-    batch.push(value);
+    batch.push({
+      key,
+      name: value.name || "",
+      profile_url: value.profile_url || "",
+      attempts: Number(value.attempts || 0),
+    });
     queue.delete(key);
     if (batch.length >= size) {
       break;
     }
   }
   return batch;
+}
+
+function requeueHistoryBatch(sessionId, batch) {
+  const queue = ensureQueue(sessionId);
+  for (const item of batch || []) {
+    const key = item?.key || normalizeProfileUrl(item?.profile_url || "") || normalizeName(item?.name || "");
+    if (!key) {
+      continue;
+    }
+    const attempts = Number(item?.attempts || 0) + 1;
+    if (attempts > MAX_HISTORY_ATTEMPTS) {
+      continue;
+    }
+    const existing = queue.get(key) || {};
+    queue.set(key, {
+      name: item?.name || existing.name || "",
+      profile_url: normalizeProfileUrl(item?.profile_url || "") || existing.profile_url || "",
+      attempts: Math.max(Number(existing.attempts || 0), attempts),
+    });
+  }
+}
+
+function historyMatchesBatchItem(history, item) {
+  const historyProfileUrl = normalizeProfileUrl(history?.profile_url || history?.profileUrl || "");
+  const itemProfileUrl = normalizeProfileUrl(item?.profile_url || "");
+  if (historyProfileUrl && itemProfileUrl && historyProfileUrl === itemProfileUrl) {
+    return true;
+  }
+  return normalizeName(history?.name || "") === normalizeName(item?.name || "");
+}
+
+async function reloadHistoryTab(tabId) {
+  try {
+    await browser.tabs.reload(tabId);
+    await waitForTabReady(tabId);
+  } catch (error) {
+  }
 }
 
 async function waitForTabReady(tabId, timeoutMs = 15000) {
@@ -175,20 +248,51 @@ async function runHistoryCapture(sessionId) {
       if (!batch.length) {
         break;
       }
-      const response = await sendMessageWithRetry(tabId, {
-        type: "JOB_AGENT_SCRAPE_MESSAGE_HISTORIES",
-        payload: {
-          sessionId,
-          items: batch,
-        },
-      });
-      if (response && Array.isArray(response.histories) && response.histories.length) {
-        await postToBridge("/api/linkedin-extension/message-histories", {
-          session_id: sessionId,
-          histories: response.histories,
+      let response = null;
+      try {
+        response = await sendMessageWithRetry(tabId, {
+          type: "JOB_AGENT_SCRAPE_MESSAGE_HISTORIES",
+          payload: {
+            sessionId,
+            items: batch.map((item) => ({
+              name: item.name,
+              profile_url: item.profile_url,
+            })),
+          },
         });
+      } catch (error) {
+        requeueHistoryBatch(sessionId, batch);
+        await reloadHistoryTab(tabId);
+        await sleep(800);
+        continue;
       }
-      await new Promise((resolve) => setTimeout(resolve, 600));
+
+      const histories = Array.isArray(response?.histories) ? response.histories : [];
+      const successfulHistories = histories.filter((entry) => Array.isArray(entry?.messages) && entry.messages.length);
+      if (successfulHistories.length) {
+        try {
+          await postToBridge("/api/linkedin-extension/message-histories", {
+            session_id: sessionId,
+            histories: successfulHistories,
+          });
+        } catch (error) {
+          requeueHistoryBatch(sessionId, batch);
+          await reloadHistoryTab(tabId);
+          await sleep(800);
+          continue;
+        }
+      }
+
+      const unresolved = batch.filter(
+        (item) => !successfulHistories.some((history) => historyMatchesBatchItem(history, item))
+      );
+      if (unresolved.length) {
+        requeueHistoryBatch(sessionId, unresolved);
+        if (unresolved.length === batch.length) {
+          await reloadHistoryTab(tabId);
+        }
+      }
+      await sleep(600);
     }
   } finally {
     activeHistoryRuns.delete(sessionId);
@@ -271,7 +375,11 @@ browser.runtime.onMessage.addListener((message, sender) => {
       if (!settings.autoCapture) {
         return { accepted: false, skipped: true };
       }
-      await postToBridge("/api/linkedin-extension/search-results", message.payload);
+      try {
+        await postToBridge("/api/linkedin-extension/search-results", message.payload);
+      } catch (error) {
+        return { accepted: false, error: String(error) };
+      }
       queueHistoryTargets(message.payload.session_id, message.payload.contacts || []);
       await runHistoryCapture(message.payload.session_id);
       return { accepted: true };

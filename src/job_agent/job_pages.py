@@ -42,6 +42,9 @@ ATS_HOST_MAP = {
     "myworkdayjobs.com": "Workday",
     "jobvite.com": "Jobvite",
     "smartrecruiters.com": "SmartRecruiters",
+    "recruitee.com": "Recruitee",
+    "careers.tellent.com": "Recruitee",
+    "jobscore.com": "JobScore",
     "portal.dynamicsats.com": "DynamicsATS",
 }
 
@@ -127,6 +130,12 @@ async def fetch_job_page(url: str) -> JobPageSnapshot:
         _merge(snapshot, _extract_greenhouse_fields(html, evidence))
     elif ats_platform == "Lever":
         _merge(snapshot, _extract_lever_fields(soup, html, evidence))
+    elif ats_platform == "Ashby":
+        _merge(snapshot, _extract_ashby_fields(html, evidence))
+    elif ats_platform == "Recruitee":
+        _merge(snapshot, _extract_recruitee_fields(html, evidence))
+    elif ats_platform == "JobScore":
+        _merge(snapshot, _extract_jobscore_fields(soup, html, evidence))
 
     # Generic fallbacks after ATS-specific extraction.
     salary_min, salary_max, salary_text = _extract_salary_range(combined_text)
@@ -201,6 +210,82 @@ def _extract_job_posting_json_ld(soup: BeautifulSoup) -> dict[str, Any] | None:
     return None
 
 
+def _extract_json_object_after_marker(html: str, marker: str) -> dict[str, Any] | None:
+    marker_index = html.find(marker)
+    if marker_index == -1:
+        return None
+    start = html.find("{", marker_index + len(marker))
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(html)):
+        char = html[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = html[start : index + 1]
+                try:
+                    payload = json.loads(candidate)
+                except json.JSONDecodeError:
+                    return None
+                return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _extract_escaped_json_object_after_marker(html: str, marker: str) -> dict[str, Any] | None:
+    marker_index = html.find(marker)
+    if marker_index == -1:
+        return None
+    start = html.find("{", marker_index + len(marker))
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(html)):
+        char = html[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                raw_candidate = html[start : index + 1]
+                try:
+                    payload = json.loads(unescape(raw_candidate))
+                except json.JSONDecodeError:
+                    return None
+                return payload if isinstance(payload, dict) else None
+    return None
+
+
 def _find_job_posting_node(payload: Any) -> dict[str, Any] | None:
     if isinstance(payload, dict):
         type_value = payload.get("@type")
@@ -247,6 +332,120 @@ def _extract_generic_jobposting_fields(
         evidence.append(f"Title from structured data: {title}")
     if date_posted:
         evidence.append(f"datePosted from structured data: {date_posted}")
+    return values
+
+
+def _extract_ashby_fields(html: str, evidence: list[str]) -> dict[str, Any]:
+    payload = _extract_json_object_after_marker(html, "window.__appData = ")
+    if not payload:
+        return {}
+    posting = payload.get("posting") if isinstance(payload.get("posting"), dict) else {}
+    organization = payload.get("organization") if isinstance(payload.get("organization"), dict) else {}
+    description_html = str(posting.get("descriptionHtml") or "")
+    description_text = _html_to_text(description_html)
+    structured_text = " ".join(part for part in (description_text, str(posting.get("locationName") or "")) if part)
+    salary_min, salary_max, salary_text = _extract_salary_range(description_text or structured_text)
+    location = str(posting.get("locationName") or posting.get("locationExternalName") or "").strip() or None
+    published_at = posting.get("publishedAt") or posting.get("publishedDate")
+    values = {
+        "company_name": str(organization.get("name") or "").strip() or None,
+        "role_title": str(posting.get("title") or "").strip() or None,
+        "location_text": location,
+        "is_fully_remote": _infer_remote_status(location, structured_text),
+        "posted_date_iso": _normalize_iso_date(str(published_at or "")) if published_at else None,
+        "posted_date_text": _normalize_iso_date(str(published_at or "")) if published_at else None,
+        "base_salary_min_usd": salary_min,
+        "base_salary_max_usd": salary_max,
+        "salary_text": salary_text,
+    }
+    if values["company_name"]:
+        evidence.append(f"Ashby organization: {values['company_name']}")
+    if values["role_title"]:
+        evidence.append(f"Ashby posting title: {values['role_title']}")
+    if values["location_text"]:
+        evidence.append(f"Ashby location: {values['location_text']}")
+    return values
+
+
+def _extract_recruitee_fields(html: str, evidence: list[str]) -> dict[str, Any]:
+    offer = _extract_escaped_json_object_after_marker(html, "&quot;offers&quot;:[")
+    if not offer:
+        return {}
+    translations = offer.get("translations") if isinstance(offer.get("translations"), dict) else {}
+    english = translations.get("en") if isinstance(translations.get("en"), dict) else {}
+    title = str(english.get("name") or english.get("title") or "").strip() or None
+    country = str(english.get("country") or offer.get("countryCode") or "").strip()
+    city = str(offer.get("city") or "").strip()
+    location_parts = [part for part in (city, country) if part]
+    salary = offer.get("salary") if isinstance(offer.get("salary"), dict) else {}
+    salary_currency = str(salary.get("currency") or "").upper()
+    salary_min = salary_max = None
+    salary_text = None
+    if salary:
+        min_raw = salary.get("min")
+        max_raw = salary.get("max")
+        period = str(salary.get("period") or "year").lower()
+        salary_text = f"{salary_currency} {min_raw:g} - {max_raw:g} per {period}" if isinstance(min_raw, (int, float)) and isinstance(max_raw, (int, float)) else None
+        if salary_currency in {"USD", "US$", "$"}:
+            if isinstance(min_raw, (int, float)):
+                salary_min = int(min_raw)
+            if isinstance(max_raw, (int, float)):
+                salary_max = int(max_raw)
+            salary_text = (
+                f"${salary_min:,} - ${salary_max:,} per {period}"
+                if salary_min is not None and salary_max is not None
+                else salary_text
+            )
+    description_html = str(english.get("descriptionHtml") or "")
+    values = {
+        "role_title": title,
+        "location_text": ", ".join(location_parts) or None,
+        "is_fully_remote": True if offer.get("remote") is True else (False if offer.get("hybrid") or offer.get("onSite") else _infer_remote_status(", ".join(location_parts), _html_to_text(description_html))),
+        "base_salary_min_usd": salary_min,
+        "base_salary_max_usd": salary_max,
+        "salary_text": salary_text,
+    }
+    if values["role_title"]:
+        evidence.append(f"Recruitee title: {values['role_title']}")
+    if values["location_text"]:
+        evidence.append(f"Recruitee location: {values['location_text']}")
+    if values["salary_text"]:
+        evidence.append(f"Recruitee salary: {values['salary_text']}")
+    return values
+
+
+def _extract_jobscore_fields(soup: BeautifulSoup, html: str, evidence: list[str]) -> dict[str, Any]:
+    meta_by_key: dict[str, str] = {}
+    for meta in soup.select("meta[name], meta[property]"):
+        key = (meta.get("name") or meta.get("property") or "").strip().lower()
+        content = (meta.get("content") or "").strip()
+        if key and content:
+            meta_by_key[key] = content
+    title = meta_by_key.get("title") or meta_by_key.get("twitter:title") or (soup.title.get_text(strip=True) if soup.title else "")
+    description = meta_by_key.get("description") or meta_by_key.get("twitter:description") or ""
+    match = re.search(
+        r"Share the\s+(?P<role>.+?)\s+open at\s+(?P<company>.+?)\s+in\s+(?P<location>.+?)(?:, powered by JobScore|[.])",
+        title,
+        re.I,
+    )
+    role_title = company_name = location_text = None
+    if match:
+        role_title = match.group("role").strip()
+        company_name = match.group("company").strip()
+        location_text = match.group("location").strip().rstrip(".")
+    body_text = " ".join(part for part in (title, description, _html_to_text(html)) if part)
+    values = {
+        "company_name": company_name,
+        "role_title": role_title,
+        "location_text": location_text,
+        "is_fully_remote": _infer_remote_status(location_text, body_text),
+    }
+    if company_name:
+        evidence.append(f"JobScore company: {company_name}")
+    if role_title:
+        evidence.append(f"JobScore title: {role_title}")
+    if location_text:
+        evidence.append(f"JobScore location: {location_text}")
     return values
 
 

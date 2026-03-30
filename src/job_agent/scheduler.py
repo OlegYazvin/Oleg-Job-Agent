@@ -10,6 +10,13 @@ from .config import Settings
 CRON_MARKER = "# job-agent daily run"
 
 
+def _quote_shell_command(raw_command: str, *, fallback: str) -> str:
+    parts = shlex.split(raw_command.strip()) if raw_command.strip() else [fallback]
+    if not parts:
+        parts = [fallback]
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 def render_cron_line(settings: Settings) -> str:
     project_root = shlex.quote(str(settings.project_root))
     export_path = 'export PATH="$HOME/.local/bin:$PATH"'
@@ -17,9 +24,10 @@ def render_cron_line(settings: Settings) -> str:
     if settings.llm_provider == "ollama":
         ollama_health_url = shlex.quote(f"{settings.ollama_base_url.rstrip('/')}/api/version")
         ollama_log = shlex.quote(str(settings.output_dir / "ollama.log"))
+        ollama_command = _quote_shell_command(settings.ollama_command, fallback="ollama")
         ollama_preamble = (
             f"if ! curl -fsS {ollama_health_url} >/dev/null; then "
-            f"nohup ollama serve >> {ollama_log} 2>&1 & sleep 5; "
+            f"nohup {ollama_command} serve >> {ollama_log} 2>&1 & sleep 5; "
             f"fi && "
         )
     command = (

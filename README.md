@@ -94,7 +94,7 @@ For a platform-specific quick start, you can also use:
    - Or, for local-first non-token mode:
      - `LLM_PROVIDER=ollama`
      - `OLLAMA_BASE_URL=http://localhost:11434`
-     - `OLLAMA_MODEL=qwen2.5:14b-instruct`
+     - `OLLAMA_MODEL=qwen2.5:7b-instruct`
      - `USE_OPENAI_FALLBACK=false`
    - Optional LinkedIn configuration:
      - `LINKEDIN_MANUAL_REVIEW_MODE=true` (default): no automated LinkedIn scraping; generates review links in the output doc.
@@ -180,6 +180,7 @@ If you want the tool to use your real Firefox LinkedIn session instead of an aut
    LINKEDIN_EXTENSION_BRIDGE_HOST=127.0.0.1
    LINKEDIN_EXTENSION_BRIDGE_PORT=8765
    LINKEDIN_EXTENSION_AUTO_OPEN_SEARCH_TABS=true
+   FIREFOX_EXTENSION_PROFILE_DIR=/absolute/path/to/your/real/firefox/profile
    ```
 
 2. In Firefox, open:
@@ -215,7 +216,14 @@ Files:
 
 ### Scripted Deployment
 
-On this machine, Firefox Release will not accept this unsigned add-on as a normal permanent install. The scripted deployment path is:
+On this machine, Firefox Release will not accept this unsigned add-on as a normal permanent install. The preferred path is to point `FIREFOX_EXTENSION_PROFILE_DIR` at the real Firefox profile you already use for LinkedIn, then load the add-on temporarily in that same profile. The scripted deployment helper will now:
+
+- use that configured real profile first
+- open `about:debugging#/runtime/this-firefox` in that profile if the add-on is missing
+- open LinkedIn in that profile if the add-on is present but LinkedIn auth is missing
+- fall back to the dedicated Selenium-managed host only when no real profile is configured
+
+The helper command is:
 
 ```bash
 . .venv/bin/activate
@@ -250,10 +258,10 @@ To run without paid token usage for drafting/discovery extraction:
 ```bash
 LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:14b-instruct
+OLLAMA_MODEL=qwen2.5:7b-instruct
 OLLAMA_KEEP_ALIVE=0m
-OLLAMA_NUM_CTX=2048
-OLLAMA_NUM_BATCH=16
+OLLAMA_NUM_CTX=1024
+OLLAMA_NUM_BATCH=4
 OLLAMA_MAX_CONCURRENT_REQUESTS=1
 USE_OPENAI_FALLBACK=false
 ```

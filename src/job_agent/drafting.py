@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 from agents import Agent, Runner
 from pydantic import BaseModel, Field
 
 from .config import Settings
 from .llm_provider import LLMProviderError, OllamaStructuredProvider
+from .ollama_runtime import record_ollama_event
 from .models import (
     FirstOrderMessage,
     JobOutreachBundle,
@@ -27,6 +29,62 @@ class SecondOrderMessagesOutput(BaseModel):
 
 def _build_ollama_provider(settings: Settings) -> OllamaStructuredProvider:
     return OllamaStructuredProvider(settings)
+
+
+def _message_lint_score(message_body: str) -> tuple[int, bool]:
+    score = 100
+    body = message_body.strip()
+    placeholder_leak = bool(re.search(r"\b(?:\[.*?\]|<.*?>|todo|tbd)\b", body, flags=re.IGNORECASE))
+    if placeholder_leak:
+        score -= 40
+    if len(body) > 900:
+        score -= 30
+    elif len(body) > 700:
+        score -= 20
+    elif len(body) > 500:
+        score -= 10
+    if body.count("\n") > 6:
+        score -= 10
+    return max(0, score), placeholder_leak
+
+
+def _record_drafting_outcome(
+    settings: Settings,
+    *,
+    run_id: str | None,
+    prompt_category: str,
+    strategy: str,
+    messages: list[FirstOrderMessage] | list[SecondOrderIntroMessage],
+) -> None:
+    if settings.llm_provider != "ollama":
+        return
+    normalized_bodies = [
+        " ".join(str(message.message_body).lower().split())
+        for message in messages
+    ]
+    duplicate_count = max(0, len(normalized_bodies) - len(set(normalized_bodies)))
+    lint_scores = [_message_lint_score(str(message.message_body)) for message in messages]
+    placeholder_leak_count = sum(1 for _score, leaked in lint_scores if leaked)
+    average_lint_score = round(sum(score for score, _leaked in lint_scores) / len(lint_scores), 3) if lint_scores else 0.0
+    event_type = {
+        "template": "drafting_template_fallback",
+        "openai": "drafting_openai_fallback",
+    }.get(strategy, "drafting_outcome")
+    record_ollama_event(
+        settings,
+        event_type,
+        run_id=run_id,
+        caller="drafting",
+        prompt_category=prompt_category,
+        draft_count=len(messages),
+        duplicate_count=duplicate_count,
+        average_lint_score=average_lint_score,
+        placeholder_leak_count=placeholder_leak_count,
+        used_output_count=len(messages),
+        fallback_template_count=int(strategy == "template"),
+        fallback_openai_count=int(strategy == "openai"),
+        ollama_generated_count=int(strategy == "ollama"),
+    )
 
 
 def build_first_order_message_agent() -> Agent:
@@ -347,7 +405,11 @@ def _finalize_second_order_messages(
 
 
 async def draft_first_order_messages(
-    settings: Settings, job: JobPosting, contacts: list[LinkedInContact]
+    settings: Settings,
+    job: JobPosting,
+    contacts: list[LinkedInContact],
+    *,
+    run_id: str | None = None,
 ) -> list[FirstOrderMessage]:
     contacts = sorted(contacts, key=_contact_priority)
     if not contacts:
@@ -365,6 +427,25 @@ Contacts:
 {json.dumps([contact.model_dump(mode="json") for contact in contacts], indent=2)}
 """.strip()
     if settings.llm_provider == "ollama":
+        if settings.ollama_degraded_for_run:
+            messages = _finalize_first_order_messages(job, contacts, _template_first_order_messages(job, contacts))
+            record_ollama_event(
+                settings,
+                "ollama_degraded_skip",
+                run_id=run_id,
+                caller="drafting",
+                prompt_category="first_order_messages",
+                reason=settings.ollama_degraded_reason,
+                skipped_count=len(contacts),
+            )
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="first_order_messages",
+                strategy="template",
+                messages=messages,
+            )
+            return messages
         provider = _build_ollama_provider(settings)
         system_prompt = """
 You draft concise LinkedIn messages to first-degree contacts at a target company.
@@ -380,14 +461,41 @@ Requirements:
                 system_prompt=system_prompt,
                 user_prompt=prompt,
                 schema=FirstOrderMessagesOutput,
+                run_id=run_id,
+                caller="drafting",
+                prompt_category="first_order_messages",
             )
-            return _finalize_first_order_messages(job, contacts, output.messages)
+            messages = _finalize_first_order_messages(job, contacts, output.messages)
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="first_order_messages",
+                strategy="ollama",
+                messages=messages,
+            )
+            return messages
         except LLMProviderError:
             if settings.use_openai_fallback and settings.openai_api_key:
                 agent = build_first_order_message_agent()
                 result = await Runner.run(agent, prompt)
-                return _finalize_first_order_messages(job, contacts, result.final_output.messages)
-            return _finalize_first_order_messages(job, contacts, _template_first_order_messages(job, contacts))
+                messages = _finalize_first_order_messages(job, contacts, result.final_output.messages)
+                _record_drafting_outcome(
+                    settings,
+                    run_id=run_id,
+                    prompt_category="first_order_messages",
+                    strategy="openai",
+                    messages=messages,
+                )
+                return messages
+            messages = _finalize_first_order_messages(job, contacts, _template_first_order_messages(job, contacts))
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="first_order_messages",
+                strategy="template",
+                messages=messages,
+            )
+            return messages
 
     agent = build_first_order_message_agent()
     result = await Runner.run(agent, prompt)
@@ -399,6 +507,8 @@ async def draft_second_order_messages(
     job: JobPosting,
     first_order_contacts: list[LinkedInContact],
     second_order_contacts: list[LinkedInContact],
+    *,
+    run_id: str | None = None,
 ) -> list[SecondOrderIntroMessage]:
     first_order_contacts = sorted(first_order_contacts, key=_contact_priority)
     second_order_contacts = [
@@ -427,6 +537,26 @@ Write exactly one message per first-degree connector group.
 Each message must cover every second-degree target listed for that connector group.
 """.strip()
     if settings.llm_provider == "ollama":
+        if settings.ollama_degraded_for_run:
+            templated = _template_second_order_messages(job, first_order_contacts, second_order_contacts)
+            messages = _finalize_second_order_messages(job, first_order_contacts, second_order_contacts, templated)
+            record_ollama_event(
+                settings,
+                "ollama_degraded_skip",
+                run_id=run_id,
+                caller="drafting",
+                prompt_category="second_order_messages",
+                reason=settings.ollama_degraded_reason,
+                skipped_count=len(second_order_contacts),
+            )
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="second_order_messages",
+                strategy="template",
+                messages=messages,
+            )
+            return messages
         provider = _build_ollama_provider(settings)
         system_prompt = """
 You draft concise messages asking a first-degree contact to introduce the sender to one or more second-degree contacts.
@@ -444,25 +574,52 @@ Requirements:
                 system_prompt=system_prompt,
                 user_prompt=prompt,
                 schema=SecondOrderMessagesOutput,
+                run_id=run_id,
+                caller="drafting",
+                prompt_category="second_order_messages",
             )
-            return _finalize_second_order_messages(
+            messages = _finalize_second_order_messages(
                 job,
                 first_order_contacts,
                 second_order_contacts,
                 output.messages,
             )
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="second_order_messages",
+                strategy="ollama",
+                messages=messages,
+            )
+            return messages
         except LLMProviderError:
             if settings.use_openai_fallback and settings.openai_api_key:
                 agent = build_second_order_message_agent()
                 result = await Runner.run(agent, prompt)
-                return _finalize_second_order_messages(
+                messages = _finalize_second_order_messages(
                     job,
                     first_order_contacts,
                     second_order_contacts,
                     result.final_output.messages,
                 )
+                _record_drafting_outcome(
+                    settings,
+                    run_id=run_id,
+                    prompt_category="second_order_messages",
+                    strategy="openai",
+                    messages=messages,
+                )
+                return messages
             templated = _template_second_order_messages(job, first_order_contacts, second_order_contacts)
-            return _finalize_second_order_messages(job, first_order_contacts, second_order_contacts, templated)
+            messages = _finalize_second_order_messages(job, first_order_contacts, second_order_contacts, templated)
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="second_order_messages",
+                strategy="template",
+                messages=messages,
+            )
+            return messages
 
     agent = build_second_order_message_agent()
     result = await Runner.run(agent, prompt)
@@ -479,11 +636,13 @@ async def draft_outreach_bundle(
     job: JobPosting,
     first_order_contacts: list[LinkedInContact],
     second_order_contacts: list[LinkedInContact],
+    *,
+    run_id: str | None = None,
 ) -> JobOutreachBundle:
     first_order_contacts = sorted(first_order_contacts, key=_contact_priority)
     first_order_messages, second_order_messages = await asyncio.gather(
-        draft_first_order_messages(settings, job, first_order_contacts),
-        draft_second_order_messages(settings, job, first_order_contacts, second_order_contacts),
+        draft_first_order_messages(settings, job, first_order_contacts, run_id=run_id),
+        draft_second_order_messages(settings, job, first_order_contacts, second_order_contacts, run_id=run_id),
     )
     return JobOutreachBundle(
         job=job,

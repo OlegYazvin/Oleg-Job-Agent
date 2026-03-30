@@ -1,12 +1,42 @@
 (function () {
-  const params = new URLSearchParams(window.location.search);
-  const sessionId = params.get("job_agent_session");
-  const degree = params.get("job_agent_degree");
+  function captureContextFromUrl(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl, window.location.origin);
+      const params = parsed.searchParams;
+      const sessionId = params.get("job_agent_session");
+      const degree = params.get("job_agent_degree");
+      if (!sessionId || !degree) {
+        return null;
+      }
+      return { sessionId, degree, pageUrl: parsed.toString() };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  const directContext = captureContextFromUrl(window.location.href);
+  const loginRedirectContext = (() => {
+    const params = new URLSearchParams(window.location.search);
+    const sessionRedirect = params.get("session_redirect");
+    if (!sessionRedirect) {
+      return null;
+    }
+    const candidate = sessionRedirect.startsWith("http")
+      ? sessionRedirect
+      : `${window.location.origin}${sessionRedirect}`;
+    return captureContextFromUrl(candidate);
+  })();
+  const captureContext = directContext || loginRedirectContext;
+  const sessionId = captureContext?.sessionId || null;
+  const degree = captureContext?.degree || null;
   if (!sessionId || !degree) {
     return;
   }
 
   let sent = false;
+  let inFlight = false;
+  let sendAttempts = 0;
+  const MAX_SEND_ATTEMPTS = 5;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -248,21 +278,43 @@
     return Array.from(contacts.values());
   }
 
+  function retryDelayMs(attemptNumber) {
+    return Math.min(8000, 1200 * attemptNumber);
+  }
+
   async function sendCapture() {
-    if (sent) {
+    if (sent || inFlight || sendAttempts >= MAX_SEND_ATTEMPTS) {
       return;
     }
-    sent = true;
-    const contacts = await collectAcrossPages(3);
-    await browser.runtime.sendMessage({
-      type: "JOB_AGENT_SEARCH_RESULTS",
-      payload: {
-        session_id: sessionId,
-        degree,
-        page_url: window.location.href,
-        contacts,
-      },
-    });
+    inFlight = true;
+    sendAttempts += 1;
+    try {
+      const loginRequired =
+        window.location.pathname.includes("/uas/login") || window.location.pathname.includes("/login");
+      const contacts = loginRequired ? [] : await collectAcrossPages(3);
+      const response = await browser.runtime.sendMessage({
+        type: "JOB_AGENT_SEARCH_RESULTS",
+        payload: {
+          session_id: sessionId,
+          degree,
+          page_url: captureContext?.pageUrl || window.location.href,
+          login_required: loginRequired,
+          contacts,
+        },
+      });
+      if (response?.accepted || response?.skipped) {
+        sent = true;
+        return;
+      }
+    } catch (error) {
+    } finally {
+      inFlight = false;
+    }
+    if (!sent && sendAttempts < MAX_SEND_ATTEMPTS) {
+      setTimeout(() => {
+        void sendCapture();
+      }, retryDelayMs(sendAttempts));
+    }
   }
 
   window.addEventListener("load", () => {

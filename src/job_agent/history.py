@@ -74,6 +74,73 @@ def _normalize_company_key(company_name: str | None) -> str:
     return "".join(character.lower() for character in str(company_name or "") if character.isalnum())
 
 
+def _normalize_job_history_key(job_key: str | None) -> str:
+    normalized = str(job_key or "").strip()
+    if not normalized:
+        return ""
+    try:
+        from .job_search import _job_history_primary_key
+    except Exception:
+        return normalized
+    try:
+        return _job_history_primary_key(normalized)
+    except Exception:
+        return normalized
+
+
+def _board_identifier(url: str | None) -> str | None:
+    normalized = str(url or "").strip()
+    if not normalized:
+        return None
+    try:
+        from .job_search import _extract_company_board_identifier
+    except Exception:
+        return None
+    try:
+        return _extract_company_board_identifier(normalized)
+    except Exception:
+        return None
+
+
+def _normalize_job_history_entries(job_history: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], bool]:
+    normalized_entries: dict[str, dict[str, Any]] = {}
+    changed = False
+    for raw_key, raw_entry in dict(job_history or {}).items():
+        if not isinstance(raw_entry, Mapping):
+            changed = True
+            continue
+        normalized_key = _normalize_job_history_key(raw_entry.get("job_key") or raw_key)
+        if not normalized_key:
+            changed = True
+            continue
+        entry = dict(raw_entry)
+        entry["job_key"] = normalized_key
+        entry.setdefault("canonical_job_key", normalized_key)
+        if normalized_key in normalized_entries:
+            merged_entry = dict(normalized_entries[normalized_key])
+            merged_entry.update({key: value for key, value in entry.items() if value not in (None, "", [], {})})
+            merged_entry["first_reported_at"] = (
+                merged_entry.get("first_reported_at")
+                or entry.get("first_reported_at")
+            )
+            merged_entry["last_reported_at"] = (
+                entry.get("last_reported_at")
+                or merged_entry.get("last_reported_at")
+            )
+            merged_entry["report_count"] = max(
+                int(normalized_entries[normalized_key].get("report_count") or 0),
+                int(entry.get("report_count") or 0),
+            )
+            entry = merged_entry
+            changed = True
+        if normalized_key != str(raw_key).strip() or str(raw_entry.get("job_key") or "").strip() != normalized_key:
+            changed = True
+        normalized_entries[normalized_key] = entry
+    if len(normalized_entries) != len(job_history):
+        changed = True
+    return normalized_entries, changed
+
+
 def _company_host(*urls: str | None) -> str:
     for url in urls:
         normalized = str(url or "").strip()
@@ -108,6 +175,7 @@ def _update_company_history_entry(
     run_id: str | None,
     message_docx_path: str | None,
     summary_docx_path: str | None,
+    board_identifier: str | None = None,
 ) -> None:
     company_key = _normalize_company_key(company_name)
     if not company_key:
@@ -122,11 +190,15 @@ def _update_company_history_entry(
     role_titles = [str(title).strip() for title in entry.get("role_titles", []) if str(title).strip()]
     if role_title and role_title not in role_titles:
         role_titles.append(role_title)
+    board_identifiers = [str(item).strip() for item in entry.get("board_identifiers", []) if str(item).strip()]
+    if board_identifier and board_identifier not in board_identifiers:
+        board_identifiers.append(board_identifier)
     entry.update(
         {
             "company_key": company_key,
             "company_name": company_name,
             "role_titles": role_titles[:8],
+            "board_identifiers": board_identifiers[:8],
             "first_reported_at": first_reported_at,
             "last_reported_at": generated_at,
             "last_run_id": run_id,
@@ -162,6 +234,11 @@ def _update_company_watchlist_entry(
         normalized = str(url or "").strip()
         if normalized.startswith(("http://", "https://")) and normalized not in source_urls:
             source_urls.append(normalized)
+    board_identifiers = [str(item).strip() for item in entry.get("board_identifiers", []) if str(item).strip()]
+    for url in (direct_job_url, source_url):
+        board_identifier = _board_identifier(url)
+        if board_identifier and board_identifier not in board_identifiers:
+            board_identifiers.append(board_identifier)
     reason_counts = {
         str(key): int(value)
         for key, value in dict(entry.get("recent_rejection_reasons") or {}).items()
@@ -180,6 +257,7 @@ def _update_company_watchlist_entry(
             "last_detail": (detail or "")[:240],
             "source_hosts": source_hosts[:8],
             "source_urls": source_urls[:6],
+            "board_identifiers": board_identifiers[:8],
             "recent_rejection_reasons": reason_counts,
         }
     )
@@ -193,9 +271,10 @@ def _bootstrap_histories_from_run_artifacts(data_dir: Path) -> tuple[list[dict[s
     job_history = _load_json(data_dir / "job-history.json", default={})
     if not isinstance(job_history, dict):
         job_history = {}
+    job_history, job_history_changed = _normalize_job_history_entries(job_history)
 
     seen_run_ids = {str(entry.get("run_id") or "").strip() for entry in run_history}
-    changed = False
+    changed = job_history_changed
 
     for artifact_path in sorted(data_dir.glob("run-*.json")):
         payload = _load_json(artifact_path, default={})
@@ -234,13 +313,15 @@ def _bootstrap_histories_from_run_artifacts(data_dir: Path) -> tuple[list[dict[s
             job_payload = bundle.get("job")
             if not isinstance(job_payload, dict):
                 continue
-            job_key = str(job_payload.get("resolved_job_url") or job_payload.get("direct_job_url") or "").strip()
+            job_key = _normalize_job_history_key(job_payload.get("resolved_job_url") or job_payload.get("direct_job_url"))
             if not job_key:
                 continue
             if job_key in job_history:
                 continue
             job_history[job_key] = {
                 "job_key": job_key,
+                "normalized_job_url": _normalize_job_history_key(job_payload.get("resolved_job_url") or job_payload.get("direct_job_url")),
+                "canonical_job_key": job_key,
                 "company_name": job_payload.get("company_name"),
                 "role_title": job_payload.get("role_title"),
                 "posted_date_iso": job_payload.get("posted_date_iso"),
@@ -299,6 +380,7 @@ def _bootstrap_company_files_from_run_artifacts(data_dir: Path) -> tuple[dict[st
                 run_id=run_id,
                 message_docx_path=manifest.get("message_docx_path"),
                 summary_docx_path=manifest.get("summary_docx_path"),
+                board_identifier=_board_identifier(job_payload.get("resolved_job_url") or job_payload.get("direct_job_url")),
             )
             changed = True
 
@@ -350,11 +432,19 @@ def load_company_watchlist_entries(data_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def load_previously_reported_job_keys(data_dir: Path) -> set[str]:
-    return {
-        str(job_key).strip()
-        for job_key in load_job_history_entries(data_dir).keys()
-        if str(job_key).strip()
-    }
+    keys: set[str] = set()
+    for job_key, entry in load_job_history_entries(data_dir).items():
+        normalized = str(job_key).strip()
+        if normalized:
+            keys.add(normalized)
+        if isinstance(entry, Mapping):
+            canonical_key = str(entry.get("canonical_job_key") or "").strip()
+            normalized_url = str(entry.get("normalized_job_url") or "").strip()
+            if canonical_key:
+                keys.add(canonical_key)
+            if normalized_url:
+                keys.add(normalized_url)
+    return keys
 
 
 def load_previously_reported_company_keys(data_dir: Path) -> set[str]:
@@ -403,10 +493,16 @@ def record_successful_run(
     company_history = load_company_history_entries(data_dir)
     for bundle in bundles:
         job = bundle.job
-        job_key = str(job.resolved_job_url or job.direct_job_url or "").strip()
+        job_key = _normalize_job_history_key(job.resolved_job_url or job.direct_job_url)
         if not job_key:
             continue
         entry = dict(job_history.get(job_key) or {})
+        try:
+            from .job_search import _normalize_direct_job_url
+            normalized_job_url = _normalize_direct_job_url(str(job.resolved_job_url or job.direct_job_url))
+        except Exception:
+            normalized_job_url = str(job.resolved_job_url or job.direct_job_url).strip()
+        canonical_job_key = _normalize_job_history_key(normalized_job_url)
         first_reported_at = entry.get("first_reported_at") or generated_at_iso
         previous_count = int(entry.get("report_count") or 0)
         if str(entry.get("last_run_id") or "").strip() == run_id:
@@ -416,6 +512,8 @@ def record_successful_run(
         entry.update(
             {
                 "job_key": job_key,
+                "normalized_job_url": normalized_job_url,
+                "canonical_job_key": canonical_job_key,
                 "company_name": job.company_name,
                 "role_title": job.role_title,
                 "posted_date_iso": job.posted_date_iso,
@@ -438,6 +536,7 @@ def record_successful_run(
             run_id=run_id,
             message_docx_path=manifest.message_docx_path,
             summary_docx_path=manifest.summary_docx_path,
+            board_identifier=_board_identifier(job.resolved_job_url or job.direct_job_url),
         )
 
     _write_json(data_dir / "job-history.json", job_history)

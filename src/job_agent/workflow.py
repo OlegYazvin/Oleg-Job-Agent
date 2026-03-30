@@ -12,7 +12,15 @@ from .job_search import find_matching_jobs
 from .linkedin_extension_bridge import LinkedInExtensionBridge
 from .linkedin import LinkedInClient
 from .models import JobOutreachBundle, RunManifest
-from .reports import build_live_outreach_payload, build_manifest, build_message_document, build_summary_document
+from .ollama_runtime import auto_tune_ollama_settings, build_ollama_run_summary, save_ollama_run_summary
+from .reports import (
+    build_live_outreach_payload,
+    build_manifest,
+    build_message_document,
+    build_near_miss_document,
+    build_near_miss_payload,
+    build_summary_document,
+)
 from .status import StatusReporter
 from .storage import save_run_artifacts
 
@@ -29,7 +37,22 @@ async def _run_daily_workflow_body(
     run_id: str,
     status: StatusReporter | None = None,
 ) -> tuple[list[JobOutreachBundle], RunManifest]:
-    jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(settings, status=status)
+    tuning_profile = None
+    if settings.llm_provider == "ollama":
+        settings, tuning_profile = auto_tune_ollama_settings(settings, run_id=run_id)
+        if status:
+            status.emit(
+                "starting",
+                "Applied Ollama tuning profile for this run.",
+                ollama_model=settings.ollama_model,
+                ollama_num_ctx=settings.ollama_num_ctx,
+                ollama_num_batch=settings.ollama_num_batch,
+                ollama_num_predict=settings.ollama_num_predict,
+                ollama_degraded_for_run=settings.ollama_degraded_for_run,
+                ollama_degraded_reason=settings.ollama_degraded_reason,
+            )
+
+    jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(settings, status=status, run_id=run_id)
     linkedin = LinkedInClient(settings)
     bundles: list[JobOutreachBundle] = []
 
@@ -88,7 +111,7 @@ async def _run_daily_workflow_body(
                     )
 
             if discovery is None:
-                bundle = await draft_outreach_bundle(settings, job, [], [])
+                bundle = await draft_outreach_bundle(settings, job, [], [], run_id=run_id)
                 bundles.append(bundle)
                 continue
 
@@ -106,6 +129,7 @@ async def _run_daily_workflow_body(
                 job,
                 discovery.first_order_contacts,
                 discovery.second_order_contacts,
+                run_id=run_id,
             )
             bundles.append(bundle)
 
@@ -123,12 +147,37 @@ async def _run_daily_workflow_body(
     generated_at = datetime.now()
     message_docx_path = build_message_document(bundles, settings.output_dir, generated_at=generated_at)
     summary_docx_path = build_summary_document(bundles, settings.output_dir, generated_at=generated_at)
+    near_miss_docx_path = build_near_miss_document(
+        search_diagnostics.near_misses,
+        settings.output_dir,
+        generated_at=generated_at,
+    )
+    near_miss_payload = build_near_miss_payload(
+        search_diagnostics.near_misses,
+        run_id=run_id,
+        generated_at=generated_at,
+    )
+    ollama_summary_path = None
+    ollama_summary_payload = None
+    if settings.llm_provider == "ollama" and tuning_profile is not None:
+        ollama_summary = build_ollama_run_summary(
+            settings,
+            run_id=run_id,
+            tuning_profile=tuning_profile,
+            generated_at=generated_at,
+        )
+        ollama_summary_path = save_ollama_run_summary(settings, ollama_summary)
+        ollama_summary_payload = ollama_summary.model_dump(mode="json")
     manifest = build_manifest(
         run_id=run_id,
         bundles=bundles,
         jobs_found_by_search=jobs_found_by_search,
         message_docx_path=message_docx_path,
         summary_docx_path=summary_docx_path,
+        near_misses=search_diagnostics.near_misses,
+        near_miss_docx_path=near_miss_docx_path,
+        near_miss_json_path=settings.data_dir / "near-misses-latest.json",
+        ollama_summary_json_path=ollama_summary_path,
         generated_at=generated_at,
     )
     live_outreach_payload = build_live_outreach_payload(
@@ -141,6 +190,8 @@ async def _run_daily_workflow_body(
         bundles,
         manifest,
         live_outreach_payload=live_outreach_payload,
+        near_miss_payload=near_miss_payload,
+        ollama_summary_payload=ollama_summary_payload,
         search_diagnostics=search_diagnostics,
         status_payload=status.snapshot() if status else None,
     )
@@ -152,6 +203,8 @@ async def _run_daily_workflow_body(
             jobs_found_by_search=jobs_found_by_search,
             jobs_kept_after_validation=manifest.jobs_kept_after_validation,
             jobs_with_any_messages=manifest.jobs_with_any_messages,
+            near_miss_count=manifest.near_miss_count,
+            ollama_degraded_for_run=settings.ollama_degraded_for_run,
         )
     return bundles, manifest
 

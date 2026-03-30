@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 import json
+import time
 from typing import TypeVar
+from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel
@@ -16,6 +19,12 @@ TModel = TypeVar("TModel", bound=BaseModel)
 
 class LLMProviderError(RuntimeError):
     pass
+
+
+def _duration_seconds(value: object) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return round(float(value) / 1_000_000_000, 3)
 
 
 def _extract_json_payload(text: str) -> str:
@@ -98,16 +107,24 @@ User request:
         system_prompt: str,
         user_prompt: str,
         schema: type[TModel],
+        run_id: str | None = None,
+        caller: str = "unknown",
+        prompt_category: str = "structured",
     ) -> TModel:
         try:
             async with asyncio.timeout(self.timeout_seconds + 15):
                 payload = self._build_payload(system_prompt=system_prompt, user_prompt=user_prompt, schema=schema)
                 semaphore = get_ollama_request_semaphore(self.settings.ollama_max_concurrent_requests)
-
+                request_id = uuid4().hex
+                prompt_text = str(payload.get("prompt") or "")
+                prompt_hash = sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+                queue_started_at = time.monotonic()
                 async with semaphore:
+                    queue_wait_seconds = round(time.monotonic() - queue_started_at, 3)
                     await ensure_ollama_server(self.settings)
                     for attempt_number in range(1, self.settings.ollama_max_retries + 1):
                         try:
+                            started_at = time.monotonic()
                             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                                 response = await client.post(f"{self.base_url}/api/generate", json=payload)
                             response.raise_for_status()
@@ -116,16 +133,57 @@ User request:
                             if not raw_text:
                                 raise LLMProviderError("Ollama response body was empty.")
                             payload_text = _extract_json_payload(raw_text)
-                            return schema.model_validate_json(payload_text)
+                            parsed = schema.model_validate_json(payload_text)
+                            load_duration_seconds = _duration_seconds(response_json.get("load_duration"))
+                            record_ollama_event(
+                                self.settings,
+                                "request_success",
+                                request_id=request_id,
+                                run_id=run_id,
+                                attempt_number=attempt_number,
+                                caller=caller,
+                                prompt_category=prompt_category,
+                                prompt_hash=prompt_hash,
+                                schema_name=schema.__name__,
+                                model=self.model,
+                                keep_alive=self.settings.ollama_keep_alive,
+                                num_ctx=self.settings.ollama_num_ctx,
+                                num_batch=self.settings.ollama_num_batch,
+                                num_predict=self.settings.ollama_num_predict,
+                                prompt_chars=len(prompt_text),
+                                response_chars=len(raw_text),
+                                queue_wait_seconds=queue_wait_seconds,
+                                wall_duration_seconds=round(time.monotonic() - started_at, 3),
+                                total_duration_seconds=_duration_seconds(response_json.get("total_duration")),
+                                load_duration_seconds=load_duration_seconds,
+                                prompt_eval_count=response_json.get("prompt_eval_count"),
+                                prompt_eval_duration_seconds=_duration_seconds(response_json.get("prompt_eval_duration")),
+                                eval_count=response_json.get("eval_count"),
+                                eval_duration_seconds=_duration_seconds(response_json.get("eval_duration")),
+                                cold_start=bool(load_duration_seconds and load_duration_seconds >= 0.5),
+                                schema_valid_rate=1.0,
+                                output_used="pending",
+                            )
+                            return parsed
                         except Exception as exc:  # pragma: no cover - network/runtime dependent
                             record_ollama_event(
                                 self.settings,
                                 "request_failure",
+                                request_id=request_id,
+                                run_id=run_id,
                                 attempt_number=attempt_number,
+                                caller=caller,
+                                prompt_category=prompt_category,
+                                prompt_hash=prompt_hash,
+                                schema_name=schema.__name__,
                                 model=self.model,
+                                queue_wait_seconds=queue_wait_seconds,
+                                wall_duration_seconds=round(time.monotonic() - started_at, 3),
                                 error_type=type(exc).__name__,
                                 error_message=str(exc),
                                 retryable=self._is_retryable_request_failure(exc),
+                                schema_valid_rate=0.0,
+                                output_used="discarded",
                             )
                             if (
                                 self.settings.ollama_restart_on_failure
@@ -135,7 +193,12 @@ User request:
                                 record_ollama_event(
                                     self.settings,
                                     "request_retry_restart",
+                                    request_id=request_id,
+                                    run_id=run_id,
                                     attempt_number=attempt_number,
+                                    caller=caller,
+                                    prompt_category=prompt_category,
+                                    prompt_hash=prompt_hash,
                                     model=self.model,
                                 )
                                 await ensure_ollama_server(self.settings, force_restart=True)
@@ -148,8 +211,14 @@ User request:
             record_ollama_event(
                 self.settings,
                 "request_outer_timeout",
+                run_id=run_id,
+                caller=caller,
+                prompt_category=prompt_category,
+                prompt_hash=prompt_hash,
+                schema_name=schema.__name__,
                 model=self.model,
                 timeout_seconds=self.timeout_seconds + 15,
+                output_used="discarded",
             )
             raise LLMProviderError(
                 f"Ollama request exceeded the outer timeout of {self.timeout_seconds + 15} seconds."

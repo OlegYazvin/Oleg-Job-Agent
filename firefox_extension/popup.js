@@ -122,7 +122,7 @@ async function pingBridge() {
     return;
   }
   const details = response?.error ? ` (${response.error})` : "";
-  setStatus(`Bridge not reachable${details}`);
+  setStatus(`Workflow bridge not reachable yet${details}. Expected unless a run is actively in Firefox-extension capture.`);
 }
 
 async function loadCachedDrafts() {

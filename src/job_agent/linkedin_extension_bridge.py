@@ -15,8 +15,13 @@ import uuid
 from urllib.parse import quote
 import webbrowser
 
-from .config import Settings
-from .firefox_extension_host import enqueue_open_url, read_state as read_firefox_extension_host_state
+from .config import Settings, load_settings
+from .firefox_extension_host import (
+    enqueue_open_url,
+    inspect_configured_firefox_extension_profile,
+    open_url_in_firefox_profile,
+    read_state as read_firefox_extension_host_state,
+)
 
 
 def _normalize_name(value: str) -> str:
@@ -100,6 +105,7 @@ class ExtensionCaptureSession:
     message_histories_by_name: dict[str, list[str]] = field(default_factory=dict)
     message_histories_by_profile_url: dict[str, list[str]] = field(default_factory=dict)
     received_degrees: set[str] = field(default_factory=set)
+    login_required: bool = False
     search_results_event: asyncio.Event = field(default_factory=asyncio.Event)
     history_update_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -145,10 +151,31 @@ class LinkedInExtensionBridge:
         return session
 
     async def wait_for_search_results(self, session: ExtensionCaptureSession) -> None:
-        await asyncio.wait_for(
-            session.search_results_event.wait(),
-            timeout=self.settings.linkedin_extension_capture_timeout_seconds,
-        )
+        total_budget = max(1, self.settings.linkedin_extension_capture_timeout_seconds)
+        end_time = asyncio.get_running_loop().time() + total_budget
+        partial_result_idle_window = 5.0
+        partial_deadline: float | None = None
+        while True:
+            if session.login_required:
+                return
+            if {"1st", "2nd"}.issubset(session.received_degrees):
+                return
+            if session.received_degrees and partial_deadline is None:
+                partial_deadline = asyncio.get_running_loop().time() + partial_result_idle_window
+            remaining = end_time - asyncio.get_running_loop().time()
+            if partial_deadline is not None:
+                remaining = min(remaining, partial_deadline - asyncio.get_running_loop().time())
+            if remaining <= 0:
+                if session.received_degrees:
+                    return
+                raise TimeoutError
+            session.search_results_event.clear()
+            try:
+                await asyncio.wait_for(session.search_results_event.wait(), timeout=remaining)
+            except TimeoutError:
+                if session.received_degrees:
+                    return
+                raise
 
     async def wait_for_history_settle(self, session: ExtensionCaptureSession) -> None:
         total_budget = max(0, self.settings.linkedin_extension_history_timeout_seconds)
@@ -166,13 +193,48 @@ class LinkedInExtensionBridge:
             except TimeoutError:
                 return
 
-    async def open_search_tabs(self, session: ExtensionCaptureSession) -> None:
+    async def open_search_tabs(self, session: ExtensionCaptureSession, *, prime_linkedin_feed: bool = True) -> None:
         if not self.settings.linkedin_extension_auto_open_search_tabs:
             return
+        configured_profile = inspect_configured_firefox_extension_profile(self.settings)
+        if configured_profile.get("configured"):
+            if not configured_profile.get("exists"):
+                raise RuntimeError(
+                    "Configured Firefox extension profile was not found. "
+                    "Set FIREFOX_EXTENSION_PROFILE_DIR to the real Firefox profile you use for LinkedIn."
+                )
+            if not configured_profile.get("extension_installed"):
+                raise RuntimeError(
+                    "Configured Firefox profile does not currently have the Job Agent LinkedIn Bridge add-on loaded. "
+                    "Open `about:debugging#/runtime/this-firefox` in that profile and load "
+                    "`firefox_extension/manifest.json` as a temporary add-on."
+                )
+            if not configured_profile.get("linkedin_authenticated"):
+                raise RuntimeError(
+                    "Configured Firefox profile is not authenticated to LinkedIn. "
+                    "Sign into LinkedIn in that profile before running the workflow."
+                )
+            if prime_linkedin_feed:
+                await asyncio.to_thread(
+                    _open_url_in_firefox,
+                    "https://www.linkedin.com/feed/",
+                    self.settings.project_root,
+                )
+                await asyncio.sleep(1.0)
         for degree in ("1st", "2nd"):
             for url in session.search_urls.get(degree, []):
                 await asyncio.to_thread(_open_url_in_firefox, url, self.settings.project_root)
                 await asyncio.sleep(0.5)
+
+    async def retry_session_after_login_redirect(
+        self,
+        company_name: str,
+        *,
+        role_title: str | None = None,
+    ) -> ExtensionCaptureSession:
+        retry_session = await self.create_session(company_name, role_title=role_title)
+        await self.open_search_tabs(retry_session, prime_linkedin_feed=True)
+        return retry_session
 
     def _build_handler(self):
         bridge = self
@@ -245,8 +307,15 @@ class LinkedInExtensionBridge:
         session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
         degree = str(payload.get("degree") or "").strip()
         contacts = payload.get("contacts")
+        login_required = bool(payload.get("login_required") or payload.get("loginRequired"))
         session = self._sessions.get(session_id)
-        if session is None or degree not in {"1st", "2nd"} or not isinstance(contacts, list):
+        if session is None or degree not in {"1st", "2nd"}:
+            return
+        if login_required:
+            session.login_required = True
+            session.search_results_event.set()
+            return
+        if not isinstance(contacts, list):
             return
 
         normalized_contacts = [contact for contact in contacts if isinstance(contact, dict)]
@@ -255,8 +324,7 @@ class LinkedInExtensionBridge:
         else:
             session.second_order_contacts.extend(normalized_contacts)
         session.received_degrees.add(degree)
-        if {"1st", "2nd"}.issubset(session.received_degrees):
-            session.search_results_event.set()
+        session.search_results_event.set()
 
     def _apply_message_histories(self, payload: dict[str, object]) -> None:
         session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
@@ -295,6 +363,11 @@ class LinkedInExtensionBridge:
 
 
 def _open_url_in_firefox(url: str, project_root: Path) -> None:
+    settings = load_settings(project_root, require_openai=False)
+    if settings.firefox_extension_profile_dir is not None:
+        if open_url_in_firefox_profile(settings.firefox_extension_profile_dir, url):
+            return
+
     firefox_binary = shutil.which("firefox")
     firefox_esr_binary = shutil.which("firefox-esr")
     flatpak_binary = shutil.which("flatpak")

@@ -59,9 +59,11 @@ def test_record_successful_run_updates_run_and_job_history(tmp_path: Path) -> No
     assert run_history[0]["run_id"] == "run-123"
     assert run_history[0]["status"] == "completed"
     assert run_history[0]["message_docx_path"].endswith("linkedin_outreach_messages-20260325-144453.docx")
-    assert "https://jobs.ashbyhq.com/acme/123" in job_history
+    assert "ashby:acme:123" in job_history
     assert "acmeai" in company_history
-    assert load_previously_reported_job_keys(tmp_path) == {"https://jobs.ashbyhq.com/acme/123"}
+    reported_keys = load_previously_reported_job_keys(tmp_path)
+    assert "ashby:acme:123" in reported_keys
+    assert "https://jobs.ashbyhq.com/acme/123" in reported_keys
     assert load_previously_reported_company_keys(tmp_path) == {"acmeai"}
     assert load_company_history_entries(tmp_path)["acmeai"]["company_name"] == "Acme AI"
 
@@ -105,3 +107,37 @@ def test_record_company_watchlist_tracks_promising_companies(tmp_path: Path) -> 
     assert company_watchlist["tinyai"]["priority_score"] > 0
     assert "jobs.ashbyhq.com" in company_watchlist["tinyai"]["source_hosts"]
     assert load_company_watchlist_entries(tmp_path)["tinyai"]["company_name"] == "Tiny AI"
+
+
+def test_record_successful_run_normalizes_job_history_tracking_urls(tmp_path: Path) -> None:
+    bundle = JobOutreachBundle(
+        job=JobPosting(
+            company_name="Dropbox",
+            role_title="Staff Product Manager, AI Organization Workflows",
+            direct_job_url="https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows/?gh_src=c393b7f81us",
+            resolved_job_url="https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows/?gh_src=c393b7f81us",
+            ats_platform="Dropbox",
+            location_text="Remote",
+            is_fully_remote=True,
+            posted_date_text="2026-03-25",
+            posted_date_iso="2026-03-25",
+            salary_text="$250,000",
+            evidence_notes="Valid direct role.",
+        )
+    )
+    manifest = RunManifest(
+        run_id="run-dropbox",
+        generated_at=datetime(2026, 3, 26, 16, 0, 0),
+        message_docx_path=str(tmp_path / "output" / "linkedin_outreach_messages-20260326-160000.docx"),
+        summary_docx_path=str(tmp_path / "output" / "job_summary-20260326-160000.docx"),
+        jobs_found_by_search=10,
+        jobs_kept_after_validation=1,
+        jobs_with_any_messages=0,
+    )
+
+    record_successful_run(tmp_path, run_id="run-dropbox", manifest=manifest, bundles=[bundle])
+
+    job_history = json.loads((tmp_path / "job-history.json").read_text(encoding="utf-8"))
+    normalized_key = "https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows"
+    assert normalized_key in job_history
+    assert load_previously_reported_job_keys(tmp_path) == {normalized_key}

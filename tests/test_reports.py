@@ -3,8 +3,21 @@ from pathlib import Path
 
 from docx import Document
 
-from job_agent.models import FirstOrderMessage, JobOutreachBundle, JobPosting, ManualReviewLink, SecondOrderIntroMessage
-from job_agent.reports import build_live_outreach_payload, build_message_document, build_summary_document
+from job_agent.models import (
+    FirstOrderMessage,
+    JobOutreachBundle,
+    JobPosting,
+    ManualReviewLink,
+    NearMissJob,
+    SecondOrderIntroMessage,
+)
+from job_agent.reports import (
+    build_live_outreach_payload,
+    build_message_document,
+    build_near_miss_document,
+    build_near_miss_payload,
+    build_summary_document,
+)
 
 
 def build_bundle() -> JobOutreachBundle:
@@ -98,3 +111,28 @@ def test_summary_report_counts_second_order_targets_not_messages(tmp_path: Path)
     table = doc.tables[0]
     assert table.rows[0].cells[7].text == "2nd-Degree Contacts Messaged"
     assert table.rows[1].cells[7].text == "2"
+
+
+def test_near_miss_report_and_payload_are_written(tmp_path: Path) -> None:
+    near_miss = NearMissJob(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        reason_code="missing_salary",
+        detail="No salary range was published on the direct page.",
+        why_close="The role looked strong on a real ATS page, but compensation was missing.",
+        source_url="https://boards.greenhouse.io/acme/jobs/123",
+        direct_job_url="https://boards.greenhouse.io/acme/jobs/123",
+        source_type="direct_ats",
+        posted_date_text="2026-03-25",
+        is_remote=True,
+        supporting_evidence=["Remote ATS role."],
+    )
+    generated_at = datetime(2026, 3, 25, 14, 44, 53)
+
+    near_miss_doc = build_near_miss_document([near_miss], tmp_path, generated_at=generated_at)
+    payload = build_near_miss_payload([near_miss], run_id="run-123", generated_at=generated_at)
+
+    assert near_miss_doc.exists()
+    assert near_miss_doc.name == "job_near_misses-20260325-144453.docx"
+    assert payload["near_miss_count"] == 1
+    assert payload["items"][0]["reason_code"] == "missing_salary"

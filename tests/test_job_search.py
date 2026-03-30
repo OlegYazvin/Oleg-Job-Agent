@@ -8,7 +8,10 @@ from job_agent.job_search import (
     SearchTuning,
     _apply_salary_inference,
     _apply_company_novelty_quota,
+    _build_candidate_job,
     _build_lead_from_search_result,
+    _build_near_miss,
+    _build_portfolio_company_scout_queries,
     _build_small_company_scout_queries,
     _build_local_search_engine_queries,
     _builtin_category_urls_for_query,
@@ -39,6 +42,7 @@ from job_agent.job_search import (
     _is_ai_related_product_manager,
     _is_ai_related_product_manager_text,
     _lead_is_ai_related_product_manager,
+    _lead_priority,
     _load_seed_leads_from_file,
     _job_posting_dedupe_key,
     _is_duckduckgo_anomaly_page,
@@ -56,16 +60,18 @@ from job_agent.job_search import (
     _normalize_company_key,
     _normalize_role_title_to_focus_queries,
     _normalize_direct_job_url,
+    _precheck_lead_hints,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
     _resolve_lead_via_company_careers_pages,
     _salary_is_base_salary,
+    _seed_lead_from_failure,
     _select_watchlist_focus_companies,
     _select_focus_roles,
     _url_candidate_score,
 )
 from job_agent.job_pages import JobPageSnapshot
-from job_agent.models import JobLead, JobPosting, SearchDiagnostics, SearchFailure
+from job_agent.models import DirectJobResolution, JobLead, JobPosting, SearchDiagnostics, SearchFailure
 
 
 def build_settings() -> Settings:
@@ -116,6 +122,10 @@ def build_settings() -> Settings:
 def test_allowed_direct_job_url_accepts_ats_hosts() -> None:
     assert _is_allowed_direct_job_url("https://boards.greenhouse.io/acme/jobs/123")
     assert _is_allowed_direct_job_url("https://jobs.lever.co/acme/123")
+    assert _is_allowed_direct_job_url("https://jobs.recruitee.com/acme/o/staff-ai-product-manager")
+    assert _is_allowed_direct_job_url("https://careers.tellent.com/o/staff-ai-product-manager")
+    assert _is_allowed_direct_job_url("https://www.comeet.com/jobs/acme/00.005")
+    assert _is_allowed_direct_job_url("https://acme.jobscore.com/job/staff-ai-product-manager")
     assert _is_allowed_direct_job_url(
         "https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04"
     )
@@ -147,7 +157,13 @@ def test_normalize_direct_job_url_strips_apply_suffixes() -> None:
     assert _normalize_direct_job_url("https://jobs.ashbyhq.com/clickup/292d27c5-956c-4291-a209-2420076e4bcb/2657e8034us") == "https://jobs.ashbyhq.com/clickup/292d27c5-956c-4291-a209-2420076e4bcb"
     assert (
         _normalize_direct_job_url("https://navan.com/careers/openings?gh_jid=7660273&gh_src=5f7fcffe1")
-        == "https://navan.com/careers/openings?gh_jid=7660273&gh_src=5f7fcffe1"
+        == "https://navan.com/careers/openings?gh_jid=7660273"
+    )
+    assert (
+        _normalize_direct_job_url(
+            "https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows/?gh_src=c393b7f81us"
+        )
+        == "https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows"
     )
 
 
@@ -197,8 +213,9 @@ def test_company_hint_from_workday_url_uses_company_slug_or_host() -> None:
     )
 
 
-def test_weak_company_hints_do_not_trigger_mismatch_rejection() -> None:
+def test_weak_company_hints_do_not_trigger_mismatch_rejection(monkeypatch) -> None:
     settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
     job = JobPosting(
         company_name="Headspace",
         role_title="Principal Product Manager, LLM Innovation",
@@ -251,6 +268,104 @@ def test_generic_job_url_detection_catches_board_indexes() -> None:
     assert _looks_like_generic_job_url("https://job-boards.greenhouse.io/acme?error=true")
 
 
+def test_build_near_miss_accepts_strong_close_salary_miss() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Small AI Co",
+        role_title="Staff Product Manager, AI Platform",
+        source_url="https://jobs.ashbyhq.com/smallai/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/smallai/123",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-24",
+        salary_text_hint="$185,000 - $195,000",
+        evidence_notes="Direct ATS role at a smaller AI company.",
+        source_quality_score_hint=6,
+    )
+    job = JobPosting(
+        company_name="Small AI Co",
+        role_title="Staff Product Manager, AI Platform",
+        direct_job_url="https://jobs.ashbyhq.com/smallai/123",
+        resolved_job_url="https://jobs.ashbyhq.com/smallai/123",
+        ats_platform="Ashby",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-24",
+        posted_date_iso="2026-03-24",
+        base_salary_min_usd=185000,
+        base_salary_max_usd=195000,
+        salary_text="$185,000 - $195,000",
+        evidence_notes="Strong AI PM scope on a direct ATS page.",
+        validation_evidence=["Own the AI platform roadmap."],
+        source_quality_score=6,
+    )
+    failure = SearchFailure(
+        stage="validation",
+        reason_code="salary_below_min",
+        detail="Salary was below the configured minimum.",
+        company_name=job.company_name,
+        role_title=job.role_title,
+        source_url=lead.source_url,
+        direct_job_url=job.direct_job_url,
+        posted_date_text=job.posted_date_text,
+        salary_text=job.salary_text,
+        is_remote=True,
+        source_quality_score=6,
+    )
+
+    near_miss = _build_near_miss(lead, job, failure, settings)
+
+    assert near_miss is not None
+    assert near_miss.reason_code == "salary_below_min"
+    assert near_miss.company_name == "Small AI Co"
+
+
+def test_build_near_miss_rejects_low_signal_strategy_roles() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Strategy AI",
+        role_title="AI Strategy Product Manager",
+        source_url="https://jobs.ashbyhq.com/strategyai/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/strategyai/123",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-24",
+        evidence_notes="Strategy-heavy title on a direct ATS page.",
+        source_quality_score_hint=6,
+    )
+    job = JobPosting(
+        company_name="Strategy AI",
+        role_title="AI Strategy Product Manager",
+        direct_job_url="https://jobs.ashbyhq.com/strategyai/123",
+        resolved_job_url="https://jobs.ashbyhq.com/strategyai/123",
+        ats_platform="Ashby",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-24",
+        posted_date_iso="2026-03-24",
+        base_salary_min_usd=195000,
+        base_salary_max_usd=205000,
+        salary_text="$195,000 - $205,000",
+        evidence_notes="Strategy-heavy role.",
+        source_quality_score=6,
+    )
+    failure = SearchFailure(
+        stage="validation",
+        reason_code="remote_unclear",
+        detail="Remote evidence was ambiguous.",
+        company_name=job.company_name,
+        role_title=job.role_title,
+        source_url=lead.source_url,
+        direct_job_url=job.direct_job_url,
+        posted_date_text=job.posted_date_text,
+        salary_text=job.salary_text,
+        is_remote=None,
+        source_quality_score=6,
+    )
+
+    assert _build_near_miss(lead, job, failure, settings) is None
+
+
 def test_recent_text_parser_rejects_multi_week_postings() -> None:
     assert _is_recent_enough(None, "1 week ago", 7)
     assert _is_recent_enough(None, "Reposted 4 Days Ago", 7)
@@ -269,11 +384,11 @@ def test_recent_iso_parser_uses_configured_timezone_for_boundary(monkeypatch) ->
     assert _is_recent_enough("2026-03-10", "", 14, timezone_name="America/Chicago")
 
 
-def test_build_local_query_rounds_includes_targeted_site_queries() -> None:
+def test_build_local_query_rounds_include_startup_biased_queries() -> None:
     settings = build_settings()
     rounds = _build_local_query_rounds(settings, tuning=SearchTuning(attempt_number=1))
     flattened = [query for group in rounds for query in group]
-    assert any("site:boards.greenhouse.io" in query or "site:job-boards.greenhouse.io" in query for query in flattened)
+    assert any("startup" in query.lower() or "careers" in query.lower() for query in flattened)
     assert any(query == "AI product manager" for query in flattened)
 
 
@@ -619,8 +734,9 @@ def test_merge_candidate_with_snapshot_keeps_remote_hint_for_js_shell_pages() ->
     assert merged.is_fully_remote is True
 
 
-def test_merge_candidate_with_generic_snapshot_title_preserves_candidate_role_for_ai_inference() -> None:
+def test_merge_candidate_with_generic_snapshot_title_preserves_candidate_role_for_ai_inference(monkeypatch) -> None:
     settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
     candidate = JobPosting(
         company_name="Yelp",
         role_title="Principal Product Manager - Applied ML (Remote - United States)",
@@ -656,6 +772,289 @@ def test_merge_candidate_with_generic_snapshot_title_preserves_candidate_role_fo
     assert merged.salary_inferred is True
     reason_code, detail = _evaluate_merged_job(merged, snapshot, settings, expected_company_name="Yelp")
     assert reason_code is None, detail
+
+
+def test_merge_candidate_with_misaligned_snapshot_role_preserves_discovered_ai_pm_title() -> None:
+    candidate = JobPosting(
+        company_name="Acme AI",
+        role_title="Senior Product Manager, AI & Data Products",
+        direct_job_url="https://boards.greenhouse.io/acme/jobs/123",
+        resolved_job_url="https://boards.greenhouse.io/acme/jobs/123",
+        ats_platform="Greenhouse",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-24",
+        posted_date_iso="2026-03-24",
+        base_salary_min_usd=210000,
+        base_salary_max_usd=250000,
+        salary_text="$210,000-$250,000",
+        evidence_notes="Discovered from a direct ATS role page.",
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=candidate.direct_job_url,
+        resolved_url=candidate.direct_job_url,
+        ats_platform="Greenhouse",
+        status_code=200,
+        company_name="Acme AI",
+        role_title="Client Partner",
+        page_title="Client Partner at Acme AI",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-24",
+        posted_date_iso="2026-03-24",
+        base_salary_min_usd=210000,
+        base_salary_max_usd=250000,
+        salary_text="$210,000-$250,000",
+        text_excerpt="Client Partner at Acme AI.",
+        evidence_snippets=[],
+    )
+
+    merged = _merge_candidate_with_snapshot(candidate, snapshot)
+
+    assert merged.role_title == candidate.role_title
+
+
+def test_evaluate_merged_job_marks_specific_wrong_role_page_as_resolution_missing(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
+    job = JobPosting(
+        company_name="Acme AI",
+        role_title="Senior Product Manager, AI & Data Products",
+        direct_job_url="https://boards.greenhouse.io/acme/jobs/123",
+        resolved_job_url="https://boards.greenhouse.io/acme/jobs/123",
+        ats_platform="Greenhouse",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-24",
+        posted_date_iso="2026-03-24",
+        base_salary_min_usd=210000,
+        base_salary_max_usd=250000,
+        salary_text="$210,000-$250,000",
+        evidence_notes="AI product role discovered from the direct ATS page.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Greenhouse",
+        status_code=200,
+        company_name="Acme AI",
+        role_title="Client Partner",
+        page_title="Client Partner at Acme AI",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-24",
+        posted_date_iso="2026-03-24",
+        base_salary_min_usd=210000,
+        base_salary_max_usd=250000,
+        salary_text="$210,000-$250,000",
+        text_excerpt="Client Partner at Acme AI.",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Acme AI",
+        expected_role_title="Senior Product Manager, AI & Data Products",
+    )
+
+    assert reason_code == "resolution_missing"
+    assert "did not line up with expected role" in detail
+
+
+def test_evaluate_merged_job_rejects_geo_limited_remote_role(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    job = JobPosting(
+        company_name="Linktree",
+        role_title="Staff AI Product Manager",
+        direct_job_url="https://jobs.gem.com/linktree/example",
+        resolved_job_url="https://jobs.gem.com/linktree/example",
+        ats_platform="Gem",
+        location_text="Remote - California only",
+        is_fully_remote=True,
+        posted_date_text="2026-03-26",
+        posted_date_iso="2026-03-26",
+        base_salary_min_usd=220000,
+        base_salary_max_usd=240000,
+        salary_text="$220,000 - $240,000",
+        evidence_notes="Remote restriction: California only. Staff AI Product Manager role.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Gem",
+        status_code=200,
+        company_name="Linktree",
+        role_title="Linktree Careers",
+        page_title="Linktree Careers",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-26",
+        posted_date_iso="2026-03-26",
+        text_excerpt="Candidates can choose fully remote or hybrid, but we are only considering candidates who reside in California.",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Linktree",
+        expected_role_title="Staff AI Product Manager",
+        allow_trusted_source_role_fallback=True,
+    )
+
+    assert reason_code == "not_remote"
+    assert "geographically restricted" in detail
+
+
+def test_evaluate_merged_job_rejects_blank_workday_page_with_specific_location_slug(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    job = JobPosting(
+        company_name="Citi",
+        role_title="Wealth - AI Product Manager - Senior Vice President",
+        direct_job_url=(
+            "https://citi.wd5.myworkdayjobs.com/2/job/New-York-New-York-United-States/"
+            "Wealth---AI-Product-Manager---Senior-Vice-President_25923027"
+        ),
+        resolved_job_url=(
+            "https://citi.wd5.myworkdayjobs.com/2/job/New-York-New-York-United-States/"
+            "Wealth---AI-Product-Manager---Senior-Vice-President_25923027"
+        ),
+        ats_platform="Workday",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-20",
+        posted_date_iso="2026-03-20",
+        base_salary_min_usd=176720,
+        base_salary_max_usd=265080,
+        salary_text="$176,720.00 - $265,080.00",
+        evidence_notes="Remote hint from discovery source.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Workday",
+        status_code=200,
+        company_name="Citi",
+        role_title=None,
+        page_title="",
+        text_excerpt="",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Citi",
+        expected_role_title="Wealth - AI Product Manager - Senior Vice President",
+    )
+
+    assert reason_code == "not_remote"
+    assert "specific location" in detail
+
+
+def test_evaluate_merged_job_allows_trusted_source_fallback_for_generic_brand_page(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    job = JobPosting(
+        company_name="Acme AI",
+        role_title="Principal Product Manager, AI Platform",
+        direct_job_url="https://jobs.gem.com/acme/example",
+        resolved_job_url="https://jobs.gem.com/acme/example",
+        ats_platform="Gem",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-26",
+        posted_date_iso="2026-03-26",
+        base_salary_min_usd=220000,
+        base_salary_max_usd=260000,
+        salary_text="$220,000 - $260,000",
+        evidence_notes="Built In source provided explicit salary and fully remote evidence.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Gem",
+        status_code=200,
+        company_name="Acme AI",
+        role_title="Acme AI",
+        page_title="Acme AI Careers",
+        location_text=None,
+        is_fully_remote=None,
+        posted_date_text=None,
+        posted_date_iso=None,
+        text_excerpt="Apply to join Acme AI.",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Acme AI",
+        expected_role_title="Principal Product Manager, AI Platform",
+        allow_trusted_source_role_fallback=True,
+    )
+
+    assert reason_code is None, detail
+
+
+def test_seed_lead_from_failure_parses_salary_text_into_numeric_hints() -> None:
+    failure = SearchFailure(
+        stage="validation",
+        reason_code="missing_salary",
+        detail="No salary range was available from the direct page.",
+        company_name="Citi",
+        role_title="Wealth - AI Product Manager - Senior Vice President",
+        source_url="https://builtinnyc.com/job/example",
+        direct_job_url="https://citi.wd5.myworkdayjobs.com/job/example",
+        posted_date_text="2026-03-20",
+        salary_text="$176,720.00 - $265,080.00",
+        is_remote=True,
+    )
+
+    lead = _seed_lead_from_failure(failure)
+
+    assert lead is not None
+    assert lead.base_salary_min_usd_hint == 176720
+    assert lead.base_salary_max_usd_hint == 265080
+
+
+def test_build_candidate_job_hydrates_numeric_salary_from_hint() -> None:
+    lead = JobLead(
+        company_name="Citi",
+        role_title="Wealth - AI Product Manager - Senior Vice President",
+        source_url="https://builtinnyc.com/job/example",
+        source_type="builtin",
+        direct_job_url="https://citi.wd5.myworkdayjobs.com/job/example",
+        location_hint="Remote",
+        posted_date_hint="2026-03-20",
+        is_remote_hint=True,
+        salary_text_hint="$176,720.00 - $265,080.00",
+        evidence_notes="Built In source carried explicit salary.",
+    )
+
+    candidate = _build_candidate_job(
+        lead,
+        DirectJobResolution(
+            accepted=True,
+            direct_job_url="https://citi.wd5.myworkdayjobs.com/job/example",
+            ats_platform="Workday",
+            evidence_notes="Resolved from Built In apply link.",
+        ),
+    )
+
+    assert candidate.base_salary_min_usd == 176720
+    assert candidate.base_salary_max_usd == 265080
 
 
 def test_is_ai_related_product_manager_ignores_discovery_snippet_noise() -> None:
@@ -812,7 +1211,8 @@ def test_local_query_rounds_use_simpler_builtin_friendly_terms() -> None:
     rounds = _build_query_rounds(settings)
     flattened = [query for query_round in rounds for query in query_round]
     assert "AI product manager" in flattened
-    assert any("site:" in query for query in flattened)
+    assert any(query.startswith("site:") for query in flattened)
+    assert all(query.count("site:") <= 1 for query in flattened)
     assert any("posted this week" in query.lower() for query in flattened)
     assert any("machine learning product manager" == query for query in flattened)
 
@@ -831,6 +1231,9 @@ def test_local_query_rounds_prefer_focus_roles_before_company_drilldown() -> Non
     flattened = [query for query_round in rounds for query in query_round]
     assert flattened[0] == "principal product manager AI"
     assert "staff product manager machine learning" in flattened[:4]
+    focus_company_queries = [query for query in flattened[:12] if "Alt" in query or "Coinbase" in query]
+    assert any("Alt" in query for query in focus_company_queries)
+    assert any("Coinbase" in query for query in focus_company_queries)
 
 
 def test_builtin_search_terms_expand_brittle_queries() -> None:
@@ -916,6 +1319,8 @@ def test_local_search_engine_queries_cover_non_builtin_boards_and_direct_ats() -
         "glassdoor.com/Job",
         "builtin.com/jobs",
         "wellfound.com/jobs",
+        "workatastartup.com/jobs",
+        "getro.com/companies",
         "ziprecruiter.com/jobs",
         "themuse.com/jobs",
         "monster.com/jobs",
@@ -936,6 +1341,10 @@ def test_local_search_engine_queries_cover_non_builtin_boards_and_direct_ats() -
         "boards.greenhouse.io",
         "jobs.lever.co",
         "jobs.ashbyhq.com",
+        "jobs.recruitee.com",
+        "careers.tellent.com",
+        "comeet.com/jobs",
+        "jobscore.com",
         "myworkdayjobs.com",
         "jobs.smartrecruiters.com",
         "jobs.jobvite.com",
@@ -960,6 +1369,8 @@ def test_supported_discovery_sources_include_specific_job_board_pages() -> None:
     assert _is_supported_discovery_source_url("https://www.linkedin.com/jobs/view/123456789")
     assert _is_supported_discovery_source_url("https://www.glassdoor.com/Job/acme-ai-product-manager-job123.htm")
     assert _is_supported_discovery_source_url("https://wellfound.com/jobs/123456-product-manager-ai")
+    assert _is_supported_discovery_source_url("https://www.workatastartup.com/jobs/76698")
+    assert _is_supported_discovery_source_url("https://mercuryfund.getro.com/companies/span-2/jobs/62085282-senior-product-manager-ai")
     assert _is_supported_discovery_source_url("https://www.indeed.com/viewjob?jk=123456")
     assert _is_supported_discovery_source_url("https://dynamitejobs.com/company/rula/remote-job/sr-product-manager-ai-remote")
     assert _is_supported_discovery_source_url("https://dailyremote.com/remote-job/senior-product-manager-ai-1234")
@@ -968,6 +1379,45 @@ def test_supported_discovery_sources_include_specific_job_board_pages() -> None:
     assert _is_supported_discovery_source_url("https://www.ycombinator.com/companies/dynamo-ai/jobs/tt5OVwf-product-manager-ai")
     assert _is_supported_discovery_source_url("https://remoteai.io/roles/AI-Product-Management/job-123")
     assert not _is_supported_discovery_source_url("https://example.com/blog/ai-product-manager-role")
+
+
+def test_precheck_lead_hints_fast_rejects_stale_non_remote_and_low_salary() -> None:
+    settings = build_settings()
+    stale_lead = JobLead(
+        company_name="Acme",
+        role_title="Senior Product Manager, AI",
+        source_url="https://workatastartup.com/jobs/123",
+        source_type="other",
+        posted_date_hint="2026-03-01",
+        evidence_notes="Remote startup role.",
+    )
+    stale_failure = _precheck_lead_hints(stale_lead, settings, attempt_number=1, round_number=1)
+    assert stale_failure is not None
+    assert stale_failure.reason_code == "stale_posting"
+
+    hybrid_lead = JobLead(
+        company_name="Acme",
+        role_title="Senior Product Manager, AI",
+        source_url="https://workatastartup.com/jobs/123",
+        source_type="other",
+        is_remote_hint=False,
+        evidence_notes="Hybrid in San Francisco office.",
+    )
+    hybrid_failure = _precheck_lead_hints(hybrid_lead, settings, attempt_number=1, round_number=1)
+    assert hybrid_failure is not None
+    assert hybrid_failure.reason_code == "not_remote"
+
+    low_salary_lead = JobLead(
+        company_name="Acme",
+        role_title="Senior Product Manager, AI",
+        source_url="https://workatastartup.com/jobs/123",
+        source_type="other",
+        salary_text_hint="$160,000 - $180,000",
+        evidence_notes="Remote startup role with salary range.",
+    )
+    low_salary_failure = _precheck_lead_hints(low_salary_lead, settings, attempt_number=1, round_number=1)
+    assert low_salary_failure is not None
+    assert low_salary_failure.reason_code == "salary_below_min"
 
 
 def test_normalize_and_filter_discovery_leads_keeps_supported_job_board_pages_without_direct_urls() -> None:
@@ -1012,7 +1462,7 @@ def test_dedupe_round_leads_keeps_best_source_for_same_role() -> None:
         source_type="direct_ats",
         direct_job_url="https://jobs.ashbyhq.com/hopper/123",
         is_remote_hint=True,
-        posted_date_hint="2026-03-20",
+        posted_date_hint="2026-03-24",
         evidence_notes="Direct ATS result.",
     )
 
@@ -1261,7 +1711,7 @@ def test_job_posting_dedupe_key_normalizes_direct_url_variants() -> None:
         salary_text="$185,000 - $244,000",
         evidence_notes="AI agents role.",
     )
-    assert _job_posting_dedupe_key(job) == "https://jobs.ashbyhq.com/january/837101a2-6bc5-44e8-8f93-110638dcaca3"
+    assert _job_posting_dedupe_key(job) == "ashby:january:837101a2-6bc5-44e8-8f93-110638dcaca3"
 
 
 def test_resolve_lead_via_company_careers_pages_walks_homepage_to_board(monkeypatch) -> None:
@@ -1324,7 +1774,7 @@ def test_local_query_rounds_rotate_to_new_variants_across_attempts() -> None:
     flat_two = [query for query_round in attempt_two for query in query_round]
     assert len(flat_one) == settings.max_search_rounds * settings.search_round_query_limit
     assert len(flat_two) == settings.max_search_rounds * settings.search_round_query_limit
-    assert len(set(flat_one).intersection(flat_two)) <= 2
+    assert len(set(flat_one).intersection(flat_two)) <= settings.search_round_query_limit
 
 
 def test_normalize_role_title_to_focus_queries_generalizes_titles() -> None:
@@ -1360,7 +1810,7 @@ def test_adaptive_query_bank_prioritizes_focus_companies() -> None:
     assert "\"Highspot\" \"Principal Product Manager, AI\" remote" in query_bank[:12]
 
 
-def test_apply_company_novelty_quota_keeps_at_least_three_quarters_novel_companies() -> None:
+def test_apply_company_novelty_quota_keeps_ninety_percent_novel_companies() -> None:
     settings = build_settings()
     novel_leads = [
         JobLead(
@@ -1371,7 +1821,7 @@ def test_apply_company_novelty_quota_keeps_at_least_three_quarters_novel_compani
             direct_job_url=f"https://jobs.lever.co/novel{index}/123",
             evidence_notes="Novel company role.",
         )
-        for index in range(1, 5)
+        for index in range(1, 10)
     ]
     repeated_leads = [
         JobLead(
@@ -1389,12 +1839,12 @@ def test_apply_company_novelty_quota_keeps_at_least_three_quarters_novel_compani
     ordered = _apply_company_novelty_quota(
         [*novel_leads, *repeated_leads],
         known_company_keys,
-        min_novelty_ratio=0.75,
-        limit=4,
+        min_novelty_ratio=0.90,
+        limit=10,
     )
 
     ordered_keys = [_normalize_company_key(lead.company_name) for lead in ordered]
-    assert sum(1 for key in ordered_keys if key not in known_company_keys) >= 3
+    assert sum(1 for key in ordered_keys if key not in known_company_keys) >= 9
 
 
 def test_select_watchlist_focus_companies_prefers_small_unknown_companies(tmp_path: Path) -> None:
@@ -1424,15 +1874,135 @@ def test_select_watchlist_focus_companies_prefers_small_unknown_companies(tmp_pa
     assert focus_companies[0] == "Tiny AI"
 
 
+def test_select_watchlist_focus_companies_penalizes_stale_high_churn_companies(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    (settings.data_dir / "company-watchlist.json").write_text(
+        json.dumps(
+            {
+                "twilio": {
+                    "company_name": "Twilio",
+                    "priority_score": 2960,
+                    "watch_count": 440,
+                    "source_hosts": ["job-boards.greenhouse.io"],
+                    "recent_rejection_reasons": {"stale_posting": 440},
+                },
+                "tinyai": {
+                    "company_name": "Tiny AI",
+                    "priority_score": 120,
+                    "watch_count": 8,
+                    "source_hosts": ["jobs.ashbyhq.com"],
+                    "recent_rejection_reasons": {"stale_posting": 1},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    focus_companies = _select_watchlist_focus_companies(settings, set())
+    assert focus_companies[0] == "Tiny AI"
+
+
+def test_select_watchlist_focus_companies_skips_saturated_repeat_failures(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    (settings.data_dir / "company-watchlist.json").write_text(
+        json.dumps(
+            {
+                "jerry": {
+                    "company_name": "Jerry",
+                    "priority_score": 72,
+                    "watch_count": 12,
+                    "source_hosts": ["jobs.ashbyhq.com"],
+                    "last_reason_code": "fetch_non_200",
+                    "recent_rejection_reasons": {"fetch_non_200": 12},
+                },
+                "fresh": {
+                    "company_name": "Fresh Startup",
+                    "priority_score": 30,
+                    "watch_count": 2,
+                    "source_hosts": ["jobs.ashbyhq.com"],
+                    "last_reason_code": "remote_unclear",
+                    "recent_rejection_reasons": {"remote_unclear": 1},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    focus_companies = _select_watchlist_focus_companies(settings, set())
+    assert focus_companies == ["Fresh Startup"]
+
+
 def test_small_company_scout_queries_bias_toward_direct_ats_hosts() -> None:
     settings = build_settings()
     queries = _build_small_company_scout_queries(
         settings,
+        SearchTuning(attempt_number=14, prioritize_recency=True, prioritize_remote=True),
+    )
+    assert queries
+    assert any("site:" in query and "product manager" in query for query in queries)
+    assert all("site:" in query for query in queries[:6])
+    assert any("\"portfolio company\"" in query for query in queries)
+    assert any("\"early stage\"" in query for query in queries)
+
+
+def test_portfolio_company_scout_queries_target_startup_network_boards() -> None:
+    settings = build_settings()
+    queries = _build_portfolio_company_scout_queries(
+        settings,
         SearchTuning(attempt_number=1, prioritize_recency=True, prioritize_remote=True),
     )
     assert queries
-    assert any("site:jobs.ashbyhq.com" in query for query in queries)
-    assert any("site:jobs.lever.co" in query for query in queries)
+    assert any("workatastartup.com/jobs" in query or "getro.com/companies" in query for query in queries)
+    assert any("startup" in query or "\"portfolio company\"" in query for query in queries)
+
+
+def test_local_query_rounds_prioritize_focus_companies_without_compound_site_queries() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    rounds = _build_local_query_rounds(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            prioritize_recency=True,
+            prioritize_salary=True,
+            focus_companies=["Tiny AI"],
+            focus_roles=["\"Senior Product Manager, AI\""],
+        ),
+    )
+    flat_queries = [query for query_round in rounds for query in query_round]
+    assert flat_queries
+    assert any("Tiny AI" in query for query in flat_queries[:12])
+    assert all(query.count("site:") <= 1 for query in flat_queries)
+
+
+def test_lead_priority_prefers_small_company_hosts_over_enterprise_ats() -> None:
+    settings = build_settings()
+    small_company_lead = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/tinyai/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Direct startup ATS role.",
+    )
+    enterprise_lead = JobLead(
+        company_name="Big Enterprise",
+        role_title="Senior Product Manager, AI",
+        source_url="https://bigenterprise.myworkdayjobs.com/en-US/Careers/job/123",
+        source_type="direct_ats",
+        direct_job_url="https://bigenterprise.myworkdayjobs.com/en-US/Careers/job/123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Direct enterprise ATS role.",
+    )
+
+    assert _lead_priority(small_company_lead, settings) < _lead_priority(enterprise_lead, settings)
 
 
 def test_refine_local_leads_with_ollama_merges_cleaned_candidates(monkeypatch) -> None:

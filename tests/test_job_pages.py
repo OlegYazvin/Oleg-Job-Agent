@@ -4,11 +4,14 @@ from bs4 import BeautifulSoup
 import httpx
 
 from job_agent.job_pages import (
+    _extract_ashby_fields,
     _extract_ai_context_snippets,
     _extract_greenhouse_board_job_reference,
     _extract_greenhouse_fields,
+    _extract_jobscore_fields,
     _extract_jsonld_location,
     _extract_lever_fields,
+    _extract_recruitee_fields,
     _extract_salary_range,
     _infer_remote_status,
     fetch_job_page,
@@ -68,6 +71,47 @@ GREENHOUSE_HTML = """
 </html>
 """
 
+ASHBY_HTML = """
+<html>
+  <body>
+    <script>
+      window.__appData = {
+        "organization": {"name": "Jerry.ai"},
+        "posting": {
+          "title": "Senior Product Manager, AI Agents and Platform",
+          "locationName": "Remote - US",
+          "publishedAt": "2026-03-26T19:07:17.783Z",
+          "descriptionHtml": "<p>Base salary range: $210,000 - $260,000. This is a fully remote role.</p>"
+        }
+      }
+    </script>
+  </body>
+</html>
+"""
+
+RECRUITEE_HTML = """
+<html>
+  <body>
+    <script>
+      var state = &quot;offers&quot;:[{&quot;remote&quot;:true,&quot;guid&quot;:&quot;abc123&quot;,&quot;id&quot;:1804373,&quot;countryCode&quot;:&quot;US&quot;,&quot;hybrid&quot;:false,&quot;city&quot;:&quot;Remote&quot;,&quot;salary&quot;:{&quot;currency&quot;:&quot;USD&quot;,&quot;max&quot;:260000,&quot;min&quot;:210000,&quot;period&quot;:&quot;year&quot;},&quot;translations&quot;:{&quot;en&quot;:{&quot;name&quot;:&quot;Senior Product Manager, AI Platform&quot;,&quot;country&quot;:&quot;United States&quot;,&quot;descriptionHtml&quot;:&quot;&lt;p&gt;Remote role&lt;/p&gt;&quot;}}}],&quot;translations&quot;:{};
+    </script>
+  </body>
+</html>
+"""
+
+JOBSCORE_HTML = """
+<html>
+  <head>
+    <title>Share the Product Manager – AI Solutions open at Unified in Remote, United States., powered by JobScore</title>
+    <meta name="title" content="Share the Product Manager – AI Solutions open at Unified in Remote, United States." />
+    <meta name="description" content="Share the Product Manager – AI Solutions open at Unified in Remote, United States." />
+  </head>
+  <body>
+    <main>This role is fully remote and focused on AI products.</main>
+  </body>
+</html>
+"""
+
 
 def test_extract_salary_range_parses_usd_ranges() -> None:
     assert _extract_salary_range("Compensation: $210,000 - $260,000 base salary") == (
@@ -115,6 +159,33 @@ def test_extract_greenhouse_fields_reads_salary_posted_and_remote() -> None:
     assert values["base_salary_min_usd"] == 210000
     assert values["base_salary_max_usd"] == 260000
     assert values["posted_date_iso"] == "2026-03-20"
+    assert values["is_fully_remote"] is True
+
+
+def test_extract_ashby_fields_reads_embedded_app_data() -> None:
+    values = _extract_ashby_fields(ASHBY_HTML, [])
+    assert values["company_name"] == "Jerry.ai"
+    assert values["role_title"] == "Senior Product Manager, AI Agents and Platform"
+    assert values["posted_date_iso"] == "2026-03-26"
+    assert values["base_salary_min_usd"] == 210000
+    assert values["base_salary_max_usd"] == 260000
+    assert values["is_fully_remote"] is True
+
+
+def test_extract_recruitee_fields_reads_embedded_offer_payload() -> None:
+    values = _extract_recruitee_fields(RECRUITEE_HTML, [])
+    assert values["role_title"] == "Senior Product Manager, AI Platform"
+    assert values["location_text"] == "Remote, United States"
+    assert values["base_salary_min_usd"] == 210000
+    assert values["base_salary_max_usd"] == 260000
+    assert values["is_fully_remote"] is True
+
+
+def test_extract_jobscore_fields_uses_meta_title_and_description() -> None:
+    values = _extract_jobscore_fields(BeautifulSoup(JOBSCORE_HTML, "html.parser"), JOBSCORE_HTML, [])
+    assert values["company_name"] == "Unified"
+    assert values["role_title"] == "Product Manager – AI Solutions"
+    assert values["location_text"] == "Remote, United States"
     assert values["is_fully_remote"] is True
 
 

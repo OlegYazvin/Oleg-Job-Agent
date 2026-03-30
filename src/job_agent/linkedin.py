@@ -4,6 +4,7 @@ import configparser
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
+import json
 from pathlib import Path
 import re
 import shutil
@@ -139,6 +140,30 @@ class LinkedInClient:
                 "No Firefox extension capture was received before timeout. "
                 "Make sure Firefox is open, the LinkedIn extension is loaded, and the capture tabs were allowed to load."
             ) from exc
+        if session.login_required:
+            retry_session = await extension_bridge.retry_session_after_login_redirect(
+                company_name,
+                role_title=role_title,
+            )
+            try:
+                await extension_bridge.wait_for_search_results(retry_session)
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "Firefox extension capture retried after a LinkedIn login redirect, "
+                    "but the retried capture still timed out before results arrived."
+                ) from exc
+            if retry_session.login_required:
+                raise RuntimeError(
+                    "Firefox extension capture was redirected to LinkedIn login before results loaded, "
+                    "and the retry against the configured Firefox profile still landed on LinkedIn login. "
+                    "Re-open LinkedIn in that Firefox profile and keep the temporary add-on window alive."
+                )
+            session = retry_session
+        if session.login_required:
+            raise RuntimeError(
+                "Firefox extension capture was redirected to LinkedIn login before results loaded. "
+                "The Firefox browser/profile handling capture is not authenticated to LinkedIn."
+            )
         await extension_bridge.wait_for_history_settle(session)
         return self._build_discovery_from_extension_session(company_name, session)
 
@@ -329,37 +354,7 @@ class LinkedInClient:
         return session.message_histories_by_name.get(normalized_name, [])
 
     async def _apply_auth_cookies(self, context: BrowserContext) -> None:
-        firefox_cookies = _load_firefox_linkedin_cookies()
-        if firefox_cookies:
-            await context.add_cookies(firefox_cookies)
-            return
-
-        cookies = []
-        if self.settings.linkedin_li_at:
-            cookies.append(
-                {
-                    "name": "li_at",
-                    "value": self.settings.linkedin_li_at,
-                    "domain": ".linkedin.com",
-                    "path": "/",
-                    "secure": True,
-                    "httpOnly": True,
-                }
-            )
-        if self.settings.linkedin_jsessionid:
-            jsessionid = self.settings.linkedin_jsessionid
-            if not jsessionid.startswith('"'):
-                jsessionid = f'"{jsessionid}"'
-            cookies.append(
-                {
-                    "name": "JSESSIONID",
-                    "value": jsessionid,
-                    "domain": ".www.linkedin.com",
-                    "path": "/",
-                    "secure": True,
-                    "httpOnly": False,
-                }
-            )
+        cookies = _load_linkedin_auth_cookies(self.settings)
         if cookies:
             await context.add_cookies(cookies)
 
@@ -1279,6 +1274,41 @@ def _copy_firefox_cookie_db(profile_dir: Path) -> Path | None:
         return None
 
 
+def _load_linkedin_storage_state_cookies(storage_state_path: Path) -> list[dict[str, object]]:
+    if not storage_state_path.exists():
+        return []
+    try:
+        payload = json.loads(storage_state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    cookies: list[dict[str, object]] = []
+    for raw_cookie in payload.get("cookies", []):
+        if not isinstance(raw_cookie, dict):
+            continue
+        domain = str(raw_cookie.get("domain") or "")
+        if "linkedin.com" not in domain:
+            continue
+        name = str(raw_cookie.get("name") or "").strip()
+        value = raw_cookie.get("value")
+        if not name or value is None:
+            continue
+        cookie = {
+            "name": name,
+            "value": str(value),
+            "domain": domain,
+            "path": str(raw_cookie.get("path") or "/"),
+            "expires": _normalize_cookie_expiry(raw_cookie.get("expires")),
+            "secure": bool(raw_cookie.get("secure", False)),
+            "httpOnly": bool(raw_cookie.get("httpOnly", False)),
+        }
+        same_site = raw_cookie.get("sameSite")
+        if same_site in {"Lax", "Strict", "None"}:
+            cookie["sameSite"] = same_site
+        cookies.append(cookie)
+    return cookies
+
+
 def _load_firefox_linkedin_cookies(profile_dir: Path | None = None) -> list[dict[str, object]]:
     resolved_profile_dir = profile_dir or _default_firefox_profile_dir()
     if resolved_profile_dir is None:
@@ -1323,6 +1353,57 @@ def _load_firefox_linkedin_cookies(profile_dir: Path | None = None) -> list[dict
         except Exception:
             pass
         shutil.rmtree(copied_db.parent, ignore_errors=True)
+
+
+def _load_env_linkedin_cookies(settings: Settings) -> list[dict[str, object]]:
+    cookies: list[dict[str, object]] = []
+    if settings.linkedin_li_at:
+        cookies.append(
+            {
+                "name": "li_at",
+                "value": settings.linkedin_li_at,
+                "domain": ".linkedin.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+            }
+        )
+    if settings.linkedin_jsessionid:
+        jsessionid = settings.linkedin_jsessionid
+        if not jsessionid.startswith('"'):
+            jsessionid = f'"{jsessionid}"'
+        cookies.append(
+            {
+                "name": "JSESSIONID",
+                "value": jsessionid,
+                "domain": ".www.linkedin.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+            }
+        )
+    return cookies
+
+
+def _load_linkedin_auth_cookies(settings: Settings) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for source_cookies in (
+        _load_env_linkedin_cookies(settings),
+        _load_linkedin_storage_state_cookies(settings.linkedin_storage_state),
+        _load_firefox_linkedin_cookies(),
+    ):
+        for cookie in source_cookies:
+            key = (
+                str(cookie.get("name") or ""),
+                str(cookie.get("domain") or ""),
+                str(cookie.get("path") or "/"),
+            )
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            merged.append(cookie)
+    return merged
 
 
 def _normalize_cookie_expiry(value: object) -> int:

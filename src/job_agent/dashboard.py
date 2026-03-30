@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import load_settings
 from .history import load_job_history_entries, load_run_history_entries
+from .ollama_runtime import load_latest_ollama_summary, load_ollama_tuning_profile
 from .status import _pid_is_alive, _read_status_payload, can_launch_progress_gui
 
 try:
@@ -222,6 +223,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     current_updated_var = tk.StringVar(value="")
     current_metrics_var = tk.StringVar(value="")
     history_counts_var = tk.StringVar(value="")
+    ollama_var = tk.StringVar(value="")
 
     ttk.Label(current_card, textvariable=current_stage_var, style="Body.TLabel").pack(anchor="w", pady=(8, 2))
     ttk.Label(current_card, textvariable=current_message_var, style="Muted.TLabel", wraplength=420, justify="left").pack(
@@ -230,6 +232,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     ttk.Label(current_card, textvariable=current_updated_var, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
     ttk.Label(current_card, textvariable=current_metrics_var, style="Body.TLabel", justify="left").pack(anchor="w", pady=(10, 0))
     ttk.Label(current_card, textvariable=history_counts_var, style="Muted.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
+    ttk.Label(current_card, textvariable=ollama_var, style="Muted.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
 
     controls_card = ttk.Frame(right_panel, style="Card.TFrame")
     controls_card.pack(fill="x", pady=(18, 0))
@@ -343,6 +346,8 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
         live_status = _read_status_payload(settings.live_status_path)
         run_history = load_run_history_entries(settings.data_dir)
         job_history = load_job_history_entries(settings.data_dir)
+        ollama_profile = load_ollama_tuning_profile(settings)
+        ollama_summary = load_latest_ollama_summary(settings)
         current_runs = _build_runs_for_display(live_status, run_history)
 
         current_stage = str(live_status.get("stage", "idle"))
@@ -366,6 +371,19 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
             f"Historical runs logged: {len(run_history)}\n"
             f"Unique jobs archived: {len(job_history)}"
         )
+        ollama_lines = [
+            f"Ollama profile: {ollama_profile.model} | ctx {ollama_profile.num_ctx} | batch {ollama_profile.num_batch}",
+        ]
+        if ollama_profile.degraded:
+            ollama_lines.append(f"Degraded: {ollama_profile.degraded_reason or 'yes'}")
+        if ollama_summary is not None:
+            ollama_lines.append(
+                f"Latest Ollama run: success {ollama_summary.success_count}/{ollama_summary.request_count}, "
+                f"warm-hit {round(ollama_summary.warm_hit_rate * 100)}%"
+            )
+            if ollama_summary.median_wall_duration_seconds is not None:
+                ollama_lines.append(f"Median wall time: {ollama_summary.median_wall_duration_seconds}s")
+        ollama_var.set("\n".join(ollama_lines))
 
         existing_selection = tree.selection()
         existing_ids = set(tree.get_children())

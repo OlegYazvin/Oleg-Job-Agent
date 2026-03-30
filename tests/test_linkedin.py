@@ -8,6 +8,8 @@ from job_agent.linkedin import (
     _company_matches,
     _default_firefox_profile_dir,
     _load_firefox_linkedin_cookies,
+    _load_linkedin_auth_cookies,
+    _load_linkedin_storage_state_cookies,
     _normalize_cookie_expiry,
     build_manual_review_links,
 )
@@ -122,6 +124,111 @@ def test_load_firefox_linkedin_cookies_reads_copied_cookie_db(tmp_path: Path) ->
     assert len(cookies) == 1
     assert cookies[0]["name"] == "li_at"
     assert cookies[0]["domain"] == ".linkedin.com"
+
+
+def test_load_linkedin_storage_state_cookies_reads_linkedin_entries(tmp_path: Path) -> None:
+    storage_state_path = tmp_path / "linkedin-state.json"
+    storage_state_path.write_text(
+        """
+        {
+          "cookies": [
+            {
+              "name": "li_at",
+              "value": "abc123",
+              "domain": ".linkedin.com",
+              "path": "/",
+              "expires": 2000000000,
+              "httpOnly": true,
+              "secure": true,
+              "sameSite": "Lax"
+            },
+            {
+              "name": "ignored",
+              "value": "nope",
+              "domain": ".example.com",
+              "path": "/",
+              "expires": 2000000000,
+              "httpOnly": false,
+              "secure": false
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    cookies = _load_linkedin_storage_state_cookies(storage_state_path)
+
+    assert len(cookies) == 1
+    assert cookies[0]["name"] == "li_at"
+    assert cookies[0]["domain"] == ".linkedin.com"
+    assert cookies[0]["sameSite"] == "Lax"
+
+
+def test_load_linkedin_auth_cookies_prefers_env_then_storage_then_firefox(tmp_path: Path, monkeypatch) -> None:
+    storage_state_path = tmp_path / "linkedin-state.json"
+    storage_state_path.write_text(
+        """
+        {
+          "cookies": [
+            {
+              "name": "li_at",
+              "value": "from-storage",
+              "domain": ".linkedin.com",
+              "path": "/",
+              "expires": 2000000000,
+              "httpOnly": true,
+              "secure": true
+            },
+            {
+              "name": "storage-only",
+              "value": "keep-me",
+              "domain": ".www.linkedin.com",
+              "path": "/",
+              "expires": 2000000000,
+              "httpOnly": false,
+              "secure": true
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "job_agent.linkedin._load_firefox_linkedin_cookies",
+        lambda profile_dir=None: [
+            {
+                "name": "li_at",
+                "value": "from-firefox",
+                "domain": ".linkedin.com",
+                "path": "/",
+                "expires": 2000000000,
+                "httpOnly": True,
+                "secure": True,
+            },
+            {
+                "name": "firefox-only",
+                "value": "keep-too",
+                "domain": ".linkedin.com",
+                "path": "/",
+                "expires": 2000000000,
+                "httpOnly": True,
+                "secure": True,
+            },
+        ],
+    )
+    settings = SimpleNamespace(
+        linkedin_li_at="from-env",
+        linkedin_jsessionid=None,
+        linkedin_storage_state=storage_state_path,
+    )
+
+    cookies = _load_linkedin_auth_cookies(settings)
+
+    by_name = {cookie["name"]: cookie for cookie in cookies}
+    assert by_name["li_at"]["value"] == "from-env"
+    assert by_name["storage-only"]["value"] == "keep-me"
+    assert by_name["firefox-only"]["value"] == "keep-too"
 
 
 def test_normalize_cookie_expiry_handles_milliseconds() -> None:

@@ -71,6 +71,18 @@
     return null;
   }
 
+  async function waitForSearchBox(timeoutMs = 12000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const input = findSearchBox();
+      if (input) {
+        return input;
+      }
+      await sleep(400);
+    }
+    return null;
+  }
+
   async function clearSearchBox(input) {
     input.focus();
     input.value = "";
@@ -80,32 +92,35 @@
   }
 
   async function searchConversation(name) {
-    const searchBox = findSearchBox();
-    if (!searchBox) {
-      return false;
-    }
-    await clearSearchBox(searchBox);
-    searchBox.focus();
-    searchBox.value = name;
-    searchBox.dispatchEvent(new Event("input", { bubbles: true }));
-    searchBox.dispatchEvent(new Event("change", { bubbles: true }));
-    await sleep(1400);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const searchBox = await waitForSearchBox();
+      if (!searchBox) {
+        await sleep(600);
+        continue;
+      }
+      await clearSearchBox(searchBox);
+      searchBox.focus();
+      searchBox.value = name;
+      searchBox.dispatchEvent(new Event("input", { bubbles: true }));
+      searchBox.dispatchEvent(new Event("change", { bubbles: true }));
+      await sleep(1400 + attempt * 300);
 
-    const candidates = Array.from(
-      document.querySelectorAll(
-        "li, div, a"
-      )
-    ).filter((node) => visibleText(node).includes(name));
-    const conversation = candidates.find((node) => {
-      const text = visibleText(node);
-      return text.includes(name) && text.length < 500;
-    });
-    if (!conversation) {
-      return false;
+      const candidates = Array.from(document.querySelectorAll("li, div, a")).filter((node) =>
+        visibleText(node).includes(name)
+      );
+      const conversation = candidates.find((node) => {
+        const text = visibleText(node);
+        return text.includes(name) && text.length < 500;
+      });
+      if (!conversation) {
+        await sleep(500);
+        continue;
+      }
+      conversation.click();
+      await sleep(1600);
+      return true;
     }
-    conversation.click();
-    await sleep(1600);
-    return true;
+    return false;
   }
 
   async function scrapeMessageHistory(item) {

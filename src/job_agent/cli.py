@@ -3,13 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shlex
 import signal
 import shutil
 
 from .config import load_settings
 from .dashboard import run_dashboard
-from .firefox_extension_host import deploy_host_background, remove_host
+from .firefox_extension_host import (
+    deploy_host_background,
+    inspect_configured_firefox_extension_profile,
+    remove_host,
+)
 from .linkedin import LinkedInClient, describe_browser_choice
+from .ollama_runtime import load_latest_ollama_summary, load_ollama_tuning_profile
 from .scheduler import install_user_cron, render_cron_line
 from .status import StatusReporter, spawn_progress_gui
 from .workflow import run_daily_workflow
@@ -105,6 +111,11 @@ async def _run_workflow(*, show_gui: bool, timeout_seconds: int | None = None) -
 
 def _run_doctor() -> None:
     settings = load_settings(require_openai=False)
+    firefox_extension_profile = inspect_configured_firefox_extension_profile(settings)
+    ollama_profile = load_ollama_tuning_profile(settings)
+    ollama_summary = load_latest_ollama_summary(settings)
+    ollama_command_parts = shlex.split(settings.ollama_command.strip()) if settings.ollama_command.strip() else ["ollama"]
+    ollama_executable = ollama_command_parts[0] if ollama_command_parts else "ollama"
     payload = {
         "project_root": str(settings.project_root),
         "openai_key_present": bool(settings.openai_api_key),
@@ -121,7 +132,10 @@ def _run_doctor() -> None:
         "linkedin_manual_review_mode": settings.linkedin_manual_review_mode,
         "llm_provider": settings.llm_provider,
         "ollama_base_url": settings.ollama_base_url,
+        "ollama_command": settings.ollama_command,
+        "ollama_command_resolved": shutil.which(ollama_executable),
         "ollama_model": settings.ollama_model,
+        "ollama_tuning_profile": ollama_profile.model_dump(mode="json"),
         "ollama_keep_alive": settings.ollama_keep_alive,
         "ollama_num_ctx": settings.ollama_num_ctx,
         "ollama_num_batch": settings.ollama_num_batch,
@@ -129,7 +143,9 @@ def _run_doctor() -> None:
         "ollama_max_concurrent_requests": settings.ollama_max_concurrent_requests,
         "ollama_restart_on_failure": settings.ollama_restart_on_failure,
         "ollama_log_path": str(settings.ollama_log_path),
-        "ollama_event_log_path": str(settings.output_dir / "ollama-events.jsonl"),
+        "ollama_event_log_path": str(settings.ollama_event_log_path),
+        "ollama_summary_path": str(settings.ollama_summary_path),
+        "ollama_latest_summary": ollama_summary.model_dump(mode="json") if ollama_summary is not None else None,
         "use_openai_fallback": settings.use_openai_fallback,
         "local_confidence_threshold": settings.local_confidence_threshold,
         "linkedin_capture_mode": settings.linkedin_capture_mode,
@@ -139,6 +155,7 @@ def _run_doctor() -> None:
         "linkedin_extension_capture_timeout_seconds": settings.linkedin_extension_capture_timeout_seconds,
         "linkedin_extension_history_timeout_seconds": settings.linkedin_extension_history_timeout_seconds,
         "linkedin_extension_auto_open_search_tabs": settings.linkedin_extension_auto_open_search_tabs,
+        "firefox_extension_profile": firefox_extension_profile,
         "cron_available": shutil.which("crontab") is not None,
         "recommended_cron_line": render_cron_line(settings),
         "recommended_auth_bootstrap": "job-agent bootstrap-linkedin-google-session",

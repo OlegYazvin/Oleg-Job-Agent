@@ -18,6 +18,8 @@ def save_run_artifacts(
     bundles: list[JobOutreachBundle],
     manifest: RunManifest,
     live_outreach_payload: dict | None = None,
+    near_miss_payload: dict | None = None,
+    ollama_summary_payload: dict | None = None,
     search_diagnostics: SearchDiagnostics | None = None,
     status_payload: dict | None = None,
 ) -> None:
@@ -29,8 +31,18 @@ def save_run_artifacts(
     if live_outreach_payload is not None:
         payload["live_outreach"] = live_outreach_payload
         save_json_snapshot(data_dir / "live-outreach.json", live_outreach_payload)
+    if near_miss_payload is not None:
+        payload["near_misses"] = near_miss_payload
+        save_json_snapshot(data_dir / "near-misses-latest.json", near_miss_payload)
+    if ollama_summary_payload is not None:
+        payload["ollama_summary"] = ollama_summary_payload
+        save_json_snapshot(data_dir / "ollama-summary-latest.json", ollama_summary_payload)
     if search_diagnostics is not None:
         payload["search_diagnostics"] = search_diagnostics.model_dump(mode="json")
+        save_json_snapshot(
+            data_dir / "false-negative-audit-latest.json",
+            {"items": search_diagnostics.model_dump(mode="json").get("false_negative_audit", [])},
+        )
     save_json_snapshot(data_dir / f"run-{timestamp}.json", payload)
     record_successful_run(
         data_dir,

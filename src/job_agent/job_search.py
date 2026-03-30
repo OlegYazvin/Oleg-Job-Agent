@@ -9,7 +9,7 @@ from html import unescape
 import json
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from agents import Agent, Runner, WebSearchTool
 from bs4 import BeautifulSoup
@@ -24,7 +24,18 @@ from .history import (
 )
 from .job_pages import USER_AGENT, JobPageSnapshot, fetch_job_page
 from .llm_provider import LLMProviderError, OllamaStructuredProvider
-from .models import DirectJobResolution, JobLead, JobLeadSearchResult, JobPosting, SearchDiagnostics, SearchFailure, SearchPassSummary
+from .models import (
+    DirectJobResolution,
+    FalseNegativeAuditEntry,
+    JobLead,
+    JobLeadSearchResult,
+    JobPosting,
+    NearMissJob,
+    SearchDiagnostics,
+    SearchFailure,
+    SearchPassSummary,
+)
+from .ollama_runtime import record_ollama_event
 from .status import StatusReporter
 from .storage import save_json_snapshot
 
@@ -36,6 +47,10 @@ ALLOWED_JOB_HOST_FRAGMENTS = (
     "jobs.lever.co",
     "lever.co",
     "ashbyhq.com",
+    "recruitee.com",
+    "careers.tellent.com",
+    "comeet.com",
+    "jobscore.com",
     "myworkdayjobs.com",
     "jobvite.com",
     "smartrecruiters.com",
@@ -245,7 +260,7 @@ COMPANY_SITE_JUNK_HOST_FRAGMENTS = (
 COMPANY_RESOLUTION_URL_CACHE: dict[str, list[str]] = {}
 LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES = (
     ("linkedin.com/jobs/view", "glassdoor.com/Job", "builtin.com/jobs"),
-    ("wellfound.com/jobs", "ziprecruiter.com/jobs", "themuse.com/jobs"),
+    ("wellfound.com/jobs", "workatastartup.com/jobs", "getro.com/companies"),
     ("monster.com/jobs", "startup.jobs", "jobgether.com"),
     ("welcometothejungle.com/en/companies", "joinhandshake.com/jobs", "ycombinator.com/companies"),
     ("dynamitejobs.com/company", "dailyremote.com/remote-job", "remote.io/remote-product-jobs"),
@@ -254,6 +269,7 @@ LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES = (
 LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES = (
     ("job-boards.greenhouse.io", "boards.greenhouse.io", "jobs.lever.co"),
     ("jobs.ashbyhq.com", "myworkdayjobs.com", "jobs.smartrecruiters.com"),
+    ("jobs.recruitee.com", "comeet.com/jobs", "jobscore.com"),
     ("jobs.jobvite.com", "jobs.workable.com", "jobs.icims.com"),
     ("careers.bamboohr.com", "jobs.dayforcehcm.com", "recruiting.paylocity.com"),
     ("careers.adp.com", "careers.workday.com"),
@@ -264,17 +280,59 @@ LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT = 2
 LOCAL_SEARCH_TOTAL_QUERY_LIMIT = 14
 SEARCH_QUERY_RESULT_CACHE: dict[tuple[str, int], list[tuple[str, str, str]]] = {}
 SEED_LEADS_FILENAME = "seed-leads.json"
-NOVEL_COMPANY_TARGET_RATIO = 0.75
+NOVEL_COMPANY_TARGET_RATIO = 0.90
+TRACKING_QUERY_PARAM_NAMES = {
+    "gh_src",
+    "gh_sid",
+    "gh_oid",
+    "gh_bid",
+    "gh_aid",
+    "gh_cid",
+    "gh_u",
+    "gclid",
+    "fbclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "referrer",
+    "source",
+    "src",
+    "trk",
+}
 SMALL_COMPANY_SCOUT_DOMAINS = (
     "jobs.ashbyhq.com",
     "jobs.lever.co",
+    "jobs.recruitee.com",
+    "careers.tellent.com",
+    "comeet.com/jobs",
+    "jobscore.com",
     "jobs.workable.com",
     "boards.greenhouse.io",
     "job-boards.greenhouse.io",
+    "jobs.jobvite.com",
+    "jobs.gem.com",
+    "teamtailor.com/jobs",
     "careers.bamboohr.com",
     "recruiting.paylocity.com",
     "jobs.dayforcehcm.com",
     "jobs.smartrecruiters.com",
+    "wellfound.com/jobs",
+    "startup.jobs",
+    "welcometothejungle.com/en/companies",
+    "workatastartup.com/jobs",
+    "ycombinator.com/companies",
+    "dynamitejobs.com/company",
+    "dailyremote.com/remote-job",
+    "remoteai.io/roles",
+    "jobgether.com",
+    "flexhired.com/jobs",
+)
+PORTFOLIO_BOARD_SCOUT_DOMAINS = (
+    "workatastartup.com/jobs",
+    "wellfound.com/jobs",
+    "getro.com/companies",
+    "ycombinator.com/companies",
 )
 SMALL_COMPANY_SCOUT_TOPICS = (
     "AI",
@@ -282,10 +340,87 @@ SMALL_COMPANY_SCOUT_TOPICS = (
     "generative AI",
     "agentic AI",
     "applied AI",
+    "applied intelligence",
+    "vertical AI",
     "LLM",
     "AI platform",
     "ML platform",
+    "AI agents",
+    "conversational AI",
+    "voice AI",
+    "AI workflow automation",
+    "AI infrastructure",
+    "data products",
 )
+SMALL_COMPANY_LOCAL_SCOUT_MODIFIERS = (
+    "startup",
+    "\"series a\"",
+    "\"series b\"",
+    "\"series c\"",
+    "\"seed stage\"",
+    "\"venture backed\"",
+    "\"vc backed\"",
+    "\"portfolio company\"",
+    "\"early stage\"",
+    "\"growth stage\"",
+    "\"founding team\"",
+    "\"small team\"",
+    "\"high growth\"",
+)
+ENTERPRISE_ATS_HOST_FRAGMENTS = (
+    "myworkdayjobs.com",
+    "careers.workday.com",
+    "careers.adp.com",
+    "jobs.icims.com",
+)
+NON_ACTIONABLE_WATCHLIST_REASON_CODES = {
+    "already_reported",
+    "company_mismatch",
+    "direct_url_not_allowed",
+    "fetch_non_200",
+    "missing_salary",
+    "not_remote",
+    "not_specific_job_page",
+    "remote_unclear",
+    "resolution_missing",
+    "salary_below_min",
+    "stale_posting",
+}
+NEAR_MISS_REASON_CODES = {
+    "remote_unclear",
+    "missing_salary",
+    "salary_below_min",
+    "stale_posting",
+    "fetch_non_200",
+    "resolution_missing",
+}
+FALSE_NEGATIVE_AUDIT_REASON_CODES = {
+    "not_ai_product_manager",
+    "remote_unclear",
+    "fetch_non_200",
+    "resolution_missing",
+    "salary_below_min",
+    "missing_salary",
+}
+LOW_SIGNAL_ROLE_TERMS = {
+    "strategist",
+    "strategy",
+    "operations",
+    "ops",
+    "consultant",
+    "consulting",
+    "program manager",
+    "project manager",
+    "partnerships",
+    "marketing",
+    "growth",
+    "customer success",
+    "solutions architect",
+    "sales",
+    "business development",
+}
+CLOSE_MISS_SALARY_BUFFER_USD = 25000
+NEAR_MISS_STALE_BUFFER_DAYS = 7
 
 
 class SearchQueryTimeoutError(asyncio.TimeoutError):
@@ -341,7 +476,7 @@ def _normalize_direct_job_url(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
     path = parsed.path.rstrip("/")
-    query = parsed.query
+    query = _strip_tracking_query_params(parsed.query)
 
     if "jobs.lever.co" in host and "/apply" in path:
         path = path.split("/apply", 1)[0]
@@ -359,6 +494,9 @@ def _normalize_direct_job_url(url: str) -> str:
     elif "jobvite.com" in host and path.endswith("/apply"):
         path = path[: -len("/apply")]
         query = ""
+    elif ("recruitee.com" in host or "careers.tellent.com" in host) and path.endswith("/apply"):
+        path = path[: -len("/apply")]
+        query = ""
     elif any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
         query = ""
 
@@ -366,6 +504,126 @@ def _normalize_direct_job_url(url: str) -> str:
         path = "/"
 
     return urlunparse(parsed._replace(path=path, query=query, fragment=""))
+
+
+def _extract_company_board_identifier(url: str | None) -> str | None:
+    normalized = _normalize_direct_job_url(str(url or ""))
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    segments = _path_segments(parsed.path)
+    query = parse_qs(parsed.query)
+
+    if "greenhouse.io" in host and segments:
+        board_token = segments[0]
+        if board_token:
+            return f"greenhouse:{board_token.lower()}"
+    if "jobs.lever.co" in host and segments:
+        return f"lever:{segments[0].lower()}"
+    if "ashbyhq.com" in host and segments:
+        return f"ashby:{segments[0].lower()}"
+    if "myworkdayjobs.com" in host:
+        host_prefix = host.split(".wd", 1)[0]
+        if host_prefix:
+            return f"workday:{host_prefix.lower()}"
+    if "smartrecruiters.com" in host and segments:
+        return f"smartrecruiters:{segments[0].lower()}"
+    if "recruitee.com" in host or "careers.tellent.com" in host:
+        if len(segments) >= 2 and segments[0] == "o":
+            return f"recruitee:{segments[1].lower()}"
+    if "jobscore.com" in host:
+        host_prefix = host.split(".jobscore.com", 1)[0]
+        if host_prefix and host_prefix != host:
+            return f"jobscore:{host_prefix.lower()}"
+    for field in ("gh_jid", "gh_job_id"):
+        values = query.get(field)
+        if values and values[0].strip():
+            return f"{host}:{values[0].strip()}"
+    return None
+
+
+def _canonical_job_key(url: str | None) -> str | None:
+    normalized = _normalize_direct_job_url(str(url or ""))
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    segments = _path_segments(parsed.path)
+    query = parse_qs(parsed.query)
+    board_identifier = _extract_company_board_identifier(normalized)
+
+    if "greenhouse.io" in host:
+        job_id = None
+        gh_values = query.get("gh_jid") or query.get("gh_job_id")
+        if gh_values and gh_values[0].strip():
+            job_id = gh_values[0].strip()
+        elif "jobs" in segments:
+            try:
+                job_id = segments[segments.index("jobs") + 1]
+            except (ValueError, IndexError):
+                job_id = None
+        if board_identifier and job_id:
+            return f"{board_identifier}:{job_id}"
+
+    if "jobs.lever.co" in host and len(segments) >= 2:
+        return f"lever:{segments[0].lower()}:{segments[1].lower()}"
+
+    if "ashbyhq.com" in host and len(segments) >= 2:
+        return f"ashby:{segments[0].lower()}:{segments[1].lower()}"
+
+    if "myworkdayjobs.com" in host:
+        gh_values = query.get("gh_jid") or query.get("gh_job_id")
+        if gh_values and gh_values[0].strip():
+            return f"{board_identifier or host}:{gh_values[0].strip()}"
+        if segments:
+            tail = segments[-1]
+            if "_" in tail:
+                job_id = tail.rsplit("_", 1)[-1]
+                if job_id:
+                    return f"{board_identifier or host}:{job_id}"
+
+    if "smartrecruiters.com" in host and len(segments) >= 2:
+        return f"smartrecruiters:{segments[0].lower()}:{segments[1].lower()}"
+
+    if ("recruitee.com" in host or "careers.tellent.com" in host) and len(segments) >= 2 and segments[0] == "o":
+        return f"recruitee:{segments[1].lower()}"
+
+    if "jobscore.com" in host and segments:
+        if "jobs" in segments:
+            return f"{board_identifier or host}:{segments[-1].lower()}"
+        if "job" in segments:
+            return f"{board_identifier or host}:{segments[-1].lower()}"
+
+    return normalized
+
+
+def _job_history_key_candidates(url: str | None) -> set[str]:
+    normalized = _normalize_direct_job_url(str(url or ""))
+    candidates = {normalized} if normalized else set()
+    canonical = _canonical_job_key(url)
+    if canonical:
+        candidates.add(canonical)
+    return {candidate for candidate in candidates if candidate}
+
+
+def _job_history_primary_key(url: str | None) -> str:
+    canonical = _canonical_job_key(url)
+    if canonical:
+        return canonical
+    return _normalize_direct_job_url(str(url or ""))
+
+
+def _strip_tracking_query_params(query: str) -> str:
+    if not query:
+        return ""
+    kept_params = []
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        lowered_key = key.lower()
+        if lowered_key.startswith("utm_") or lowered_key in TRACKING_QUERY_PARAM_NAMES:
+            continue
+        kept_params.append((key, value))
+    return urlencode(kept_params, doseq=True)
 
 
 def _describe_exception(exc: BaseException) -> str:
@@ -419,6 +677,15 @@ def _looks_like_direct_ats_job_path(host: str, path: str) -> bool:
             return False
         posting_slug = segments[1]
         return bool(re.search(r"\d{6,}", posting_slug))
+
+    if "recruitee.com" in host or "careers.tellent.com" in host:
+        return len(segments) >= 2 and segments[0] == "o"
+
+    if "comeet.com" in host:
+        return "/jobs/" in f"{normalized_path}/"
+
+    if "jobscore.com" in host:
+        return "/job/" in f"{normalized_path}/" or "/jobs/" in f"{normalized_path}/"
 
     if "myworkdayjobs.com" in host:
         return "/job/" in f"{normalized_path}/"
@@ -739,6 +1006,30 @@ def _role_match_score(role_title: str, candidate_text: str) -> int:
     return score
 
 
+def _role_titles_align(expected_role_title: str | None, observed_role_title: str | None) -> bool:
+    expected = " ".join(str(expected_role_title or "").split())
+    observed = " ".join(str(observed_role_title or "").split())
+    if not expected or not observed:
+        return False
+    if expected.lower() == observed.lower():
+        return True
+
+    expected_is_ai_pm = _is_ai_related_product_manager_text(expected)
+    observed_is_ai_pm = _is_ai_related_product_manager_text(observed)
+    if expected_is_ai_pm and not observed_is_ai_pm:
+        return False
+
+    forward_score = _role_match_score(expected, observed)
+    reverse_score = _role_match_score(observed, expected)
+    if min(forward_score, reverse_score) >= 14:
+        return True
+
+    expected_tokens = set(_role_token_candidates(expected))
+    observed_tokens = set(_role_token_candidates(observed))
+    overlap = expected_tokens.intersection(observed_tokens)
+    return len(overlap) >= 4 and "product" in overlap and "manager" in overlap
+
+
 def _extract_experience_years_floor(text: str) -> int | None:
     if not text:
         return None
@@ -988,6 +1279,10 @@ def _is_supported_discovery_source_url(url: str) -> bool:
         return "/job/" in path
     if "wellfound.com" in host:
         return "/jobs/" in path
+    if "workatastartup.com" in host:
+        return "/jobs/" in path
+    if "getro.com" in host:
+        return "/companies/" in path and "/jobs/" in path
     if "ziprecruiter.com" in host:
         return "/jobs/" in path
     if "themuse.com" in host:
@@ -1034,7 +1329,42 @@ def _hint_is_recent(posted_date_hint: str | None, settings: Settings) -> bool | 
     return posted_on >= _today_for_timezone(settings.timezone) - timedelta(days=settings.posted_within_days)
 
 
-def _lead_priority(lead: JobLead, settings: Settings) -> tuple[int, int, int, int, int, int, str, str]:
+def _small_company_host_priority(hosts: list[str]) -> int:
+    normalized_hosts = [host.lower() for host in hosts if host]
+    if any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts):
+        return 0
+    if any(any(fragment in host for fragment in ENTERPRISE_ATS_HOST_FRAGMENTS) for host in normalized_hosts):
+        return 2
+    return 1
+
+
+def _lead_has_portfolio_board_source(lead: JobLead) -> bool:
+    source_url = (lead.source_url or "").lower()
+    return any(domain in source_url for domain in PORTFOLIO_BOARD_SCOUT_DOMAINS)
+
+
+def _lead_has_strong_validation_hints(lead: JobLead, settings: Settings) -> bool:
+    recent_hint = _hint_is_recent(lead.posted_date_hint, settings)
+    salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
+        lead.base_salary_min_usd_hint,
+        lead.base_salary_max_usd_hint,
+        lead.salary_text_hint,
+        lead.evidence_notes,
+    )
+    salary_values = [value for value in (salary_min, salary_max) if value is not None]
+    return (
+        lead.is_remote_hint is True
+        and recent_hint is True
+        and bool(salary_values and max(salary_values) >= settings.min_base_salary_usd)
+    )
+
+
+def _lead_host_is_js_blank_prone(lead: JobLead) -> bool:
+    host = (urlparse(lead.direct_job_url or lead.source_url).netloc or "").lower()
+    return any(fragment in host for fragment in ("myworkdayjobs.com", "careers.workday.com", "getro.com"))
+
+
+def _lead_priority(lead: JobLead, settings: Settings) -> tuple[int, int, int, int, int, int, int, str, str]:
     direct_bonus = 0 if lead.direct_job_url else 1
     source_priority = DISCOVERY_SOURCE_PRIORITY.get(lead.source_type, 9)
     if source_priority >= DISCOVERY_SOURCE_PRIORITY["other"] and _is_supported_discovery_source_url(lead.source_url):
@@ -1069,16 +1399,108 @@ def _lead_priority(lead: JobLead, settings: Settings) -> tuple[int, int, int, in
     seniority_penalty = 0 if seniority_score > 0 else 1
     remote_penalty = 0 if lead.is_remote_hint else 1
     focus_penalty = 0 if lead.source_type in {"direct_ats", "company_site"} else 1
+    structured_penalty = 0 if _lead_has_strong_validation_hints(lead, settings) else 1
+    portfolio_penalty = 0 if _lead_has_portfolio_board_source(lead) else 1
+    js_blank_penalty = 2 if _lead_host_is_js_blank_prone(lead) and not _lead_has_trusted_source_fallback_evidence(lead, settings) else 0
+    host_candidates = [
+        urlparse(lead.direct_job_url or "").netloc.lower(),
+        urlparse(lead.source_url).netloc.lower(),
+    ]
+    company_scale_penalty = _small_company_host_priority(host_candidates)
     return (
         recency_penalty,
         salary_penalty,
+        structured_penalty,
         seniority_penalty,
         remote_penalty,
         source_priority,
-        direct_bonus + focus_penalty,
+        company_scale_penalty,
+        direct_bonus + focus_penalty + portfolio_penalty + js_blank_penalty,
         lead.company_name.lower(),
         lead.role_title.lower(),
     )
+
+
+def _role_title_is_low_signal(role_title: str, evidence_notes: str = "") -> bool:
+    lowered = " ".join(part for part in (role_title, evidence_notes) if part).lower()
+    if not lowered.strip():
+        return True
+    if "product manager" not in lowered:
+        return True
+    if "strategy" in lowered or "strategist" in lowered:
+        return True
+    return any(term in lowered for term in LOW_SIGNAL_ROLE_TERMS if term not in {"strategy", "strategist"})
+
+
+def _lead_source_quality_score(
+    lead: JobLead,
+    settings: Settings,
+    watchlist_entry: dict[str, object] | None = None,
+) -> int:
+    score = 0
+    if lead.direct_job_url:
+        score += 4
+    if lead.source_type in {"direct_ats", "company_site"}:
+        score += 4
+    elif lead.source_type == "builtin":
+        score += 2
+    elif lead.source_type == "linkedin":
+        score += 1
+    if _is_supported_discovery_source_url(lead.source_url):
+        score += 2
+    if _lead_has_portfolio_board_source(lead):
+        score += 3
+    host_candidates = [
+        urlparse(lead.direct_job_url or "").netloc.lower(),
+        urlparse(lead.source_url).netloc.lower(),
+    ]
+    if _company_looks_small_from_hosts(host_candidates):
+        score += 3
+    recent_hint = _hint_is_recent(lead.posted_date_hint, settings)
+    if recent_hint is True:
+        score += 2
+    elif recent_hint is False:
+        score -= 2
+    if lead.is_remote_hint is True:
+        score += 2
+    elif lead.is_remote_hint is False:
+        score -= 3
+    if lead.base_salary_min_usd_hint or lead.base_salary_max_usd_hint or lead.salary_text_hint:
+        score += 2
+    if _lead_has_strong_validation_hints(lead, settings):
+        score += 3
+    if _lead_host_is_js_blank_prone(lead) and not _lead_has_trusted_source_fallback_evidence(lead, settings):
+        score -= 3
+    if _role_title_is_low_signal(lead.role_title, lead.evidence_notes):
+        score -= 5
+    if watchlist_entry:
+        recycle_penalty, saturation_penalty = _watchlist_focus_penalties(watchlist_entry)
+        score -= min(6, recycle_penalty // 2)
+        score -= min(4, saturation_penalty // 3)
+    return score
+
+
+def _annotate_and_filter_resolution_leads(
+    leads: list[JobLead],
+    settings: Settings,
+    company_watchlist: dict[str, dict[str, object]],
+) -> list[JobLead]:
+    annotated: list[JobLead] = []
+    for lead in leads:
+        watchlist_entry = company_watchlist.get(_normalize_company_key(lead.company_name), {})
+        source_quality_score = _lead_source_quality_score(lead, settings, watchlist_entry)
+        if source_quality_score <= 0:
+            continue
+        if source_quality_score <= 2 and _role_title_is_low_signal(lead.role_title, lead.evidence_notes):
+            continue
+        annotated.append(lead.model_copy(update={"source_quality_score_hint": source_quality_score}))
+    annotated.sort(
+        key=lambda lead: (
+            -(lead.source_quality_score_hint or 0),
+            *_lead_priority(lead, settings),
+        )
+    )
+    return annotated
 
 
 def _normalize_company_key(company_name: str | None) -> str:
@@ -1088,6 +1510,56 @@ def _normalize_company_key(company_name: str | None) -> str:
 def _company_looks_small_from_hosts(hosts: list[str]) -> bool:
     normalized_hosts = [host.lower() for host in hosts if host]
     return any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts)
+
+
+def _watchlist_reason_count(entry: dict[str, object], reason_code: str) -> int:
+    reasons = entry.get("recent_rejection_reasons")
+    if not isinstance(reasons, dict):
+        return 0
+    value = reasons.get(reason_code)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _watchlist_focus_penalties(entry: dict[str, object]) -> tuple[int, int]:
+    watch_count = max(0, int(entry.get("watch_count") or 0))
+    reason_counts = {
+        reason_code: _watchlist_reason_count(entry, reason_code) for reason_code in NON_ACTIONABLE_WATCHLIST_REASON_CODES
+    }
+    stale_count = reason_counts["stale_posting"]
+    already_reported_count = reason_counts["already_reported"]
+    not_remote_count = reason_counts["not_remote"] + reason_counts["remote_unclear"]
+    hard_failure_count = max(reason_counts.values(), default=0)
+    recycle_penalty = (
+        min(10, stale_count // 3)
+        + min(6, already_reported_count // 2)
+        + min(4, not_remote_count // 4)
+        + min(8, hard_failure_count // 6)
+    )
+    saturation_penalty = min(12, watch_count // 25)
+    return recycle_penalty, saturation_penalty
+
+
+def _watchlist_entry_is_focusable(entry: dict[str, object]) -> bool:
+    watch_count = max(0, int(entry.get("watch_count") or 0))
+    last_reason_code = str(entry.get("last_reason_code") or "")
+    reason_counts = entry.get("recent_rejection_reasons")
+    max_reason_count = 0
+    if isinstance(reason_counts, dict):
+        for value in reason_counts.values():
+            try:
+                max_reason_count = max(max_reason_count, int(value))
+            except (TypeError, ValueError):
+                continue
+    if max_reason_count >= 20:
+        return False
+    if last_reason_code in NON_ACTIONABLE_WATCHLIST_REASON_CODES and max_reason_count >= 6:
+        return False
+    if watch_count >= 30 and max_reason_count >= 4:
+        return False
+    return True
 
 
 def _select_watchlist_focus_companies(
@@ -1102,8 +1574,8 @@ def _select_watchlist_focus_companies(
         key=lambda entry: (
             0 if _normalize_company_key(entry.get("company_name")) not in known_company_keys else 1,
             0 if _company_looks_small_from_hosts([str(item) for item in entry.get("source_hosts", [])]) else 1,
+            *_watchlist_focus_penalties(entry),
             -int(entry.get("priority_score") or 0),
-            -int(entry.get("watch_count") or 0),
             str(entry.get("company_name") or "").lower(),
         ),
     )
@@ -1112,7 +1584,12 @@ def _select_watchlist_focus_companies(
     for entry in ranked_entries:
         company_name = str(entry.get("company_name") or "").strip()
         company_key = _normalize_company_key(company_name)
+        normalized_name = company_name.lower()
         if not company_name or not company_key or company_key in known_company_keys or company_key in seen_company_keys:
+            continue
+        if any(pattern in normalized_name for pattern in ("hiring for client", "confidential", "stealth startup")):
+            continue
+        if not _watchlist_entry_is_focusable(entry):
             continue
         companies.append(company_name)
         seen_company_keys.add(company_key)
@@ -1181,9 +1658,150 @@ def _build_small_company_scout_queries(settings: Settings, tuning: SearchTuning)
         for topic in topic_window:
             queries.append(f'site:{domain} "product manager" "{topic}" remote {recency_terms[0]}')
             queries.append(f'site:{domain} "senior product manager" "{topic}" remote')
+            queries.append(f'site:{domain} "staff product manager" "{topic}" remote "early stage"')
+            queries.append(f'site:{domain} "principal product manager" "{topic}" remote "portfolio company"')
+            queries.append(f'site:{domain} "{topic}" "product manager" remote "venture backed"')
             if tuning.prioritize_salary:
                 queries.append(f'site:{domain} "product manager" "{topic}" remote {salary_term}')
     return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 10)]
+
+
+def _build_portfolio_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    recency_terms = _current_recency_terms(settings.timezone)
+    topic_window = _attempt_query_window(
+        list(SMALL_COMPANY_SCOUT_TOPICS),
+        tuning.attempt_number,
+        max(3, min(5, settings.search_round_query_limit)),
+    )
+    domain_window = _attempt_query_window(
+        list(PORTFOLIO_BOARD_SCOUT_DOMAINS),
+        tuning.attempt_number,
+        max(2, min(3, settings.search_round_query_limit)),
+    )
+    queries: list[str] = []
+    for domain in domain_window:
+        for topic in topic_window:
+            queries.append(f'site:{domain} "product manager" "{topic}" remote startup')
+            queries.append(f'site:{domain} "senior product manager" "{topic}" remote')
+            queries.append(f'site:{domain} "staff product manager" "{topic}" remote "portfolio company"')
+            queries.append(f'site:{domain} "principal product manager" "{topic}" remote {recency_terms[0]}')
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 8)]
+
+
+def _default_focus_role_terms() -> list[str]:
+    return [
+        "\"AI Product Manager\"",
+        "\"Senior Product Manager, AI\"",
+        "\"Principal Product Manager, AI\"",
+        "\"Group Product Manager, AI\"",
+        "\"Staff Product Manager, AI\"",
+        "\"Senior Product Manager, Machine Learning\"",
+        "\"Principal Product Manager, Machine Learning\"",
+    ]
+
+
+def _build_focus_company_queries(
+    settings: Settings,
+    tuning: SearchTuning,
+    *,
+    include_site_domains: bool,
+) -> list[str]:
+    focus_roles = tuning.focus_roles or _default_focus_role_terms()
+    if not tuning.focus_companies or not focus_roles:
+        return []
+
+    recency_terms = _current_recency_terms(settings.timezone)
+    salary_terms = [f"\"${settings.min_base_salary_usd:,}\"", *_salary_disclosure_terms()]
+    domain_window = _attempt_query_window(
+        list(SMALL_COMPANY_SCOUT_DOMAINS),
+        tuning.attempt_number,
+        max(4, min(8, settings.search_round_query_limit + 2)),
+    )
+
+    company_groups: list[list[str]] = []
+    for company in tuning.focus_companies[:12]:
+        company_term = f"\"{company}\""
+        company_queries: list[str] = []
+        for role_term in focus_roles[:6]:
+            company_queries.append(f"{company_term} {role_term} remote")
+            company_queries.append(f"{company_term} careers {role_term} remote")
+            company_queries.append(f"{company_term} {role_term} remote {_today_for_timezone(settings.timezone).strftime('%Y')}")
+            if tuning.prioritize_recency:
+                company_queries.append(f"{company_term} {role_term} remote {recency_terms[0]}")
+            if tuning.prioritize_salary:
+                company_queries.append(f"{company_term} {role_term} remote {salary_terms[0]}")
+            if include_site_domains:
+                for domain in domain_window:
+                    company_queries.append(f"{company_term} {role_term} remote site:{domain}")
+                    if tuning.prioritize_recency:
+                        company_queries.append(f"{company_term} {role_term} remote site:{domain} {recency_terms[0]}")
+                    if tuning.prioritize_salary:
+                        company_queries.append(f"{company_term} {role_term} remote site:{domain} {salary_terms[1]}")
+        company_groups.append(
+            _dedupe_queries(company_queries)[: max(6, settings.search_round_query_limit + (2 if include_site_domains else 0))]
+        )
+
+    return _dedupe_queries(_interleave_query_groups(company_groups))
+
+
+def _build_local_small_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    recency_terms = _current_recency_terms(settings.timezone)
+    salary_term = f"\"${settings.min_base_salary_usd:,}\""
+    topic_window = _attempt_query_window(
+        list(SMALL_COMPANY_SCOUT_TOPICS),
+        tuning.attempt_number,
+        max(4, min(6, settings.search_round_query_limit)),
+    )
+    modifier_window = _attempt_query_window(
+        list(SMALL_COMPANY_LOCAL_SCOUT_MODIFIERS),
+        tuning.attempt_number,
+        max(3, min(4, settings.search_round_query_limit)),
+    )
+    queries: list[str] = []
+    for topic in topic_window:
+        for modifier in modifier_window:
+            queries.append(f'"product manager" "{topic}" remote {modifier}')
+            queries.append(f'"senior product manager" "{topic}" remote {modifier}')
+        queries.append(f'"product manager" "{topic}" remote "company careers"')
+        queries.append(f'"principal product manager" "{topic}" remote "portfolio company"')
+        queries.append(f'"staff product manager" "{topic}" remote "early stage"')
+        queries.append(f'"staff product manager" "{topic}" remote startup')
+        queries.append(f'"product manager" "{topic}" remote startup {recency_terms[0]}')
+        if tuning.prioritize_salary:
+            queries.append(f'"product manager" "{topic}" remote startup {salary_term}')
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 12)]
+
+
+def _build_local_targeted_attempt_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    role_pool = [
+        "AI product manager",
+        "machine learning product manager",
+        "generative AI product manager",
+        "AI/ML product manager",
+        "senior product manager AI",
+        "staff product manager AI",
+        "principal product manager AI",
+        "group product manager AI",
+        "lead product manager AI",
+        "AI platform product manager",
+        "agentic AI product manager",
+        "technical product manager AI",
+    ]
+    recency_terms = _current_recency_terms(settings.timezone)
+    salary_term = f"\"${settings.min_base_salary_usd:,}\""
+    role_batch = _role_query_batch_for_attempt(
+        role_pool,
+        tuning.attempt_number,
+        batch_size=max(4, settings.search_round_query_limit),
+    )
+    queries: list[str] = []
+    for role_query in role_batch:
+        queries.append(f"{role_query} remote")
+        queries.append(f"{role_query} remote careers")
+        queries.append(f"{role_query} remote {recency_terms[0]}")
+        if tuning.prioritize_salary:
+            queries.append(f"{role_query} remote {salary_term}")
+    return _dedupe_queries(queries)
 
 
 def _base_role_queries() -> list[str]:
@@ -1470,6 +2088,9 @@ def _build_targeted_attempt_queries(settings: Settings, tuning: SearchTuning) ->
         "job-boards.greenhouse.io",
         "jobs.lever.co",
         "jobs.ashbyhq.com",
+        "jobs.recruitee.com",
+        "careers.tellent.com",
+        "jobscore.com",
         "myworkdayjobs.com",
         "jobs.smartrecruiters.com",
         "jobs.jobvite.com",
@@ -1489,11 +2110,16 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
     tuning = tuning or SearchTuning(attempt_number=1)
     role_queries = _base_role_queries()
     scout_queries = _build_small_company_scout_queries(settings, tuning)
+    portfolio_scout_queries = _build_portfolio_company_scout_queries(settings, tuning)
     ats_domains = [
         "boards.greenhouse.io",
         "job-boards.greenhouse.io",
         "jobs.lever.co",
         "jobs.ashbyhq.com",
+        "jobs.recruitee.com",
+        "careers.tellent.com/o",
+        "jobscore.com",
+        "comeet.com/jobs",
         "myworkdayjobs.com",
         "jobs.smartrecruiters.com",
         "jobs.jobvite.com",
@@ -1558,26 +2184,10 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
                 salary_queries.append(f"{role_query} {salary_region} \"salary\"")
                 salary_queries.append(f"{role_query} {salary_region} \"base salary\"")
 
-    focus_roles = tuning.focus_roles or [
-        "\"AI Product Manager\"",
-        "\"Senior Product Manager, AI\"",
-        "\"Principal Product Manager, AI\"",
-        "\"Group Product Manager, AI\"",
-        "\"Staff Product Manager, AI\"",
-        "\"Senior Product Manager, Machine Learning\"",
-        "\"Principal Product Manager, Machine Learning\"",
-    ]
+    focus_queries.extend(_build_focus_company_queries(settings, tuning, include_site_domains=True))
     for company in tuning.focus_companies[:10]:
         company_term = f"\"{company}\""
-        for role_term in focus_roles[:6]:
-            focus_queries.append(f"{company_term} {role_term} remote")
-            focus_queries.append(f"{company_term} {role_term} remote {_today_for_timezone(settings.timezone).strftime('%Y')}")
-            for domain in ats_domains:
-                focus_queries.append(f"{company_term} {role_term} remote site:{domain}")
-                if tuning.prioritize_recency:
-                    focus_queries.append(f"{company_term} {role_term} remote site:{domain} {recency_terms[0]}")
-                if tuning.prioritize_salary:
-                    focus_queries.append(f"{company_term} {role_term} remote site:{domain} {salary_terms[1]}")
+        for role_term in (tuning.focus_roles or _default_focus_role_terms())[:6]:
             for domain in discovery_domains:
                 focus_queries.append(f"site:{domain} {company_term} {role_term} remote")
 
@@ -1593,6 +2203,7 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
 
     queries = [
         *focus_queries,
+        *portfolio_scout_queries,
         *scout_queries,
         *_interleave_query_groups(query_groups),
     ]
@@ -1618,19 +2229,25 @@ def _build_query_rounds(settings: Settings, tuning: SearchTuning | None = None) 
 def _build_local_query_rounds(settings: Settings, tuning: SearchTuning | None = None) -> list[list[str]]:
     tuning = tuning or SearchTuning(attempt_number=1)
     local_role_queries = _build_local_role_queries()
-    scout_queries = _build_small_company_scout_queries(settings, tuning)
+    scout_queries = _build_local_small_company_scout_queries(settings, tuning)
+    portfolio_scout_queries = _build_portfolio_company_scout_queries(settings, tuning)
     per_attempt_budget = settings.max_search_rounds * settings.search_round_query_limit
 
     focused_roles = _dedupe_queries((tuning.focus_roles or [])[:6])
-    targeted_queries = _build_targeted_attempt_queries(settings, tuning)[:per_attempt_budget]
+    focus_company_queries = _build_focus_company_queries(settings, tuning, include_site_domains=False)
+    targeted_queries = _build_local_targeted_attempt_queries(settings, tuning)[:per_attempt_budget]
     local_window = _attempt_query_window(local_role_queries, tuning.attempt_number, per_attempt_budget)
     query_bank = [
         *focused_roles,
-        *scout_queries,
-        *_interleave_query_groups([
-            targeted_queries,
-            local_window,
-        ]),
+        *_interleave_query_groups(
+            [
+                focus_company_queries,
+                portfolio_scout_queries,
+                scout_queries,
+                targeted_queries,
+                local_window,
+            ]
+        ),
     ]
     query_bank = _dedupe_queries(query_bank)
     limited_bank = query_bank[:per_attempt_budget]
@@ -1899,6 +2516,57 @@ def _extract_salary_hint(text: str) -> tuple[int | None, int | None, str | None]
     return None, None, None
 
 
+def _hydrate_salary_hint_values(
+    min_value: int | None,
+    max_value: int | None,
+    salary_text: str | None,
+    *fallback_texts: str | None,
+) -> tuple[int | None, int | None, str | None]:
+    if min_value is not None or max_value is not None:
+        return min_value, max_value, salary_text
+    for candidate_text in (salary_text, *fallback_texts):
+        parsed_min, parsed_max, parsed_text = _extract_salary_hint(candidate_text or "")
+        if parsed_min is not None or parsed_max is not None:
+            return parsed_min, parsed_max, salary_text or parsed_text
+    return min_value, max_value, salary_text
+
+
+def _normalize_remote_region_hint(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = re.sub(r"[^a-z0-9 ,/&-]", " ", value.lower())
+    normalized = re.sub(r"\b(?:the|state of|area|metro|metropolitan)\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" ,-/")
+    if not normalized:
+        return None
+    if normalized in {"united states", "united states of america", "usa", "us", "u s", "worldwide", "global"}:
+        return None
+    if normalized in {"north america", "north american"}:
+        return None
+    return normalized
+
+
+def _extract_geo_limited_remote_region(text: str | None) -> str | None:
+    normalized_text = " ".join(str(text or "").split()).lower()
+    if "remote" not in normalized_text:
+        return None
+    patterns = (
+        r"\bonly considering candidates who reside in (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
+        r"\bmust (?:reside|live|be based|be located|work) in (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
+        r"\bremote (?:within|from|in) (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
+        r"\bcandidates must be located in (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
+        r"\b(?P<region>california|new york|washington|texas|illinois|massachusetts|florida|san francisco(?: bay)?|new york city|los angeles|seattle|boston|chicago)\s+only\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized_text)
+        if not match:
+            continue
+        region = _normalize_remote_region_hint(match.group("region"))
+        if region:
+            return region
+    return None
+
+
 def _extract_posted_hint(text: str) -> str | None:
     match = re.search(r"(today|yesterday|\d+\s+(?:day|days|week|weeks)\s+ago|posted this week)", text, re.I)
     if match:
@@ -1958,6 +2626,14 @@ def _company_hint_from_url(url: str) -> str:
         return path_segments[1].replace("-", " ").title()
     if "getro.com" in host and len(path_segments) >= 2 and path_segments[0] == "companies":
         return path_segments[1].replace("-", " ").title()
+    if "jobscore.com" in host:
+        if len(path_segments) >= 2 and path_segments[0] == "careers":
+            return path_segments[1].replace("-", " ").title()
+        host_prefix = host.split(".jobscore.com", 1)[0]
+        if host_prefix and host_prefix != host:
+            return host_prefix.replace("-", " ").title()
+    if "careers.tellent.com" in host and len(path_segments) >= 2 and path_segments[0] == "o":
+        return path_segments[1].replace("-", " ").title()
     if "myworkdayjobs.com" in host:
         if (
             len(path_segments) >= 2
@@ -2009,6 +2685,14 @@ def _extract_role_company_from_title(title: str, url: str) -> tuple[str, str]:
     greenhouse_match = re.search(r"(?P<role>.+?)\s+at\s+(?P<company>.+)$", cleaned, re.I)
     if "job application for" in title.lower() and greenhouse_match:
         return greenhouse_match.group("company").strip(), greenhouse_match.group("role").strip()
+
+    jobscore_match = re.search(
+        r"Share the\s+(?P<role>.+?)\s+open at\s+(?P<company>.+?)\s+in\s+(?P<location>.+?)(?:, powered by JobScore|[.])",
+        cleaned,
+        re.I,
+    )
+    if jobscore_match:
+        return jobscore_match.group("company").strip(), jobscore_match.group("role").strip()
 
     ats_at_match = re.search(r"(?P<role>[A-Za-z0-9,&()/'’.\- ]*product manager[^@|]*)\s+@\s+(?P<company>[^|]+)$", cleaned, re.I)
     if ats_at_match:
@@ -2739,6 +3423,13 @@ def _extract_builtin_remote_hint(
     return None
 
 
+def _remote_restriction_note(*texts: str | None) -> str | None:
+    region = _extract_geo_limited_remote_region(" ".join(part for part in texts if part))
+    if not region:
+        return None
+    return f"Remote restriction: {region.title()} only."
+
+
 def _stable_text_index(text: str, modulo: int) -> int:
     if modulo <= 0:
         return 0
@@ -2872,6 +3563,10 @@ async def _fetch_builtin_job_lead(
         description_text,
         source_is_remote_listing=source_is_remote_listing,
     )
+    remote_restriction_note = _remote_restriction_note(location_text, description_text)
+    location_hint = location_text or ("Remote" if is_remote else None)
+    if remote_restriction_note and is_remote:
+        location_hint = f"Remote - {remote_restriction_note.split(': ', 1)[1].rstrip('.')}"
 
     lead = JobLead(
         company_name=company_name,
@@ -2879,14 +3574,23 @@ async def _fetch_builtin_job_lead(
         source_url=detail_url,
         source_type="builtin",
         direct_job_url=_normalize_direct_job_url(direct_url) if direct_url else None,
-        location_hint=location_text or ("Remote" if is_remote else None),
+        location_hint=location_hint,
         posted_date_hint=posted_hint,
         is_remote_hint=is_remote,
         base_salary_min_usd_hint=salary_min,
         base_salary_max_usd_hint=salary_max,
         salary_text_hint=salary_text,
         source_query=query,
-        evidence_notes=(description_text or description_hint or f"Built In result for '{query}'.")[:400],
+        evidence_notes=(
+            " ".join(
+                part
+                for part in (
+                    remote_restriction_note,
+                    description_text or description_hint or f"Built In result for '{query}'.",
+                )
+                if part
+            )
+        )[:500],
     )
     BUILTIN_LEAD_CACHE[detail_url] = lead.model_copy(update={"source_query": ""})
     return lead
@@ -3194,6 +3898,7 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
     source_url = failure.source_url or direct_job_url
     if not source_url.startswith(("http://", "https://")):
         source_url = direct_job_url
+    salary_min, salary_max, salary_text = _hydrate_salary_hint_values(None, None, failure.salary_text, failure.detail)
     lead = JobLead(
         company_name=failure.company_name,
         role_title=failure.role_title,
@@ -3203,7 +3908,9 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
         location_hint="Remote" if failure.is_remote else None,
         posted_date_hint=failure.posted_date_text,
         is_remote_hint=failure.is_remote,
-        salary_text_hint=failure.salary_text,
+        base_salary_min_usd_hint=salary_min,
+        base_salary_max_usd_hint=salary_max,
+        salary_text_hint=salary_text,
         source_query=failure.source_query,
         evidence_notes=(failure.detail or "Historical lead from prior diagnostics.")[:400],
     )
@@ -3297,6 +4004,7 @@ async def _replay_seed_leads(
     *,
     settings: Settings,
     diagnostics: SearchDiagnostics,
+    company_watchlist: dict[str, dict[str, object]],
     jobs_by_url: dict[str, JobPosting],
     previously_reported_company_keys: set[str],
     previously_reported_job_keys: set[str],
@@ -3308,6 +4016,7 @@ async def _replay_seed_leads(
     resolution_agent: Agent | None,
     attempt_number: int,
     status: StatusReporter | None,
+    run_id: str | None = None,
 ) -> tuple[int, int]:
     if not seed_leads:
         return total_unique_leads, resolved_leads_this_attempt
@@ -3322,6 +4031,7 @@ async def _replay_seed_leads(
         fresh_seed_leads.append(lead)
 
     fresh_seed_leads = _dedupe_round_leads(fresh_seed_leads, settings)
+    fresh_seed_leads = _annotate_and_filter_resolution_leads(fresh_seed_leads, settings, company_watchlist)
     seed_replay_cap = min(
         len(fresh_seed_leads),
         max(settings.max_leads_per_query * 4, settings.max_leads_to_resolve_per_pass // 2),
@@ -3355,31 +4065,50 @@ async def _replay_seed_leads(
             round_number=0,
         )
         if precheck_failure is not None:
-            _record_failure_live(
+            _record_failure_with_followups(
                 settings,
                 diagnostics,
                 precheck_failure,
                 unique_leads_discovered=total_unique_leads,
+                lead=lead,
+                audit_entry=_build_false_negative_audit_entry(lead, precheck_failure),
+                run_id=run_id,
             )
             continue
 
         if not lead.direct_job_url or not _is_allowed_direct_job_url(lead.direct_job_url):
-            _record_failure_live(
+            failure = _make_failure(
+                stage="resolution",
+                reason_code="resolution_missing",
+                detail="Seeded lead did not contain a valid direct ATS URL.",
+                lead=lead,
+                attempt_number=attempt_number,
+                round_number=0,
+            )
+            candidate = _build_candidate_job(
+                lead,
+                DirectJobResolution(
+                    accepted=True,
+                    direct_job_url=lead.source_url,
+                    ats_platform=urlparse(lead.source_url).netloc or "Unknown",
+                    evidence_notes="Near-miss fallback from seed replay.",
+                ),
+            )
+            near_miss = _build_near_miss(lead, candidate, failure, settings)
+            _record_failure_with_followups(
                 settings,
                 diagnostics,
-                _make_failure(
-                    stage="resolution",
-                    reason_code="resolution_missing",
-                    detail="Seeded lead did not contain a valid direct ATS URL.",
-                    lead=lead,
-                    attempt_number=attempt_number,
-                    round_number=0,
-                ),
+                failure,
                 unique_leads_discovered=total_unique_leads,
+                lead=lead,
+                candidate=candidate,
+                near_miss=near_miss,
+                audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate, near_miss=near_miss),
+                run_id=run_id,
             )
             continue
 
-        if _normalize_direct_job_url(lead.direct_job_url) in previously_reported_job_keys:
+        if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(lead.direct_job_url)):
             _record_failure_live(
                 settings,
                 diagnostics,
@@ -3419,7 +4148,7 @@ async def _replay_seed_leads(
             ),
         )
         try:
-            validated, validation_failure = await asyncio.wait_for(
+            validated, validation_failure, near_miss, audit_entry = await asyncio.wait_for(
                 _validate_candidate(
                     lead,
                     candidate,
@@ -3431,46 +4160,61 @@ async def _replay_seed_leads(
                 timeout=lead_timeout_seconds,
             )
         except asyncio.TimeoutError:
-            _record_failure_live(
+            failure = _make_failure(
+                stage="validation",
+                reason_code="validation_timeout",
+                detail=f"Validation timed out after {lead_timeout_seconds}s.",
+                lead=lead,
+                direct_job_url=str(candidate.direct_job_url),
+                candidate=candidate,
+                attempt_number=attempt_number,
+                round_number=0,
+            )
+            _record_failure_with_followups(
                 settings,
                 diagnostics,
-                _make_failure(
-                    stage="validation",
-                    reason_code="validation_timeout",
-                    detail=f"Validation timed out after {lead_timeout_seconds}s.",
-                    lead=lead,
-                    direct_job_url=str(candidate.direct_job_url),
-                    candidate=candidate,
-                    attempt_number=attempt_number,
-                    round_number=0,
-                ),
+                failure,
                 unique_leads_discovered=total_unique_leads,
+                lead=lead,
+                candidate=candidate,
+                audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate),
+                run_id=run_id,
             )
             continue
         except Exception as exc:
-            _record_failure_live(
+            failure = _make_failure(
+                stage="validation",
+                reason_code="validation_error",
+                detail=f"Validation failed with an exception: {exc}",
+                lead=lead,
+                direct_job_url=str(candidate.direct_job_url),
+                candidate=candidate,
+                attempt_number=attempt_number,
+                round_number=0,
+            )
+            _record_failure_with_followups(
                 settings,
                 diagnostics,
-                _make_failure(
-                    stage="validation",
-                    reason_code="validation_error",
-                    detail=f"Validation failed with an exception: {exc}",
-                    lead=lead,
-                    direct_job_url=str(candidate.direct_job_url),
-                    candidate=candidate,
-                    attempt_number=attempt_number,
-                    round_number=0,
-                ),
+                failure,
                 unique_leads_discovered=total_unique_leads,
+                lead=lead,
+                candidate=candidate,
+                audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate),
+                run_id=run_id,
             )
             continue
 
         if validation_failure is not None:
-            _record_failure_live(
+            _record_failure_with_followups(
                 settings,
                 diagnostics,
                 validation_failure,
                 unique_leads_discovered=total_unique_leads,
+                lead=lead,
+                candidate=candidate,
+                near_miss=near_miss,
+                audit_entry=audit_entry,
+                run_id=run_id,
             )
             continue
 
@@ -3478,7 +4222,7 @@ async def _replay_seed_leads(
             continue
 
         validated_key = _job_posting_dedupe_key(validated)
-        if validated_key in previously_reported_job_keys:
+        if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(validated.resolved_job_url or validated.direct_job_url)):
             _record_failure_live(
                 settings,
                 diagnostics,
@@ -3528,6 +4272,12 @@ def _build_lead_from_search_result(url: str, title: str, snippet: str, query: st
         is_remote = True
     else:
         is_remote = None
+    remote_restriction_note = _remote_restriction_note(title, snippet)
+    location_hint = None
+    if is_remote:
+        location_hint = "Remote"
+        if remote_restriction_note:
+            location_hint = f"Remote - {remote_restriction_note.split(': ', 1)[1].rstrip('.')}"
 
     lead = JobLead(
         company_name=company_name or "Unknown",
@@ -3535,14 +4285,17 @@ def _build_lead_from_search_result(url: str, title: str, snippet: str, query: st
         source_url=normalized_url,
         source_type=source_type,
         direct_job_url=direct_url,
-        location_hint="Remote" if is_remote else None,
+        location_hint=location_hint,
         posted_date_hint=posted_hint,
         is_remote_hint=is_remote,
         base_salary_min_usd_hint=salary_min,
         base_salary_max_usd_hint=salary_max,
         salary_text_hint=salary_text,
         source_query=query,
-        evidence_notes=snippet[:400] if snippet else f"Search match from query '{query}'.",
+        evidence_notes=(
+            " ".join(part for part in (remote_restriction_note, snippet[:400] if snippet else "") if part)
+            or f"Search match from query '{query}'."
+        ),
     )
     return lead
 
@@ -3580,6 +4333,8 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
             f"{normalized} remote",
             f'{normalized} "$200,000"',
             f'{normalized} "posted this week"',
+            f'site:workatastartup.com/jobs {normalized} remote',
+            f'site:getro.com/companies {normalized} remote',
         ]
     )
 
@@ -3625,8 +4380,25 @@ async def _run_local_search_engine_queries(query: str, *, max_results_per_query:
     return merged_results
 
 
-async def _cleanup_local_leads_with_ollama(settings: Settings, query: str, leads: list[JobLead]) -> list[JobLead]:
+async def _cleanup_local_leads_with_ollama(
+    settings: Settings,
+    query: str,
+    leads: list[JobLead],
+    *,
+    run_id: str | None = None,
+) -> list[JobLead]:
     if not leads or settings.llm_provider != "ollama":
+        return leads
+    if settings.ollama_degraded_for_run:
+        record_ollama_event(
+            settings,
+            "ollama_degraded_skip",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            reason=settings.ollama_degraded_reason,
+            skipped_count=len(leads),
+        )
         return leads
     provider = OllamaStructuredProvider(settings)
     prompt = f"""
@@ -3647,9 +4419,39 @@ Candidates:
                 system_prompt="You clean job lead candidates into strict structured output.",
                 user_prompt=prompt,
                 schema=JobLeadSearchResult,
+                run_id=run_id,
+                caller="lead_refinement",
+                prompt_category="lead_cleanup",
             )
-        return output.leads
+        cleaned = [lead.model_copy(update={"refined_by_ollama": True}) for lead in output.leads]
+        record_ollama_event(
+            settings,
+            "lead_refinement_outcome",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            query=query,
+            proposed_lead_count=len(leads),
+            returned_lead_count=len(cleaned),
+            schema_valid_count=len(cleaned),
+            used_output_count=len(cleaned),
+            discarded_output_count=0,
+        )
+        return cleaned
     except LLMProviderError:
+        record_ollama_event(
+            settings,
+            "lead_refinement_outcome",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            query=query,
+            proposed_lead_count=len(leads),
+            returned_lead_count=0,
+            schema_valid_count=0,
+            used_output_count=0,
+            discarded_output_count=len(leads),
+        )
         return leads
 
 
@@ -3659,8 +4461,9 @@ async def _refine_local_leads_with_ollama(
     candidate_pool: list[JobLead],
     *,
     cleanup_limit: int,
+    run_id: str | None = None,
 ) -> list[JobLead]:
-    if not candidate_pool or settings.llm_provider != "ollama":
+    if not candidate_pool or settings.llm_provider != "ollama" or settings.ollama_degraded_for_run:
         return candidate_pool
 
     cleanup_candidates = _deterministic_trim_local_leads(
@@ -3669,11 +4472,28 @@ async def _refine_local_leads_with_ollama(
         candidate_pool,
         limit=max(1, cleanup_limit),
     )
-    cleaned_leads = await _cleanup_local_leads_with_ollama(settings, query, cleanup_candidates)
+    if run_id is None:
+        cleaned_leads = await _cleanup_local_leads_with_ollama(settings, query, cleanup_candidates)
+    else:
+        cleaned_leads = await _cleanup_local_leads_with_ollama(settings, query, cleanup_candidates, run_id=run_id)
     normalized_cleaned = _normalize_and_filter_discovery_leads(cleaned_leads, query)
     if not normalized_cleaned:
         return candidate_pool
-    return _merge_and_dedupe_leads(normalized_cleaned, candidate_pool)
+    merged = _merge_and_dedupe_leads(normalized_cleaned, candidate_pool)
+    record_ollama_event(
+        settings,
+        "lead_refinement_outcome",
+        run_id=run_id,
+        caller="lead_refinement",
+        prompt_category="lead_merge",
+        query=query,
+        proposed_lead_count=len(candidate_pool),
+        returned_lead_count=len(normalized_cleaned),
+        merged_lead_count=len(merged),
+        used_output_count=len(normalized_cleaned),
+        discarded_output_count=max(0, len(candidate_pool) - len(merged)),
+    )
+    return merged
 
 
 def _merge_and_dedupe_leads(*groups: list[JobLead]) -> list[JobLead]:
@@ -3698,7 +4518,12 @@ Find high-confidence AI-related Product Manager leads and return concise structu
     return _normalize_and_filter_discovery_leads(result.final_output.leads, query)
 
 
-async def _search_single_query_local(settings: Settings, query: str) -> tuple[list[JobLead], float]:
+async def _search_single_query_local(
+    settings: Settings,
+    query: str,
+    *,
+    run_id: str | None = None,
+) -> tuple[list[JobLead], float]:
     async def _run_named(name: str, coro, *, timeout_seconds: float | None = None):
         try:
             if timeout_seconds is not None:
@@ -3792,6 +4617,7 @@ async def _search_single_query_local(settings: Settings, query: str) -> tuple[li
             query,
             candidate_pool,
             cleanup_limit=max(settings.max_leads_per_query, 8),
+            run_id=run_id,
         )
         normalized = _deterministic_trim_local_leads(settings, query, refined_pool)
         normalized_confidences = [_lead_confidence(lead) for lead in normalized]
@@ -3800,9 +4626,15 @@ async def _search_single_query_local(settings: Settings, query: str) -> tuple[li
     return normalized, average_confidence
 
 
-async def _search_single_query(agent: Agent | None, settings: Settings, query: str) -> list[JobLead]:
+async def _search_single_query(
+    agent: Agent | None,
+    settings: Settings,
+    query: str,
+    *,
+    run_id: str | None = None,
+) -> list[JobLead]:
     if settings.llm_provider == "ollama":
-        local_leads, confidence = await _search_single_query_local(settings, query)
+        local_leads, confidence = await _search_single_query_local(settings, query, run_id=run_id)
         should_fallback = (
             settings.use_openai_fallback
             and agent is not None
@@ -3823,9 +4655,14 @@ async def _search_query_with_context(
     settings: Settings,
     query: str,
     timeout_seconds: int,
+    *,
+    run_id: str | None = None,
 ) -> tuple[str, list[JobLead]]:
     try:
-        return query, await asyncio.wait_for(_search_single_query(agent, settings, query), timeout=timeout_seconds)
+        return query, await asyncio.wait_for(
+            _search_single_query(agent, settings, query, run_id=run_id),
+            timeout=timeout_seconds,
+        )
     except asyncio.TimeoutError as exc:
         raise SearchQueryTimeoutError(query) from exc
     except Exception as exc:
@@ -3863,11 +4700,17 @@ Find a different exact direct ATS/company-careers posting URL for:
 
 def _build_candidate_job(lead: JobLead, resolution: DirectJobResolution) -> JobPosting:
     direct_job_url = _normalize_direct_job_url(resolution.direct_job_url or lead.direct_job_url or lead.source_url)
+    salary_min_hint, salary_max_hint, salary_text_hint = _hydrate_salary_hint_values(
+        lead.base_salary_min_usd_hint,
+        lead.base_salary_max_usd_hint,
+        lead.salary_text_hint,
+        lead.evidence_notes,
+    )
     evidence_lines = [lead.evidence_notes, resolution.evidence_notes]
     if lead.posted_date_hint:
         evidence_lines.append(f"Posted hint: {lead.posted_date_hint}")
-    if lead.salary_text_hint:
-        evidence_lines.append(f"Salary hint: {lead.salary_text_hint}")
+    if salary_text_hint:
+        evidence_lines.append(f"Salary hint: {salary_text_hint}")
     if lead.is_remote_hint:
         evidence_lines.append("Remote hint from discovery source.")
     return JobPosting(
@@ -3880,12 +4723,14 @@ def _build_candidate_job(lead: JobLead, resolution: DirectJobResolution) -> JobP
         is_fully_remote=lead.is_remote_hint,
         posted_date_text=lead.posted_date_hint or "",
         posted_date_iso=None,
-        base_salary_min_usd=lead.base_salary_min_usd_hint,
-        base_salary_max_usd=lead.base_salary_max_usd_hint,
-        salary_text=lead.salary_text_hint,
+        base_salary_min_usd=salary_min_hint,
+        base_salary_max_usd=salary_max_hint,
+        salary_text=salary_text_hint,
         source_query=lead.source_query,
         evidence_notes=" ".join(part for part in evidence_lines if part).strip(),
         validation_evidence=[],
+        lead_refined_by_ollama=lead.refined_by_ollama,
+        source_quality_score=lead.source_quality_score_hint,
     )
 
 
@@ -3895,7 +4740,7 @@ def _lead_dedupe_key(lead: JobLead) -> str:
 
 
 def _job_posting_dedupe_key(job: JobPosting) -> str:
-    return _normalize_direct_job_url(str(job.resolved_job_url or job.direct_job_url))
+    return _job_history_primary_key(str(job.resolved_job_url or job.direct_job_url))
 
 
 def _url_candidate_score(url: str, anchor_text: str, lead: JobLead) -> tuple[int, int]:
@@ -4207,9 +5052,192 @@ def _make_failure(
         posted_date_text=posted_date_text,
         salary_text=salary_text,
         is_remote=is_remote,
+        lead_refined_by_ollama=lead.refined_by_ollama if lead else (candidate.lead_refined_by_ollama if candidate else None),
+        source_quality_score=(
+            lead.source_quality_score_hint if lead and lead.source_quality_score_hint is not None else candidate.source_quality_score if candidate else None
+        ),
         attempt_number=attempt_number,
         round_number=round_number,
     )
+
+
+def _is_close_salary_miss(job: JobPosting, settings: Settings) -> bool:
+    salary_values = _salary_values(job)
+    return bool(salary_values and max(salary_values) >= settings.min_base_salary_usd - CLOSE_MISS_SALARY_BUFFER_USD)
+
+
+def _is_close_stale_miss(job: JobPosting, settings: Settings) -> bool:
+    posted_text = job.posted_date_text or ""
+    return (
+        not _is_recent_enough(job.posted_date_iso, posted_text, settings.posted_within_days, timezone_name=settings.timezone)
+        and _is_recent_enough(
+            job.posted_date_iso,
+            posted_text,
+            settings.posted_within_days + NEAR_MISS_STALE_BUFFER_DAYS,
+            timezone_name=settings.timezone,
+        )
+    )
+
+
+def _near_miss_why_close(reason_code: str, job: JobPosting) -> str:
+    if reason_code == "remote_unclear":
+        return "The role otherwise looked strong, but the page did not state fully remote status clearly enough."
+    if reason_code == "missing_salary":
+        return "The role looked like a strong AI PM fit on a real company page, but compensation was not disclosed."
+    if reason_code == "salary_below_min":
+        return "The role looked strong and came close to the salary threshold, but the listed base range landed slightly below target."
+    if reason_code == "stale_posting":
+        return "The role looked strong and direct, but the posting date landed just outside the freshness window."
+    if reason_code == "fetch_non_200":
+        return "Discovery found a strong direct role, but the final page could not be fetched successfully during validation."
+    if reason_code == "resolution_missing":
+        return "Discovery surfaced a strong role, but the direct ATS page could not be resolved deterministically."
+    return f"The role was close, but failed validation with {reason_code}."
+
+
+def _build_near_miss(
+    lead: JobLead,
+    job: JobPosting,
+    failure: SearchFailure,
+    settings: Settings,
+) -> NearMissJob | None:
+    if failure.reason_code not in NEAR_MISS_REASON_CODES:
+        return None
+    if not _lead_is_ai_related_product_manager(lead) and not _is_ai_related_product_manager(job):
+        return None
+    if _role_title_is_low_signal(job.role_title, job.evidence_notes):
+        return None
+    direct_url = str(job.resolved_job_url or job.direct_job_url or "")
+    if direct_url and (not _is_allowed_direct_job_url(direct_url) or _looks_like_generic_job_url(direct_url)):
+        return None
+    if failure.reason_code == "salary_below_min" and not _is_close_salary_miss(job, settings):
+        return None
+    if failure.reason_code == "stale_posting" and not _is_close_stale_miss(job, settings):
+        return None
+    source_quality_score = max(
+        lead.source_quality_score_hint or 0,
+        job.source_quality_score or 0,
+        _lead_source_quality_score(lead, settings),
+    )
+    if source_quality_score < 3:
+        return None
+    supporting_evidence = list(
+        dict.fromkeys(
+            [
+                lead.evidence_notes,
+                job.evidence_notes,
+                *(job.validation_evidence or []),
+            ]
+        )
+    )[:8]
+    return NearMissJob(
+        company_name=job.company_name,
+        role_title=job.role_title,
+        reason_code=failure.reason_code,
+        detail=failure.detail,
+        why_close=_near_miss_why_close(failure.reason_code, job),
+        source_url=lead.source_url,
+        direct_job_url=direct_url or None,
+        source_type=lead.source_type,
+        ats_platform=job.ats_platform,
+        posted_date_text=job.posted_date_text,
+        salary_text=job.salary_text,
+        is_remote=job.is_fully_remote,
+        supporting_evidence=supporting_evidence,
+        validation_evidence=list(job.validation_evidence)[:8],
+        close_score=source_quality_score + (2 if failure.reason_code in {"remote_unclear", "missing_salary"} else 0),
+        source_quality_score=source_quality_score,
+        attempt_number=failure.attempt_number,
+        round_number=failure.round_number,
+    )
+
+
+def _build_false_negative_audit_entry(
+    lead: JobLead,
+    failure: SearchFailure,
+    *,
+    candidate: JobPosting | None = None,
+    near_miss: NearMissJob | None = None,
+) -> FalseNegativeAuditEntry | None:
+    if failure.reason_code not in FALSE_NEGATIVE_AUDIT_REASON_CODES:
+        return None
+    verdict = "correct_rejection"
+    notes = failure.detail
+    role_title = candidate.role_title if candidate else lead.role_title
+    if near_miss is not None:
+        verdict = "near_miss"
+        notes = near_miss.why_close
+    elif failure.reason_code in {"fetch_non_200", "resolution_missing"}:
+        verdict = "fixable"
+        notes = "A strong discovery hit was blocked by URL resolution or page fetch reliability, not by role quality."
+    elif failure.reason_code == "remote_unclear":
+        verdict = "fixable"
+        notes = "Remote evidence may be recoverable with better parsing or a cleaner direct page fetch."
+    elif failure.reason_code == "salary_below_min" and candidate is not None and _contains_ai_signal(candidate.role_title):
+        verdict = "fixable"
+        notes = "Salary evidence may be incomplete or split across page fragments; re-check this title in audits."
+    elif failure.reason_code == "not_ai_product_manager":
+        haystack = " ".join(
+            part
+            for part in (
+                role_title,
+                candidate.job_page_title if candidate else "",
+                " ".join(candidate.validation_evidence) if candidate else lead.evidence_notes,
+            )
+            if part
+        )
+        if "product manager" in haystack.lower() and _contains_ai_signal(haystack):
+            verdict = "fixable"
+            notes = "The title still carries PM and AI signal; this rejection belongs in the false-negative audit set."
+    return FalseNegativeAuditEntry(
+        reason_code=failure.reason_code,
+        verdict=verdict,  # type: ignore[arg-type]
+        company_name=failure.company_name,
+        role_title=role_title,
+        detail=failure.detail,
+        notes=notes,
+        source_url=failure.source_url,
+        direct_job_url=failure.direct_job_url,
+        salary_text=failure.salary_text,
+        posted_date_text=failure.posted_date_text,
+        is_remote=failure.is_remote,
+        attempt_number=failure.attempt_number,
+        round_number=failure.round_number,
+    )
+
+
+def _record_false_negative_audit(diagnostics: SearchDiagnostics, audit_entry: FalseNegativeAuditEntry | None) -> None:
+    if audit_entry is None:
+        return
+    key = (
+        audit_entry.reason_code,
+        _normalize_company_key(audit_entry.company_name),
+        _normalize_company_key(audit_entry.role_title),
+    )
+    existing_keys = {
+        (
+            item.reason_code,
+            _normalize_company_key(item.company_name),
+            _normalize_company_key(item.role_title),
+        )
+        for item in diagnostics.false_negative_audit
+    }
+    if key in existing_keys:
+        return
+    diagnostics.false_negative_audit.append(audit_entry)
+
+
+def _record_near_miss(diagnostics: SearchDiagnostics, near_miss: NearMissJob | None) -> None:
+    if near_miss is None:
+        return
+    key = _normalize_job_key(near_miss.company_name, near_miss.role_title)
+    existing_keys = {
+        _normalize_job_key(item.company_name, item.role_title)
+        for item in diagnostics.near_misses
+    }
+    if key in existing_keys:
+        return
+    diagnostics.near_misses.append(near_miss)
 
 
 def _record_failure(diagnostics: SearchDiagnostics, failure: SearchFailure) -> None:
@@ -4226,6 +5254,42 @@ def _record_failure_live(
     if unique_leads_discovered is not None:
         diagnostics.unique_leads_discovered = unique_leads_discovered
     _record_failure(diagnostics, failure)
+    _persist_search_diagnostics(settings, diagnostics)
+
+
+def _record_failure_with_followups(
+    settings: Settings,
+    diagnostics: SearchDiagnostics,
+    failure: SearchFailure,
+    *,
+    unique_leads_discovered: int | None = None,
+    lead: JobLead | None = None,
+    candidate: JobPosting | None = None,
+    near_miss: NearMissJob | None = None,
+    audit_entry: FalseNegativeAuditEntry | None = None,
+    run_id: str | None = None,
+) -> None:
+    _record_failure_live(
+        settings,
+        diagnostics,
+        failure,
+        unique_leads_discovered=unique_leads_discovered,
+    )
+    _record_near_miss(diagnostics, near_miss)
+    _record_false_negative_audit(diagnostics, audit_entry)
+    if lead is not None and lead.refined_by_ollama:
+        record_ollama_event(
+            settings,
+            "lead_refinement_rejection",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            company_name=lead.company_name,
+            role_title=lead.role_title,
+            reason_code=failure.reason_code,
+            rejected_count=1,
+            near_miss_count=int(near_miss is not None),
+        )
     _persist_search_diagnostics(settings, diagnostics)
 
 
@@ -4248,6 +5312,50 @@ def _precheck_lead_hints(
             stage="filter",
             reason_code="not_product_manager_hint",
             detail="Discovery lead title did not clearly indicate a product manager role.",
+            lead=lead,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    if lead.posted_date_hint and _hint_is_recent(lead.posted_date_hint, settings) is False:
+        return _make_failure(
+            stage="filter",
+            reason_code="stale_posting",
+            detail=f"Lead hint date '{lead.posted_date_hint}' was already outside the freshness window.",
+            lead=lead,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    combined_location_hint = " ".join(part for part in (lead.location_hint, lead.evidence_notes) if part)
+    if lead.is_remote_hint is False or any(token in combined_location_hint.lower() for token in ("hybrid", "on-site", "onsite", "in office")):
+        return _make_failure(
+            stage="filter",
+            reason_code="not_remote",
+            detail="Lead hints showed the role was not clearly fully remote.",
+            lead=lead,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    if _extract_geo_limited_remote_region(combined_location_hint):
+        return _make_failure(
+            stage="filter",
+            reason_code="not_remote",
+            detail="Lead hints showed the role was remote but geographically restricted.",
+            lead=lead,
+            attempt_number=attempt_number,
+            round_number=round_number,
+        )
+    salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
+        lead.base_salary_min_usd_hint,
+        lead.base_salary_max_usd_hint,
+        lead.salary_text_hint,
+        lead.evidence_notes,
+    )
+    salary_values = [value for value in (salary_min, salary_max) if value is not None]
+    if salary_values and max(salary_values) < settings.min_base_salary_usd:
+        return _make_failure(
+            stage="filter",
+            reason_code="salary_below_min",
+            detail=f"Lead salary hints were below the configured minimum of ${settings.min_base_salary_usd:,}.",
             lead=lead,
             attempt_number=attempt_number,
             round_number=round_number,
@@ -4291,6 +5399,23 @@ def _snapshot_remote_signal_is_low_confidence(snapshot: JobPageSnapshot) -> bool
     return any(pattern in text for pattern in weak_patterns)
 
 
+def _direct_job_url_has_specific_location_hint(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if "myworkdayjobs.com" not in host:
+        return False
+    match = re.search(r"/job/([^/]+)/", path)
+    if not match:
+        return False
+    location_slug = match.group(1).strip("-")
+    if not location_slug:
+        return False
+    if any(token in location_slug for token in ("remote", "virtual", "work-from-home", "work_from_home")):
+        return False
+    return location_slug.count("-") >= 2
+
+
 def _snapshot_role_title_is_specific(role_title: str | None) -> bool:
     normalized = (role_title or "").strip().lower()
     if not normalized:
@@ -4300,6 +5425,12 @@ def _snapshot_role_title_is_specific(role_title: str | None) -> bool:
         "career",
         "jobs",
         "job",
+        "job application",
+        "home",
+        "overview",
+        "benefits",
+        "sign in",
+        "login",
         "current openings",
         "open positions",
         "opportunities",
@@ -4308,6 +5439,104 @@ def _snapshot_role_title_is_specific(role_title: str | None) -> bool:
     if normalized.startswith("careers at ") or normalized.startswith("jobs at "):
         return False
     return True
+
+
+def _snapshot_looks_like_generic_brand_page(snapshot: JobPageSnapshot, company_name: str | None = None) -> bool:
+    title_candidates = [str(snapshot.role_title or "").strip(), str(snapshot.page_title or "").strip()]
+    normalized_candidates = [candidate.lower() for candidate in title_candidates if candidate]
+    if not normalized_candidates:
+        return False
+    if any(
+        candidate in {"work", "apply", "home", "overview", "careers", "jobs", "job application"}
+        or "careers" in candidate
+        or "job opportunities" in candidate
+        for candidate in normalized_candidates
+    ):
+        return True
+    company_key = _normalize_company_key(company_name)
+    return bool(company_key) and any(_normalize_company_key(candidate) == company_key for candidate in title_candidates if candidate)
+
+
+def _lead_has_trusted_source_fallback_evidence(lead: JobLead, settings: Settings) -> bool:
+    if lead.source_type not in {"builtin", "company_site", "direct_ats"}:
+        return False
+    salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
+        lead.base_salary_min_usd_hint,
+        lead.base_salary_max_usd_hint,
+        lead.salary_text_hint,
+        lead.evidence_notes,
+    )
+    salary_values = [value for value in (salary_min, salary_max) if value is not None]
+    if not salary_values or max(salary_values) < settings.min_base_salary_usd:
+        return False
+    if lead.is_remote_hint is not True:
+        return False
+    if _extract_geo_limited_remote_region(" ".join(part for part in (lead.location_hint, lead.evidence_notes) if part)):
+        return False
+    if not _lead_is_ai_related_product_manager(lead):
+        return False
+    return _is_recent_enough(
+        None,
+        lead.posted_date_hint or "",
+        settings.posted_within_days,
+        timezone_name=settings.timezone,
+    )
+
+
+def _job_has_geo_limited_remote_restriction(
+    job: JobPosting,
+    snapshot: JobPageSnapshot,
+) -> bool:
+    combined_text = " ".join(
+        part
+        for part in (
+            job.location_text,
+            job.evidence_notes,
+            snapshot.location_text,
+            snapshot.text_excerpt[:1600],
+            " ".join(snapshot.evidence_snippets[:4]),
+        )
+        if part
+    )
+    return _extract_geo_limited_remote_region(combined_text) is not None
+
+
+def _snapshot_supports_expected_role(expected_role_title: str | None, snapshot: JobPageSnapshot) -> bool:
+    expected = " ".join(str(expected_role_title or "").split())
+    if not expected:
+        return True
+    observed_role_title = snapshot.role_title if _snapshot_role_title_is_specific(snapshot.role_title) else None
+    if observed_role_title and _role_titles_align(expected, observed_role_title):
+        return True
+
+    snapshot_haystack = " ".join(
+        part
+        for part in (
+            observed_role_title or "",
+            snapshot.page_title or "",
+            snapshot.text_excerpt[:1600],
+            " ".join(snapshot.evidence_snippets[:4]),
+        )
+        if part
+    )
+    if _role_match_score(expected, snapshot_haystack) < 10:
+        return False
+    if _is_ai_related_product_manager_text(expected):
+        return _is_ai_related_product_manager_text(snapshot_haystack)
+    return True
+
+
+def _should_replace_candidate_role_title(candidate_role_title: str, snapshot: JobPageSnapshot) -> bool:
+    observed_role_title = snapshot.role_title if _snapshot_role_title_is_specific(snapshot.role_title) else None
+    if not observed_role_title:
+        return False
+    if not candidate_role_title.strip():
+        return True
+    if _role_titles_align(candidate_role_title, observed_role_title):
+        return True
+    return not _is_ai_related_product_manager_text(candidate_role_title) and _is_ai_related_product_manager_text(
+        observed_role_title
+    )
 
 
 def _merge_candidate_with_snapshot(candidate: JobPosting, snapshot: JobPageSnapshot) -> JobPosting:
@@ -4322,7 +5551,7 @@ def _merge_candidate_with_snapshot(candidate: JobPosting, snapshot: JobPageSnaps
     merged = candidate.model_copy(
         update={
             "company_name": snapshot.company_name or candidate.company_name,
-            "role_title": snapshot.role_title if _snapshot_role_title_is_specific(snapshot.role_title) else candidate.role_title,
+            "role_title": snapshot.role_title if _should_replace_candidate_role_title(candidate.role_title, snapshot) else candidate.role_title,
             "direct_job_url": snapshot.resolved_url,
             "resolved_job_url": snapshot.resolved_url,
             "ats_platform": snapshot.ats_platform or candidate.ats_platform,
@@ -4373,6 +5602,8 @@ def _evaluate_merged_job(
     settings: Settings,
     *,
     expected_company_name: str | None = None,
+    expected_role_title: str | None = None,
+    allow_trusted_source_role_fallback: bool = False,
 ) -> tuple[str | None, str]:
     job_url = str(job.resolved_job_url or job.direct_job_url)
     if not _is_allowed_direct_job_url(job_url):
@@ -4384,8 +5615,30 @@ def _evaluate_merged_job(
     if expected_company_name and not _is_weak_company_hint(expected_company_name) and not _company_names_match(expected_company_name, job.company_name):
         return "company_mismatch", f"Resolved job company '{job.company_name}' did not match expected company '{expected_company_name}'."
 
+    if (
+        expected_role_title
+        and _snapshot_role_title_is_specific(snapshot.role_title)
+        and not _snapshot_supports_expected_role(expected_role_title, snapshot)
+        and not allow_trusted_source_role_fallback
+    ):
+        observed_role_title = snapshot.role_title or snapshot.page_title or "unknown role"
+        return (
+            "resolution_missing",
+            f"Resolved page title '{observed_role_title}' did not line up with expected role '{expected_role_title}'.",
+        )
+
     if not _is_ai_related_product_manager(job):
         return "not_ai_product_manager", "Role did not look like an AI-related product manager position."
+
+    if (
+        job.is_fully_remote is True
+        and _snapshot_remote_signal_is_low_confidence(snapshot)
+        and _direct_job_url_has_specific_location_hint(job_url)
+    ):
+        return "not_remote", "Resolved job URL encoded a specific location while remote evidence only came from weak discovery hints."
+
+    if job.is_fully_remote and _job_has_geo_limited_remote_restriction(job, snapshot):
+        return "not_remote", "Role was remote but geographically restricted rather than broadly fully remote."
 
     if job.is_fully_remote is False:
         return "not_remote", "Role was not clearly fully remote."
@@ -4424,7 +5677,7 @@ async def _validate_candidate(
     resolution_agent: Agent | None,
     attempt_number: int,
     round_number: int,
-) -> tuple[JobPosting | None, SearchFailure | None]:
+) -> tuple[JobPosting | None, SearchFailure | None, NearMissJob | None, FalseNegativeAuditEntry | None]:
     snapshot = await fetch_job_page(str(candidate.direct_job_url))
     if snapshot.status_code != 200:
         repaired_url = await _repair_direct_job_url(
@@ -4438,7 +5691,7 @@ async def _validate_candidate(
             snapshot = await fetch_job_page(repaired_url)
 
     if snapshot.status_code != 200:
-        return None, _make_failure(
+        failure = _make_failure(
             stage="validation",
             reason_code="fetch_non_200",
             detail=f"Direct job page returned HTTP {snapshot.status_code}.",
@@ -4447,6 +5700,33 @@ async def _validate_candidate(
             candidate=candidate,
             attempt_number=attempt_number,
             round_number=round_number,
+        )
+        near_miss = None
+        if (lead.direct_job_url or candidate.direct_job_url) and _lead_source_quality_score(lead, settings) >= 4:
+            near_miss = NearMissJob(
+                company_name=candidate.company_name,
+                role_title=candidate.role_title,
+                reason_code=failure.reason_code,
+                detail=failure.detail,
+                why_close=_near_miss_why_close(failure.reason_code, candidate),
+                source_url=lead.source_url,
+                direct_job_url=str(candidate.direct_job_url),
+                source_type=lead.source_type,
+                ats_platform=candidate.ats_platform,
+                posted_date_text=candidate.posted_date_text,
+                salary_text=candidate.salary_text,
+                is_remote=candidate.is_fully_remote,
+                supporting_evidence=[lead.evidence_notes],
+                close_score=_lead_source_quality_score(lead, settings),
+                source_quality_score=_lead_source_quality_score(lead, settings),
+                attempt_number=attempt_number,
+                round_number=round_number,
+            )
+        return None, failure, near_miss, _build_false_negative_audit_entry(
+            lead,
+            failure,
+            candidate=candidate,
+            near_miss=near_miss,
         )
 
     if _is_generic_job_board_page(snapshot):
@@ -4461,14 +5741,26 @@ async def _validate_candidate(
             snapshot = await fetch_job_page(repaired_url)
 
     merged_job = _apply_salary_inference(_merge_candidate_with_snapshot(candidate, snapshot), snapshot, settings)
+    merged_job = merged_job.model_copy(
+        update={
+            "lead_refined_by_ollama": lead.refined_by_ollama,
+            "source_quality_score": lead.source_quality_score_hint or _lead_source_quality_score(lead, settings),
+        }
+    )
+    allow_trusted_source_role_fallback = (
+        _snapshot_looks_like_generic_brand_page(snapshot, lead.company_name)
+        and _lead_has_trusted_source_fallback_evidence(lead, settings)
+    )
     reason_code, detail = _evaluate_merged_job(
         merged_job,
         snapshot,
         settings,
         expected_company_name=lead.company_name,
+        expected_role_title=lead.role_title,
+        allow_trusted_source_role_fallback=allow_trusted_source_role_fallback,
     )
     if reason_code:
-        return None, _make_failure(
+        failure = _make_failure(
             stage="validation",
             reason_code=reason_code,
             detail=detail,
@@ -4478,12 +5770,21 @@ async def _validate_candidate(
             attempt_number=attempt_number,
             round_number=round_number,
         )
-    return merged_job, None
+        near_miss = _build_near_miss(lead, merged_job, failure, settings)
+        return None, failure, near_miss, _build_false_negative_audit_entry(
+            lead,
+            failure,
+            candidate=merged_job,
+            near_miss=near_miss,
+        )
+    return merged_job, None, None, None
 
 
 async def find_matching_jobs(
     settings: Settings,
     status: StatusReporter | None = None,
+    *,
+    run_id: str | None = None,
 ) -> tuple[list[JobPosting], int, SearchDiagnostics]:
     stop_goal = max(1, settings.minimum_qualifying_jobs, settings.target_job_count)
     diagnostics = SearchDiagnostics(minimum_qualifying_jobs=stop_goal)
@@ -4491,6 +5792,7 @@ async def find_matching_jobs(
     jobs_by_url: dict[str, JobPosting] = {}
     previously_reported_job_keys = load_previously_reported_job_keys(settings.data_dir)
     previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
+    company_watchlist = load_company_watchlist_entries(settings.data_dir)
     seen_lead_keys: set[str] = set()
     total_unique_leads = 0
 
@@ -4531,6 +5833,7 @@ async def find_matching_jobs(
                 _collect_replay_seed_leads(settings),
                 settings=settings,
                 diagnostics=diagnostics,
+                company_watchlist=company_watchlist,
                 jobs_by_url=jobs_by_url,
                 previously_reported_company_keys=previously_reported_company_keys,
                 previously_reported_job_keys=previously_reported_job_keys,
@@ -4542,6 +5845,7 @@ async def find_matching_jobs(
                 resolution_agent=resolution_agent,
                 attempt_number=attempt_number,
                 status=status,
+                run_id=run_id,
             )
             if len(jobs_by_url) >= stop_goal:
                 diagnostics.unique_leads_discovered = total_unique_leads
@@ -4578,6 +5882,7 @@ async def find_matching_jobs(
                             settings,
                             query,
                             query_timeout_seconds,
+                            run_id=run_id,
                         )
                     )
                     for query in query_batch
@@ -4674,6 +5979,7 @@ async def find_matching_jobs(
                     _persist_search_diagnostics(settings, diagnostics)
 
             round_leads = _dedupe_round_leads(round_leads, settings)
+            round_leads = _annotate_and_filter_resolution_leads(round_leads, settings, company_watchlist)
             remaining_resolution_budget = max(0, settings.max_leads_to_resolve_per_pass - resolved_leads_this_attempt)
             known_company_keys_for_round = previously_reported_company_keys.union(
                 {_normalize_company_key(job.company_name) for job in jobs_by_url.values()}
@@ -4707,11 +6013,14 @@ async def find_matching_jobs(
                     round_number=round_number,
                 )
                 if precheck_failure is not None:
-                    _record_failure_live(
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
                         precheck_failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        audit_entry=_build_false_negative_audit_entry(lead, precheck_failure),
+                        run_id=run_id,
                     )
                     continue
 
@@ -4734,18 +6043,22 @@ async def find_matching_jobs(
                         timeout=lead_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
-                    _record_failure_live(
+                    failure = _make_failure(
+                        stage="resolution",
+                        reason_code="resolution_timeout",
+                        detail=f"Resolution timed out after {lead_timeout_seconds}s.",
+                        lead=lead,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="resolution",
-                            reason_code="resolution_timeout",
-                            detail=f"Resolution timed out after {lead_timeout_seconds}s.",
-                            lead=lead,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        audit_entry=_build_false_negative_audit_entry(lead, failure),
+                        run_id=run_id,
                     )
                     continue
                 except Exception as exc:
@@ -4766,56 +6079,85 @@ async def find_matching_jobs(
                         raise OpenAIQuotaExceededError(
                             "OpenAI API quota is exhausted. Add billing or increase quota, then rerun the workflow."
                         ) from exc
-                    _record_failure_live(
+                    failure = _make_failure(
+                        stage="resolution",
+                        reason_code="resolution_error",
+                        detail=f"Resolution failed with an exception: {exc}",
+                        lead=lead,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="resolution",
-                            reason_code="resolution_error",
-                            detail=f"Resolution failed with an exception: {exc}",
-                            lead=lead,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        audit_entry=_build_false_negative_audit_entry(lead, failure),
+                        run_id=run_id,
                     )
                     continue
 
                 if resolution is None:
-                    _record_failure_live(
+                    failure = _make_failure(
+                        stage="resolution",
+                        reason_code="resolution_missing",
+                        detail="Could not resolve the discovery lead to a direct ATS or company careers URL.",
+                        lead=lead,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    fallback_candidate = _build_candidate_job(
+                        lead,
+                        DirectJobResolution(
+                            accepted=True,
+                            direct_job_url=lead.source_url,
+                            ats_platform=urlparse(lead.source_url).netloc or "Unknown",
+                            evidence_notes="Resolution failed after strong discovery hit.",
+                        ),
+                    )
+                    near_miss = _build_near_miss(lead, fallback_candidate, failure, settings)
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="resolution",
-                            reason_code="resolution_missing",
-                            detail="Could not resolve the discovery lead to a direct ATS or company careers URL.",
-                            lead=lead,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        candidate=fallback_candidate,
+                        near_miss=near_miss,
+                        audit_entry=_build_false_negative_audit_entry(
+                            lead,
+                            failure,
+                            candidate=fallback_candidate,
+                            near_miss=near_miss,
+                        ),
+                        run_id=run_id,
                     )
                     continue
 
                 if not _is_allowed_direct_job_url(resolution.direct_job_url or ""):
-                    _record_failure_live(
+                    failure = _make_failure(
+                        stage="resolution",
+                        reason_code="resolution_blocked_url",
+                        detail="Resolution returned a blocked or aggregator URL.",
+                        lead=lead,
+                        direct_job_url=resolution.direct_job_url,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="resolution",
-                            reason_code="resolution_blocked_url",
-                            detail="Resolution returned a blocked or aggregator URL.",
-                            lead=lead,
-                            direct_job_url=resolution.direct_job_url,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        audit_entry=_build_false_negative_audit_entry(lead, failure),
+                        run_id=run_id,
                     )
                     continue
 
                 normalized_resolution_url = _normalize_direct_job_url(resolution.direct_job_url or "")
-                if normalized_resolution_url in previously_reported_job_keys:
+                if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(normalized_resolution_url)):
                     _record_failure_live(
                         settings,
                         diagnostics,
@@ -4834,7 +6176,7 @@ async def find_matching_jobs(
 
                 candidate = _build_candidate_job(lead, resolution)
                 try:
-                    validated, validation_failure = await asyncio.wait_for(
+                    validated, validation_failure, near_miss, audit_entry = await asyncio.wait_for(
                         _validate_candidate(
                             lead,
                             candidate,
@@ -4846,20 +6188,25 @@ async def find_matching_jobs(
                         timeout=lead_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
-                    _record_failure_live(
+                    failure = _make_failure(
+                        stage="validation",
+                        reason_code="validation_timeout",
+                        detail=f"Validation timed out after {lead_timeout_seconds}s.",
+                        lead=lead,
+                        direct_job_url=str(candidate.direct_job_url),
+                        candidate=candidate,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="validation",
-                            reason_code="validation_timeout",
-                            detail=f"Validation timed out after {lead_timeout_seconds}s.",
-                            lead=lead,
-                            direct_job_url=str(candidate.direct_job_url),
-                            candidate=candidate,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        candidate=candidate,
+                        audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate),
+                        run_id=run_id,
                     )
                     continue
                 except Exception as exc:
@@ -4882,29 +6229,39 @@ async def find_matching_jobs(
                         raise OpenAIQuotaExceededError(
                             "OpenAI API quota is exhausted. Add billing or increase quota, then rerun the workflow."
                         ) from exc
-                    _record_failure_live(
+                    failure = _make_failure(
+                        stage="validation",
+                        reason_code="validation_error",
+                        detail=f"Validation failed with an exception: {exc}",
+                        lead=lead,
+                        direct_job_url=str(candidate.direct_job_url),
+                        candidate=candidate,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="validation",
-                            reason_code="validation_error",
-                            detail=f"Validation failed with an exception: {exc}",
-                            lead=lead,
-                            direct_job_url=str(candidate.direct_job_url),
-                            candidate=candidate,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        candidate=candidate,
+                        audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate),
+                        run_id=run_id,
                     )
                     continue
 
                 if validation_failure is not None:
-                    _record_failure_live(
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
                         validation_failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        candidate=candidate,
+                        near_miss=near_miss,
+                        audit_entry=audit_entry,
+                        run_id=run_id,
                     )
                     continue
 
@@ -4912,21 +6269,25 @@ async def find_matching_jobs(
                     continue
 
                 validated_key = _job_posting_dedupe_key(validated)
-                if validated_key in previously_reported_job_keys:
-                    _record_failure_live(
+                if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(validated.resolved_job_url or validated.direct_job_url)):
+                    failure = _make_failure(
+                        stage="filter",
+                        reason_code="already_reported",
+                        detail="Skipping a previously reported job from an earlier run.",
+                        lead=lead,
+                        direct_job_url=str(validated.direct_job_url),
+                        candidate=validated,
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                    )
+                    _record_failure_with_followups(
                         settings,
                         diagnostics,
-                        _make_failure(
-                            stage="filter",
-                            reason_code="already_reported",
-                            detail="Skipping a previously reported job from an earlier run.",
-                            lead=lead,
-                            direct_job_url=str(validated.direct_job_url),
-                            candidate=validated,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
+                        failure,
                         unique_leads_discovered=total_unique_leads,
+                        lead=lead,
+                        candidate=validated,
+                        run_id=run_id,
                     )
                     continue
 

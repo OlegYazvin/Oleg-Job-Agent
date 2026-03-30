@@ -66,16 +66,21 @@ class Settings:
     linkedin_extension_auto_open_search_tabs: bool = True
     search_queries: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_QUERIES))
     ollama_timeout_seconds: float = 120.0
-    ollama_keep_alive: str = "0m"
-    ollama_num_ctx: int = 2048
-    ollama_num_batch: int = 16
-    ollama_num_predict: int = 768
+    ollama_keep_alive: str = "5m"
+    ollama_num_ctx: int = 1024
+    ollama_num_batch: int = 4
+    ollama_num_predict: int = 256
     ollama_max_concurrent_requests: int = 1
     ollama_max_retries: int = 3
     ollama_restart_on_failure: bool = True
     ollama_start_timeout_seconds: int = 45
     ollama_retry_backoff_seconds: float = 3.0
     ollama_command: str = "ollama"
+    firefox_extension_profile_dir: Path | None = None
+    ollama_degraded_model: str = "qwen2.5:3b-instruct"
+    ollama_enable_auto_tune: bool = True
+    ollama_degraded_for_run: bool = False
+    ollama_degraded_reason: str | None = None
 
     @property
     def user_location(self) -> dict[str, object]:
@@ -107,15 +112,37 @@ class Settings:
     def ollama_log_path(self) -> Path:
         return self.output_dir / "ollama.log"
 
+    @property
+    def ollama_event_log_path(self) -> Path:
+        return self.output_dir / "ollama-events.jsonl"
+
+    @property
+    def ollama_tuning_profile_path(self) -> Path:
+        return self.data_dir / "ollama-profile.json"
+
+    @property
+    def ollama_summary_path(self) -> Path:
+        return self.data_dir / "ollama-summary-latest.json"
+
 
 def load_settings(project_root: Path | None = None, *, require_openai: bool = True) -> Settings:
     root = project_root or Path.cwd()
     load_dotenv(root / ".env")
 
+    def resolve_config_path(raw_value: str) -> Path:
+        candidate = Path(raw_value).expanduser()
+        return candidate if candidate.is_absolute() else root / candidate
+
+    def resolve_optional_config_path(raw_value: str | None) -> Path | None:
+        if not raw_value:
+            return None
+        return resolve_config_path(raw_value)
+
     output_dir = root / "output"
     data_dir = root / "data"
-    linkedin_profile_dir = root / os.getenv("LINKEDIN_PROFILE_DIR", ".secrets/linkedin-profile")
-    linkedin_storage_state = root / os.getenv("LINKEDIN_STORAGE_STATE", ".secrets/linkedin-state.json")
+    linkedin_profile_dir = resolve_config_path(os.getenv("LINKEDIN_PROFILE_DIR", ".secrets/linkedin-profile"))
+    linkedin_storage_state = resolve_config_path(os.getenv("LINKEDIN_STORAGE_STATE", ".secrets/linkedin-state.json"))
+    firefox_extension_profile_dir = resolve_optional_config_path(os.getenv("FIREFOX_EXTENSION_PROFILE_DIR"))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -173,7 +200,7 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         linkedin_manual_review_mode=os.getenv("LINKEDIN_MANUAL_REVIEW_MODE", "true").lower() == "true",
         llm_provider=llm_provider,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct"),
+        ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
         use_openai_fallback=use_openai_fallback,
         local_confidence_threshold=float(os.getenv("LOCAL_CONFIDENCE_THRESHOLD", "0.75")),
         linkedin_capture_mode=os.getenv("LINKEDIN_CAPTURE_MODE", "playwright").strip().lower(),
@@ -191,14 +218,17 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         ).lower()
         == "true",
         ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120")),
-        ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "0m"),
-        ollama_num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "2048")),
-        ollama_num_batch=int(os.getenv("OLLAMA_NUM_BATCH", "16")),
-        ollama_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "768")),
+        ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "5m"),
+        ollama_num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "1024")),
+        ollama_num_batch=int(os.getenv("OLLAMA_NUM_BATCH", "4")),
+        ollama_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "256")),
         ollama_max_concurrent_requests=int(os.getenv("OLLAMA_MAX_CONCURRENT_REQUESTS", "1")),
         ollama_max_retries=int(os.getenv("OLLAMA_MAX_RETRIES", "3")),
         ollama_restart_on_failure=os.getenv("OLLAMA_RESTART_ON_FAILURE", "true").lower() == "true",
         ollama_start_timeout_seconds=int(os.getenv("OLLAMA_START_TIMEOUT_SECONDS", "45")),
         ollama_retry_backoff_seconds=float(os.getenv("OLLAMA_RETRY_BACKOFF_SECONDS", "3")),
         ollama_command=os.getenv("OLLAMA_COMMAND", "ollama"),
+        firefox_extension_profile_dir=firefox_extension_profile_dir,
+        ollama_degraded_model=os.getenv("OLLAMA_DEGRADED_MODEL", "qwen2.5:3b-instruct"),
+        ollama_enable_auto_tune=os.getenv("OLLAMA_ENABLE_AUTO_TUNE", "true").lower() == "true",
     )

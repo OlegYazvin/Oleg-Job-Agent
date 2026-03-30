@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import Counter, deque
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
@@ -9,16 +10,27 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import time
+from typing import Any
 
 import httpx
 
 from .config import Settings
+from .models import OllamaRunSummary, OllamaTuningProfile
 
 
 _RUNTIME_LOCKS: dict[str, asyncio.Lock] = {}
 _REQUEST_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_QUALITY_EVENT_TYPES = {
+    "lead_refinement_outcome",
+    "lead_refinement_rejection",
+    "drafting_outcome",
+    "drafting_template_fallback",
+    "drafting_openai_fallback",
+    "ollama_degraded_skip",
+}
 
 
 def _runtime_lock(settings: Settings) -> asyncio.Lock:
@@ -44,7 +56,7 @@ def _pid_path(settings: Settings) -> Path:
 
 
 def _event_log_path(settings: Settings) -> Path:
-    return settings.output_dir / "ollama-events.jsonl"
+    return settings.ollama_event_log_path
 
 
 def _version_url(settings: Settings) -> str:
@@ -162,6 +174,295 @@ def record_ollama_event(settings: Settings, event_type: str, **details: object) 
             handle.write("\n")
     except Exception:
         return
+
+
+def _read_ollama_events(settings: Settings) -> list[dict[str, Any]]:
+    path = _event_log_path(settings)
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    entries.append(payload)
+    except Exception:
+        return []
+    return entries
+
+
+def _quantile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return round(values[0], 3)
+    ordered = sorted(values)
+    position = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    if lower == upper:
+        return round(ordered[lower], 3)
+    fraction = position - lower
+    interpolated = ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+    return round(interpolated, 3)
+
+
+def _current_profile_from_settings(settings: Settings) -> OllamaTuningProfile:
+    return OllamaTuningProfile(
+        model=settings.ollama_model,
+        keep_alive=settings.ollama_keep_alive,
+        num_ctx=settings.ollama_num_ctx,
+        num_batch=settings.ollama_num_batch,
+        num_predict=settings.ollama_num_predict,
+        degraded=settings.ollama_degraded_for_run,
+        degraded_reason=settings.ollama_degraded_reason,
+    )
+
+
+def load_ollama_tuning_profile(settings: Settings) -> OllamaTuningProfile:
+    path = settings.ollama_tuning_profile_path
+    if not path.exists():
+        return _current_profile_from_settings(settings)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return _current_profile_from_settings(settings)
+    try:
+        return OllamaTuningProfile.model_validate(payload)
+    except Exception:
+        return _current_profile_from_settings(settings)
+
+
+def save_ollama_tuning_profile(settings: Settings, profile: OllamaTuningProfile) -> None:
+    path = settings.ollama_tuning_profile_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile.model_dump(mode="json"), indent=2), encoding="utf-8")
+
+
+def _recent_request_events(settings: Settings, *, limit: int = 10) -> list[dict[str, Any]]:
+    entries = _read_ollama_events(settings)
+    filtered = [
+        entry
+        for entry in entries
+        if entry.get("event") in {"request_success", "request_failure", "request_outer_timeout"}
+    ]
+    return filtered[-max(1, limit) :]
+
+
+def _warm_success_median_seconds(events: list[dict[str, Any]]) -> float | None:
+    warm_successes = [
+        float(entry["wall_duration_seconds"])
+        for entry in events
+        if entry.get("event") == "request_success"
+        and entry.get("cold_start") is False
+        and isinstance(entry.get("wall_duration_seconds"), (int, float))
+    ]
+    if len(warm_successes) < 5:
+        return None
+    return round(statistics.median(warm_successes[-5:]), 3)
+
+
+def _step_down_profile(profile: OllamaTuningProfile) -> tuple[OllamaTuningProfile, str]:
+    if profile.num_batch > 1:
+        next_batch = max(1, profile.num_batch // 2)
+        return profile.model_copy(update={"num_batch": next_batch}), f"Reduced num_batch to {next_batch}."
+    if profile.num_predict > 128:
+        next_predict = max(128, profile.num_predict // 2)
+        return profile.model_copy(update={"num_predict": next_predict}), f"Reduced num_predict to {next_predict}."
+    if profile.num_ctx > 512:
+        next_ctx = max(512, profile.num_ctx // 2)
+        return profile.model_copy(update={"num_ctx": next_ctx}), f"Reduced num_ctx to {next_ctx}."
+    return profile, ""
+
+
+def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) -> tuple[Settings, OllamaTuningProfile]:
+    if settings.llm_provider != "ollama" or not settings.ollama_enable_auto_tune:
+        profile = _current_profile_from_settings(settings)
+        return settings, profile
+
+    profile = load_ollama_tuning_profile(settings)
+    recent_events = _recent_request_events(settings, limit=10)
+    request_event_count = len(recent_events)
+    if request_event_count:
+        failure_count = sum(1 for entry in recent_events if entry.get("event") in {"request_failure", "request_outer_timeout"})
+        outer_timeout_count = sum(1 for entry in recent_events if entry.get("event") == "request_outer_timeout")
+        failure_ratio = failure_count / request_event_count
+        warm_median = _warm_success_median_seconds(recent_events)
+        update_reason: str | None = None
+
+        if warm_median is not None and warm_median > 60 and profile.model != settings.ollama_degraded_model:
+            profile = profile.model_copy(
+                update={
+                    "model": settings.ollama_degraded_model,
+                    "num_ctx": min(profile.num_ctx, 1024),
+                    "num_batch": min(profile.num_batch, 2),
+                    "num_predict": min(profile.num_predict, 192),
+                    "degraded": False,
+                    "degraded_reason": None,
+                }
+            )
+            update_reason = (
+                f"Warm-call median was {warm_median}s over the last 5 successes; switched to {settings.ollama_degraded_model}."
+            )
+        elif failure_ratio > 0.2 or outer_timeout_count >= 2:
+            stepped_profile, step_reason = _step_down_profile(profile)
+            if step_reason:
+                profile = stepped_profile
+                update_reason = (
+                    f"Failure ratio {round(failure_ratio, 3)} over the last {request_event_count} requests triggered tuning. "
+                    f"{step_reason}"
+                )
+            elif profile.model != settings.ollama_degraded_model:
+                profile = profile.model_copy(
+                    update={
+                        "model": settings.ollama_degraded_model,
+                        "num_ctx": min(profile.num_ctx, 1024),
+                        "num_batch": min(profile.num_batch, 2),
+                        "num_predict": min(profile.num_predict, 192),
+                        "degraded": False,
+                        "degraded_reason": None,
+                    }
+                )
+                update_reason = (
+                    f"Failure ratio {round(failure_ratio, 3)} persisted after knob reductions; switched to {settings.ollama_degraded_model}."
+                )
+            else:
+                profile = profile.model_copy(
+                    update={
+                        "degraded": True,
+                        "degraded_reason": (
+                            f"Ollama stayed unstable on {profile.model} after auto-tuning; optional Ollama steps will be skipped for this run."
+                        ),
+                    }
+                )
+                update_reason = profile.degraded_reason
+
+        if update_reason:
+            record_ollama_event(
+                settings,
+                "auto_tune_update",
+                run_id=run_id,
+                model=profile.model,
+                num_ctx=profile.num_ctx,
+                num_batch=profile.num_batch,
+                num_predict=profile.num_predict,
+                keep_alive=profile.keep_alive,
+                degraded=profile.degraded,
+                degraded_reason=profile.degraded_reason,
+                reason=update_reason,
+            )
+
+    profile = profile.model_copy(
+        update={
+            "last_updated_at": datetime.now(UTC),
+            "based_on_event_count": len(_read_ollama_events(settings)),
+        }
+    )
+    save_ollama_tuning_profile(settings, profile)
+    tuned_settings = replace(
+        settings,
+        ollama_model=profile.model,
+        ollama_keep_alive=profile.keep_alive,
+        ollama_num_ctx=profile.num_ctx,
+        ollama_num_batch=profile.num_batch,
+        ollama_num_predict=profile.num_predict,
+        ollama_degraded_for_run=profile.degraded,
+        ollama_degraded_reason=profile.degraded_reason,
+    )
+    return tuned_settings, profile
+
+
+def build_ollama_run_summary(
+    settings: Settings,
+    *,
+    run_id: str,
+    tuning_profile: OllamaTuningProfile | None = None,
+    generated_at: datetime | None = None,
+) -> OllamaRunSummary:
+    entries = [entry for entry in _read_ollama_events(settings) if entry.get("run_id") == run_id]
+    request_entries = [
+        entry
+        for entry in entries
+        if entry.get("event") in {"request_success", "request_failure", "request_outer_timeout"}
+    ]
+    success_entries = [entry for entry in request_entries if entry.get("event") == "request_success"]
+    failure_entries = [entry for entry in request_entries if entry.get("event") != "request_success"]
+    wall_times = [
+        float(entry["wall_duration_seconds"])
+        for entry in success_entries
+        if isinstance(entry.get("wall_duration_seconds"), (int, float))
+    ]
+    warm_wall_times = [
+        float(entry["wall_duration_seconds"])
+        for entry in success_entries
+        if entry.get("cold_start") is False and isinstance(entry.get("wall_duration_seconds"), (int, float))
+    ]
+    failure_breakdown = Counter(
+        str(entry.get("error_type") or entry.get("event") or "unknown")
+        for entry in failure_entries
+    )
+    caller_breakdown = Counter(str(entry.get("caller") or "unknown") for entry in request_entries)
+    prompt_category_breakdown = Counter(str(entry.get("prompt_category") or "unknown") for entry in request_entries)
+    quality_counters: Counter[str] = Counter()
+    for entry in entries:
+        if entry.get("event") not in _QUALITY_EVENT_TYPES:
+            continue
+        for key, value in entry.items():
+            if key in {"timestamp", "event", "run_id", "caller", "prompt_category", "prompt_hash"}:
+                continue
+            if isinstance(value, bool):
+                quality_counters[key] += int(value)
+            elif isinstance(value, (int, float)):
+                quality_counters[key] += value
+    request_count = len(request_entries)
+    summary = OllamaRunSummary(
+        run_id=run_id,
+        generated_at=generated_at or datetime.now(UTC),
+        tuning_profile=tuning_profile or load_ollama_tuning_profile(settings),
+        request_count=request_count,
+        success_count=len(success_entries),
+        failure_count=len(failure_entries),
+        outer_timeout_count=sum(1 for entry in request_entries if entry.get("event") == "request_outer_timeout"),
+        success_rate=round(len(success_entries) / request_count, 3) if request_count else 0.0,
+        warm_hit_rate=round(len(warm_wall_times) / len(success_entries), 3) if success_entries else 0.0,
+        median_wall_duration_seconds=round(statistics.median(wall_times), 3) if wall_times else None,
+        p95_wall_duration_seconds=_quantile(wall_times, 0.95),
+        median_warm_wall_duration_seconds=round(statistics.median(warm_wall_times), 3) if warm_wall_times else None,
+        p95_warm_wall_duration_seconds=_quantile(warm_wall_times, 0.95),
+        failure_breakdown=dict(failure_breakdown),
+        caller_breakdown=dict(caller_breakdown),
+        prompt_category_breakdown=dict(prompt_category_breakdown),
+        quality_counters={key: round(float(value), 3) for key, value in quality_counters.items()},
+    )
+    return summary
+
+
+def save_ollama_run_summary(settings: Settings, summary: OllamaRunSummary) -> Path:
+    path = settings.ollama_summary_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summary.model_dump(mode="json"), indent=2), encoding="utf-8")
+    return path
+
+
+def load_latest_ollama_summary(settings: Settings) -> OllamaRunSummary | None:
+    path = settings.ollama_summary_path
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    try:
+        return OllamaRunSummary.model_validate(payload)
+    except Exception:
+        return None
 
 
 def _clear_managed_pid(settings: Settings) -> None:
