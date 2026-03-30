@@ -110,13 +110,68 @@ def test_open_url_in_firefox_prefers_configured_real_profile(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(
         bridge_module,
+        "inspect_configured_firefox_extension_profile",
+        lambda settings: {
+            "configured": True,
+            "path": str(profile_dir),
+            "exists": True,
+            "extension_installed": True,
+            "linkedin_authenticated": True,
+            "ready": True,
+        },
+    )
+    monkeypatch.setattr(
+        bridge_module,
         "read_firefox_extension_host_state",
-        lambda project_root: (_ for _ in ()).throw(AssertionError("host state fallback should not be used")),
+        lambda project_root: None,
     )
 
     bridge_module._open_url_in_firefox("https://www.linkedin.com/search/results/people/", tmp_path)
 
     assert opened == [(profile_dir, "https://www.linkedin.com/search/results/people/")]
+
+
+def test_open_url_in_firefox_prefers_running_extension_host_queue_over_unready_profile(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "real-profile"
+    profile_dir.mkdir()
+    enqueued: list[str] = []
+
+    monkeypatch.setattr(
+        bridge_module,
+        "load_settings",
+        lambda project_root, require_openai=False: SimpleNamespace(firefox_extension_profile_dir=profile_dir),
+    )
+    monkeypatch.setattr(
+        bridge_module,
+        "inspect_configured_firefox_extension_profile",
+        lambda settings: {
+            "configured": True,
+            "path": str(profile_dir),
+            "exists": True,
+            "extension_installed": False,
+            "linkedin_authenticated": True,
+            "ready": False,
+        },
+    )
+    monkeypatch.setattr(
+        bridge_module,
+        "read_firefox_extension_host_state",
+        lambda project_root: {"pid": 4242, "profile_dir": str(tmp_path / "host-profile")},
+    )
+    monkeypatch.setattr(bridge_module, "enqueue_open_url", lambda project_root, url: enqueued.append(url))
+    monkeypatch.setattr(bridge_module.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(
+        bridge_module,
+        "open_url_in_firefox_profile",
+        lambda profile, url: (_ for _ in ()).throw(AssertionError("configured profile should not be used")),
+    )
+
+    bridge_module._open_url_in_firefox("https://www.linkedin.com/search/results/people/", tmp_path)
+
+    assert enqueued == ["https://www.linkedin.com/search/results/people/"]
 
 
 def test_wait_for_search_results_returns_when_login_required() -> None:
@@ -138,7 +193,59 @@ def test_wait_for_search_results_returns_when_login_required() -> None:
     assert session.login_required is True
 
 
-def test_open_search_tabs_fails_fast_when_configured_profile_is_missing_extension(
+def test_open_search_tabs_uses_dedicated_host_when_configured_profile_is_missing_extension(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    opened_urls: list[str] = []
+    bridge = LinkedInExtensionBridge(
+        SimpleNamespace(
+            linkedin_extension_bridge_host="127.0.0.1",
+            linkedin_extension_bridge_port=8765,
+            linkedin_extension_capture_timeout_seconds=30,
+            linkedin_extension_history_timeout_seconds=0,
+            linkedin_extension_auto_open_search_tabs=True,
+            firefox_extension_profile_dir=tmp_path / "real-profile",
+            data_dir=tmp_path,
+            project_root=tmp_path,
+        )
+    )
+    session = ExtensionCaptureSession(
+        session_id="session-123",
+        company_name="Acme AI",
+        search_urls={"1st": ["https://example.com/1st"], "2nd": ["https://example.com/2nd"]},
+    )
+    monkeypatch.setattr(
+        bridge_module,
+        "inspect_configured_firefox_extension_profile",
+        lambda settings: {
+            "configured": True,
+            "path": str(tmp_path / "real-profile"),
+            "exists": True,
+            "extension_installed": False,
+            "linkedin_authenticated": True,
+            "ready": False,
+        },
+    )
+    monkeypatch.setattr(
+        bridge_module,
+        "deploy_dedicated_host_background",
+        lambda settings: {
+            "started": True,
+            "pid": 4242,
+            "linkedin_authenticated": True,
+            "ready_at": "2026-03-30T10:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(bridge_module, "_open_url_in_firefox", lambda url, project_root: opened_urls.append(url))
+
+    asyncio.run(bridge.open_search_tabs(session))
+
+    assert opened_urls[0] == "https://www.linkedin.com/feed/"
+    assert opened_urls[1:] == ["https://example.com/1st", "https://example.com/2nd"]
+
+
+def test_open_search_tabs_still_fails_when_dedicated_host_is_not_authenticated(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -171,13 +278,23 @@ def test_open_search_tabs_fails_fast_when_configured_profile_is_missing_extensio
             "ready": False,
         },
     )
+    monkeypatch.setattr(
+        bridge_module,
+        "deploy_dedicated_host_background",
+        lambda settings: {
+            "started": True,
+            "pid": 4242,
+            "linkedin_authenticated": False,
+            "ready_at": "2026-03-30T10:00:00+00:00",
+        },
+    )
 
     try:
         asyncio.run(bridge.open_search_tabs(session))
     except RuntimeError as exc:
-        assert "does not currently have the Job Agent LinkedIn Bridge add-on loaded" in str(exc)
+        assert "dedicated Firefox extension host could not be started in an authenticated state" in str(exc)
     else:
-        raise AssertionError("Expected open_search_tabs to fail fast for a missing extension")
+        raise AssertionError("Expected open_search_tabs to fail when host fallback is unauthenticated")
 
 
 def test_open_search_tabs_primes_feed_before_people_search(monkeypatch, tmp_path: Path) -> None:

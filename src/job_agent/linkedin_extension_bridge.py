@@ -17,6 +17,7 @@ import webbrowser
 
 from .config import Settings, load_settings
 from .firefox_extension_host import (
+    deploy_dedicated_host_background,
     enqueue_open_url,
     inspect_configured_firefox_extension_profile,
     open_url_in_firefox_profile,
@@ -203,17 +204,25 @@ class LinkedInExtensionBridge:
                     "Configured Firefox extension profile was not found. "
                     "Set FIREFOX_EXTENSION_PROFILE_DIR to the real Firefox profile you use for LinkedIn."
                 )
-            if not configured_profile.get("extension_installed"):
-                raise RuntimeError(
-                    "Configured Firefox profile does not currently have the Job Agent LinkedIn Bridge add-on loaded. "
-                    "Open `about:debugging#/runtime/this-firefox` in that profile and load "
-                    "`firefox_extension/manifest.json` as a temporary add-on."
-                )
             if not configured_profile.get("linkedin_authenticated"):
                 raise RuntimeError(
                     "Configured Firefox profile is not authenticated to LinkedIn. "
                     "Sign into LinkedIn in that profile before running the workflow."
                 )
+            if not configured_profile.get("extension_installed"):
+                host_payload = await asyncio.to_thread(
+                    deploy_dedicated_host_background,
+                    self.settings,
+                )
+                host_state = host_payload.get("state") if isinstance(host_payload.get("state"), dict) else host_payload
+                host_authenticated = bool(
+                    isinstance(host_state, dict) and host_state.get("linkedin_authenticated")
+                )
+                if not host_authenticated:
+                    raise RuntimeError(
+                        "Configured Firefox profile does not currently have the Job Agent LinkedIn Bridge add-on loaded, "
+                        "and the dedicated Firefox extension host could not be started in an authenticated state."
+                    )
             if prime_linkedin_feed:
                 await asyncio.to_thread(
                     _open_url_in_firefox,
@@ -364,15 +373,6 @@ class LinkedInExtensionBridge:
 
 def _open_url_in_firefox(url: str, project_root: Path) -> None:
     settings = load_settings(project_root, require_openai=False)
-    if settings.firefox_extension_profile_dir is not None:
-        if open_url_in_firefox_profile(settings.firefox_extension_profile_dir, url):
-            return
-
-    firefox_binary = shutil.which("firefox")
-    firefox_esr_binary = shutil.which("firefox-esr")
-    flatpak_binary = shutil.which("flatpak")
-
-    commands: list[list[str]] = []
     host_state = read_firefox_extension_host_state(project_root)
     host_profile = None
     if host_state is not None:
@@ -391,6 +391,18 @@ def _open_url_in_firefox(url: str, project_root: Path) -> None:
         profile_dir = host_state.get("profile_dir")
         if profile_dir:
             host_profile = str(profile_dir)
+
+    if settings.firefox_extension_profile_dir is not None:
+        configured_profile = inspect_configured_firefox_extension_profile(settings)
+        if configured_profile.get("extension_installed") and configured_profile.get("linkedin_authenticated"):
+            if open_url_in_firefox_profile(settings.firefox_extension_profile_dir, url):
+                return
+
+    firefox_binary = shutil.which("firefox")
+    firefox_esr_binary = shutil.which("firefox-esr")
+    flatpak_binary = shutil.which("flatpak")
+
+    commands: list[list[str]] = []
     if host_profile and firefox_binary:
         commands.append([firefox_binary, "--profile", host_profile, "--new-tab", url])
     if host_profile and firefox_esr_binary:

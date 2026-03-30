@@ -600,6 +600,12 @@ def deploy_host_background() -> dict[str, object]:
             "profile": configured_profile,
         }
 
+    return deploy_dedicated_host_background(settings)
+
+
+def deploy_dedicated_host_background(settings: Settings | None = None) -> dict[str, object]:
+    settings = settings or load_settings(require_openai=False)
+
     state = read_state(settings.project_root)
     if state is not None:
         return {"already_running": True, **state}

@@ -35,6 +35,10 @@ _BORDER = "#cfd8dc"
 _SUCCESS = "#2ecc71"
 _ERROR = "#da4453"
 _WARNING = "#fdbc4b"
+_DASHBOARD_GEOMETRY = "1320x860"
+_DASHBOARD_DEFAULT_MIN_WIDTH = 1080
+_DASHBOARD_DEFAULT_MIN_HEIGHT = 720
+_DASHBOARD_CONTROL_COLUMNS = 3
 
 
 def _pick_font_family(candidates: list[str], fallback: str) -> str:
@@ -102,6 +106,25 @@ def _build_runs_for_display(live_status: dict[str, Any], run_history: list[dict[
     return rows
 
 
+def _compute_dashboard_minimum_size(
+    required_width: int,
+    required_height: int,
+    *,
+    default_width: int = _DASHBOARD_DEFAULT_MIN_WIDTH,
+    default_height: int = _DASHBOARD_DEFAULT_MIN_HEIGHT,
+) -> tuple[int, int]:
+    return max(default_width, required_width), max(default_height, required_height)
+
+
+def _enforce_dashboard_minimum_size(root: tk.Tk) -> None:  # pragma: no cover - GUI-only
+    root.update_idletasks()
+    min_width, min_height = _compute_dashboard_minimum_size(root.winfo_reqwidth(), root.winfo_reqheight())
+    root.minsize(min_width, min_height)
+    target_width = max(root.winfo_width(), min_width)
+    target_height = max(root.winfo_height(), min_height)
+    root.geometry(f"{target_width}x{target_height}")
+
+
 def run_dashboard() -> None:  # pragma: no cover - GUI-only
     if tk is None or ttk is None or scrolledtext is None or messagebox is None:
         raise RuntimeError("Tkinter is not available on this system.")
@@ -109,8 +132,8 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     settings = load_settings(require_openai=False)
     root = tk.Tk()
     root.title("Job Agent Control Center")
-    root.geometry("1320x860")
-    root.minsize(1080, 720)
+    root.geometry(_DASHBOARD_GEOMETRY)
+    root.minsize(_DASHBOARD_DEFAULT_MIN_WIDTH, _DASHBOARD_DEFAULT_MIN_HEIGHT)
     root.configure(bg=_WINDOW_BG)
 
     sans_font = _pick_font_family(
@@ -284,18 +307,30 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
                 _open_path(str(entry["summary_docx_path"]))
                 return
 
-    button_row = ttk.Frame(controls_card)
-    button_row.pack(fill="x", pady=(10, 0))
-    start_button = ttk.Button(button_row, text="Start Run", style="Primary.TButton", command=start_run)
-    start_button.pack(side="left")
-    kill_button = ttk.Button(button_row, text="Kill Run", command=kill_run)
-    kill_button.pack(side="left", padx=(10, 0))
-    ttk.Button(button_row, text="Open Messages DOCX", command=open_selected_message_doc).pack(side="left", padx=(10, 0))
-    ttk.Button(button_row, text="Open Summary DOCX", command=open_selected_summary_doc).pack(side="left", padx=(10, 0))
-    ttk.Button(button_row, text="Open Output Folder", command=lambda: _open_path(str(settings.output_dir))).pack(
-        side="left",
-        padx=(10, 0),
-    )
+    button_grid = ttk.Frame(controls_card)
+    button_grid.pack(fill="x", pady=(10, 0))
+    for column in range(_DASHBOARD_CONTROL_COLUMNS):
+        button_grid.columnconfigure(column, weight=1, uniform="controls")
+
+    control_buttons = [
+        ttk.Button(button_grid, text="Start Run", style="Primary.TButton", command=start_run),
+        ttk.Button(button_grid, text="Kill Run", command=kill_run),
+        ttk.Button(button_grid, text="Open Messages DOCX", command=open_selected_message_doc),
+        ttk.Button(button_grid, text="Open Summary DOCX", command=open_selected_summary_doc),
+        ttk.Button(button_grid, text="Open Output Folder", command=lambda: _open_path(str(settings.output_dir))),
+    ]
+    for index, button in enumerate(control_buttons):
+        row = index // _DASHBOARD_CONTROL_COLUMNS
+        column = index % _DASHBOARD_CONTROL_COLUMNS
+        button.grid(
+            row=row,
+            column=column,
+            sticky="ew",
+            padx=(0 if column == 0 else 10, 0),
+            pady=(0 if row == 0 else 10, 0),
+        )
+    start_button = control_buttons[0]
+    kill_button = control_buttons[1]
 
     events_card = ttk.Frame(right_panel, style="Card.TFrame")
     events_card.pack(fill="both", expand=True, pady=(18, 0))
@@ -430,6 +465,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
         kill_button.state(["!disabled"] if is_active else ["disabled"])
         root.after(1000, refresh)
 
+    _enforce_dashboard_minimum_size(root)
     refresh()
     root.mainloop()
 
