@@ -921,6 +921,9 @@ def _is_ai_related_product_manager_text(text: str) -> bool:
 
 
 def _is_ai_related_product_manager(job: JobPosting) -> bool:
+    for primary_text in (job.role_title, job.job_page_title or ""):
+        if primary_text and _is_ai_related_product_manager_text(primary_text):
+            return True
     haystack = " ".join(
         part
         for part in (
@@ -1488,6 +1491,8 @@ def _annotate_and_filter_resolution_leads(
     annotated: list[JobLead] = []
     for lead in leads:
         watchlist_entry = company_watchlist.get(_normalize_company_key(lead.company_name), {})
+        if _watchlist_entry_should_skip_resolution(lead, settings, watchlist_entry):
+            continue
         source_quality_score = _lead_source_quality_score(lead, settings, watchlist_entry)
         if source_quality_score <= 0:
             continue
@@ -1560,6 +1565,48 @@ def _watchlist_entry_is_focusable(entry: dict[str, object]) -> bool:
     if watch_count >= 30 and max_reason_count >= 4:
         return False
     return True
+
+
+def _lead_has_strong_override_hints(lead: JobLead, settings: Settings) -> bool:
+    if not _lead_is_ai_related_product_manager(lead):
+        return False
+    if lead.is_remote_hint is not True:
+        return False
+    combined_location_hint = " ".join(part for part in (lead.location_hint, lead.evidence_notes) if part)
+    if _extract_geo_limited_remote_region(combined_location_hint):
+        return False
+    if lead.posted_date_hint and _hint_is_recent(lead.posted_date_hint, settings) is False:
+        return False
+    salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
+        lead.base_salary_min_usd_hint,
+        lead.base_salary_max_usd_hint,
+        lead.salary_text_hint,
+        lead.evidence_notes,
+    )
+    salary_values = [value for value in (salary_min, salary_max) if value is not None]
+    salary_ok = not salary_values or max(salary_values) >= settings.min_base_salary_usd
+    return salary_ok and (
+        bool(lead.direct_job_url)
+        or lead.source_type in {"direct_ats", "company_site", "builtin"}
+        or bool(salary_values)
+    )
+
+
+def _watchlist_entry_should_skip_resolution(
+    lead: JobLead,
+    settings: Settings,
+    watchlist_entry: dict[str, object],
+) -> bool:
+    if not watchlist_entry:
+        return False
+    stale_count = _watchlist_reason_count(watchlist_entry, "stale_posting")
+    not_remote_count = _watchlist_reason_count(watchlist_entry, "not_remote") + _watchlist_reason_count(
+        watchlist_entry,
+        "remote_unclear",
+    )
+    if max(stale_count, not_remote_count) < 4:
+        return False
+    return not _lead_has_strong_override_hints(lead, settings)
 
 
 def _select_watchlist_focus_companies(
@@ -5006,6 +5053,16 @@ async def _repair_direct_job_url(
     if local_retry and local_retry != bad_direct_url and _is_allowed_direct_job_url(local_retry):
         return local_retry
 
+    company_site_retry = await _resolve_lead_via_company_careers_pages(retry_lead)
+    if company_site_retry and company_site_retry.direct_job_url:
+        normalized_company_retry = _normalize_direct_job_url(company_site_retry.direct_job_url)
+        if (
+            normalized_company_retry != bad_direct_url
+            and _is_allowed_direct_job_url(normalized_company_retry)
+            and not _looks_like_generic_job_url(normalized_company_retry)
+        ):
+            return normalized_company_retry
+
     if agent is None:
         return None
 
@@ -5759,6 +5816,45 @@ async def _validate_candidate(
         expected_role_title=lead.role_title,
         allow_trusted_source_role_fallback=allow_trusted_source_role_fallback,
     )
+    if reason_code in {"resolution_missing", "company_mismatch", "not_specific_job_page"}:
+        repaired_url = await _repair_direct_job_url(
+            resolution_agent,
+            lead,
+            str(merged_job.direct_job_url),
+            detail,
+        )
+        if repaired_url:
+            repaired_candidate = candidate.model_copy(update={"direct_job_url": repaired_url, "resolved_job_url": repaired_url})
+            repaired_snapshot = await fetch_job_page(repaired_url)
+            if repaired_snapshot.status_code == 200:
+                repaired_merged_job = _apply_salary_inference(
+                    _merge_candidate_with_snapshot(repaired_candidate, repaired_snapshot),
+                    repaired_snapshot,
+                    settings,
+                )
+                repaired_merged_job = repaired_merged_job.model_copy(
+                    update={
+                        "lead_refined_by_ollama": lead.refined_by_ollama,
+                        "source_quality_score": lead.source_quality_score_hint or _lead_source_quality_score(lead, settings),
+                    }
+                )
+                repaired_allow_trusted_source_role_fallback = (
+                    _snapshot_looks_like_generic_brand_page(repaired_snapshot, lead.company_name)
+                    and _lead_has_trusted_source_fallback_evidence(lead, settings)
+                )
+                repaired_reason_code, repaired_detail = _evaluate_merged_job(
+                    repaired_merged_job,
+                    repaired_snapshot,
+                    settings,
+                    expected_company_name=lead.company_name,
+                    expected_role_title=lead.role_title,
+                    allow_trusted_source_role_fallback=repaired_allow_trusted_source_role_fallback,
+                )
+                if not repaired_reason_code:
+                    return repaired_merged_job, None, None, None
+                merged_job = repaired_merged_job
+                snapshot = repaired_snapshot
+                reason_code, detail = repaired_reason_code, repaired_detail
     if reason_code:
         failure = _make_failure(
             stage="validation",

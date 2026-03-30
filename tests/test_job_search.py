@@ -6,6 +6,7 @@ from pathlib import Path
 from job_agent.config import Settings
 from job_agent.job_search import (
     SearchTuning,
+    _annotate_and_filter_resolution_leads,
     _apply_salary_inference,
     _apply_company_novelty_quota,
     _build_candidate_job,
@@ -61,6 +62,7 @@ from job_agent.job_search import (
     _normalize_role_title_to_focus_queries,
     _normalize_direct_job_url,
     _precheck_lead_hints,
+    _repair_direct_job_url,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
     _resolve_lead_via_company_careers_pages,
@@ -644,8 +646,9 @@ def test_apply_salary_inference_rejects_non_us_role_without_explicit_compensatio
     assert inferred.salary_inferred is False
 
 
-def test_apply_salary_inference_accepts_us_remote_principal_role_without_explicit_salary() -> None:
+def test_apply_salary_inference_accepts_us_remote_principal_role_without_explicit_salary(monkeypatch) -> None:
     settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
     job = JobPosting(
         company_name="Webflow",
         role_title="Principal Product Manager, AI",
@@ -1420,6 +1423,43 @@ def test_precheck_lead_hints_fast_rejects_stale_non_remote_and_low_salary() -> N
     assert low_salary_failure.reason_code == "salary_below_min"
 
 
+def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_without_override_hints() -> None:
+    settings = build_settings()
+    repeat_stale = JobLead(
+        company_name="RepeatCo",
+        role_title="Senior Product Manager, AI",
+        source_url="https://www.linkedin.com/jobs/view/123",
+        source_type="linkedin",
+        is_remote_hint=True,
+        evidence_notes="AI product manager role.",
+    )
+    fresh_override = JobLead(
+        company_name="RepeatCo",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/repeatco-ai-pm/123",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/repeatco/abc123",
+        posted_date_hint="2026-03-24",
+        is_remote_hint=True,
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="Remote AI product manager role with published salary.",
+    )
+    watchlist = {
+        "repeatco": {
+            "company_name": "RepeatCo",
+            "watch_count": 18,
+            "recent_rejection_reasons": {"stale_posting": 8},
+        }
+    }
+
+    weak_only = _annotate_and_filter_resolution_leads([repeat_stale], settings, watchlist)
+    assert weak_only == []
+
+    with_override = _annotate_and_filter_resolution_leads([fresh_override], settings, watchlist)
+    assert len(with_override) == 1
+    assert with_override[0].company_name == "RepeatCo"
+
+
 def test_normalize_and_filter_discovery_leads_keeps_supported_job_board_pages_without_direct_urls() -> None:
     lead = JobLead(
         company_name="Acme",
@@ -1714,6 +1754,33 @@ def test_job_posting_dedupe_key_normalizes_direct_url_variants() -> None:
     assert _job_posting_dedupe_key(job) == "ashby:january:837101a2-6bc5-44e8-8f93-110638dcaca3"
 
 
+def test_is_ai_related_product_manager_respects_primary_ai_pm_titles_even_with_long_evidence() -> None:
+    job = JobPosting(
+        company_name="Surgo Health",
+        role_title="[Hiring] Senior Product Manager, AI & Data Products @Surgo Health",
+        direct_job_url="https://remotive.com/remote/jobs/product/senior-product-manager-ai-data-products-3780284",
+        resolved_job_url="https://remotive.com/remote/jobs/product/senior-product-manager-ai-data-products-3780284",
+        ats_platform="remotive.com",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-17",
+        posted_date_iso="2026-03-17",
+        evidence_notes="Strong AI product role.",
+        job_page_title="[Hiring] Senior Product Manager, AI & Data Products @Surgo Health",
+        validation_evidence=[
+            " ".join(
+                [
+                    "This long evidence blob includes plenty of surrounding text",
+                    "but should not erase the clear AI product manager signal from the title.",
+                ]
+                * 12
+            )
+        ],
+    )
+
+    assert _is_ai_related_product_manager(job) is True
+
+
 def test_resolve_lead_via_company_careers_pages_walks_homepage_to_board(monkeypatch) -> None:
     lead = JobLead(
         company_name="Versapay",
@@ -1764,6 +1831,47 @@ def test_resolve_lead_via_company_careers_pages_walks_homepage_to_board(monkeypa
     resolution = asyncio.run(_resolve_lead_via_company_careers_pages(lead))
     assert resolution is not None
     assert resolution.direct_job_url == "https://jobs.lever.co/versapay/1305d3eb-5d36-4a7b-86d7-9c2ab53f83d4"
+
+
+def test_repair_direct_job_url_uses_company_careers_resolution_before_agent(monkeypatch) -> None:
+    lead = JobLead(
+        company_name="Versapay",
+        role_title="Principal Product Manager - AI/ML",
+        source_url="https://www.linkedin.com/jobs/view/4389040590",
+        source_type="linkedin",
+        evidence_notes="Remote AI/ML PM role.",
+    )
+
+    async def fake_extract_direct_job_url_from_source(_lead: JobLead) -> str | None:
+        return None
+
+    async def fake_resolve_lead_via_company_careers_pages(_lead: JobLead) -> DirectJobResolution | None:
+        return DirectJobResolution(
+            accepted=True,
+            direct_job_url="https://jobs.lever.co/versapay/1305d3eb-5d36-4a7b-86d7-9c2ab53f83d4",
+            ats_platform="Lever",
+            evidence_notes="Resolved via careers page.",
+        )
+
+    monkeypatch.setattr(
+        "job_agent.job_search._extract_direct_job_url_from_source",
+        fake_extract_direct_job_url_from_source,
+    )
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_via_company_careers_pages",
+        fake_resolve_lead_via_company_careers_pages,
+    )
+
+    repaired = asyncio.run(
+        _repair_direct_job_url(
+            None,
+            lead,
+            "https://jobs.smartrecruiters.com/versapay/wrong-role",
+            "Resolved page title did not line up with expected role.",
+        )
+    )
+
+    assert repaired == "https://jobs.lever.co/versapay/1305d3eb-5d36-4a7b-86d7-9c2ab53f83d4"
 
 
 def test_local_query_rounds_rotate_to_new_variants_across_attempts() -> None:

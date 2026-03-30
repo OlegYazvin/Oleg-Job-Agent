@@ -269,6 +269,28 @@ def _warm_success_median_seconds(events: list[dict[str, Any]]) -> float | None:
     return round(statistics.median(warm_successes[-5:]), 3)
 
 
+def _available_ollama_model_names(settings: Settings) -> set[str]:
+    tags_url = f"{settings.ollama_base_url.rstrip('/')}/api/tags"
+    try:
+        response = httpx.get(tags_url, timeout=2.0)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return set()
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return set()
+    names: set[str] = set()
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        for key in ("name", "model"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                names.add(value)
+    return names
+
+
 def _step_down_profile(profile: OllamaTuningProfile) -> tuple[OllamaTuningProfile, str]:
     if profile.num_batch > 1:
         next_batch = max(1, profile.num_batch // 2)
@@ -295,22 +317,32 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
         outer_timeout_count = sum(1 for entry in recent_events if entry.get("event") == "request_outer_timeout")
         failure_ratio = failure_count / request_event_count
         warm_median = _warm_success_median_seconds(recent_events)
+        available_models = _available_ollama_model_names(settings)
+        degraded_model_available = (
+            not available_models or settings.ollama_degraded_model in available_models
+        )
         update_reason: str | None = None
 
         if warm_median is not None and warm_median > 60 and profile.model != settings.ollama_degraded_model:
-            profile = profile.model_copy(
-                update={
-                    "model": settings.ollama_degraded_model,
-                    "num_ctx": min(profile.num_ctx, 1024),
-                    "num_batch": min(profile.num_batch, 2),
-                    "num_predict": min(profile.num_predict, 192),
-                    "degraded": False,
-                    "degraded_reason": None,
-                }
-            )
-            update_reason = (
-                f"Warm-call median was {warm_median}s over the last 5 successes; switched to {settings.ollama_degraded_model}."
-            )
+            if degraded_model_available:
+                profile = profile.model_copy(
+                    update={
+                        "model": settings.ollama_degraded_model,
+                        "num_ctx": min(profile.num_ctx, 1024),
+                        "num_batch": min(profile.num_batch, 2),
+                        "num_predict": min(profile.num_predict, 192),
+                        "degraded": False,
+                        "degraded_reason": None,
+                    }
+                )
+                update_reason = (
+                    f"Warm-call median was {warm_median}s over the last 5 successes; switched to {settings.ollama_degraded_model}."
+                )
+            else:
+                update_reason = (
+                    f"Warm-call median was {warm_median}s, but configured degraded model "
+                    f"{settings.ollama_degraded_model} is not installed; keeping {profile.model}."
+                )
         elif failure_ratio > 0.2 or outer_timeout_count >= 2:
             stepped_profile, step_reason = _step_down_profile(profile)
             if step_reason:
@@ -319,7 +351,7 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
                     f"Failure ratio {round(failure_ratio, 3)} over the last {request_event_count} requests triggered tuning. "
                     f"{step_reason}"
                 )
-            elif profile.model != settings.ollama_degraded_model:
+            elif profile.model != settings.ollama_degraded_model and degraded_model_available:
                 profile = profile.model_copy(
                     update={
                         "model": settings.ollama_degraded_model,
@@ -334,12 +366,18 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
                     f"Failure ratio {round(failure_ratio, 3)} persisted after knob reductions; switched to {settings.ollama_degraded_model}."
                 )
             else:
+                degraded_reason = (
+                    f"Ollama stayed unstable on {profile.model} after auto-tuning; optional Ollama steps will be skipped for this run."
+                )
+                if profile.model != settings.ollama_degraded_model and not degraded_model_available:
+                    degraded_reason = (
+                        f"Ollama stayed unstable on {profile.model}, and configured degraded model "
+                        f"{settings.ollama_degraded_model} is not installed; optional Ollama steps will be skipped for this run."
+                    )
                 profile = profile.model_copy(
                     update={
                         "degraded": True,
-                        "degraded_reason": (
-                            f"Ollama stayed unstable on {profile.model} after auto-tuning; optional Ollama steps will be skipped for this run."
-                        ),
+                        "degraded_reason": degraded_reason,
                     }
                 )
                 update_reason = profile.degraded_reason

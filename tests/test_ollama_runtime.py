@@ -90,7 +90,10 @@ def test_auto_tune_ollama_settings_reduces_batch_after_failures(tmp_path: Path) 
     assert saved_profile["num_batch"] == 2
 
 
-def test_auto_tune_ollama_settings_switches_to_smaller_model_when_warm_calls_are_slow(tmp_path: Path) -> None:
+def test_auto_tune_ollama_settings_switches_to_smaller_model_when_warm_calls_are_slow(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     settings = build_settings(tmp_path)
     for index in range(5):
         record_ollama_event(
@@ -104,10 +107,44 @@ def test_auto_tune_ollama_settings_switches_to_smaller_model_when_warm_calls_are
             cold_start=False,
         )
 
+    monkeypatch.setattr(
+        "job_agent.ollama_runtime._available_ollama_model_names",
+        lambda _settings: {settings.ollama_model, settings.ollama_degraded_model},
+    )
+
     tuned_settings, profile = auto_tune_ollama_settings(settings, run_id="run-slow")
 
     assert tuned_settings.ollama_model == "qwen2.5:3b-instruct"
     assert profile.model == "qwen2.5:3b-instruct"
+
+
+def test_auto_tune_ollama_settings_keeps_current_model_when_degraded_model_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = build_settings(tmp_path)
+    for index in range(5):
+        record_ollama_event(
+            settings,
+            "request_success",
+            run_id=f"slow-{index}",
+            caller="drafting",
+            prompt_category="first_order_messages",
+            model=settings.ollama_model,
+            wall_duration_seconds=75.0,
+            cold_start=False,
+        )
+
+    monkeypatch.setattr(
+        "job_agent.ollama_runtime._available_ollama_model_names",
+        lambda _settings: {settings.ollama_model},
+    )
+
+    tuned_settings, profile = auto_tune_ollama_settings(settings, run_id="run-slow")
+
+    assert tuned_settings.ollama_model == settings.ollama_model
+    assert profile.model == settings.ollama_model
+    assert profile.degraded is False
 
 
 def test_build_ollama_run_summary_aggregates_quality_counters(tmp_path: Path) -> None:
