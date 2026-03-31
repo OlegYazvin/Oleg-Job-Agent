@@ -1,4 +1,8 @@
-from job_agent.dashboard import _compute_dashboard_minimum_size
+from job_agent.dashboard import (
+    _compute_dashboard_minimum_size,
+    _format_scorecard_summary,
+    _scorecard_detail_lines,
+)
 
 
 def test_compute_dashboard_minimum_size_respects_defaults() -> None:
@@ -7,3 +11,44 @@ def test_compute_dashboard_minimum_size_respects_defaults() -> None:
 
 def test_compute_dashboard_minimum_size_expands_for_required_layout() -> None:
     assert _compute_dashboard_minimum_size(1420, 830) == (1420, 830)
+
+
+def test_format_scorecard_summary_renders_primary_metrics() -> None:
+    rendered = _format_scorecard_summary(
+        {
+            "outcome": {
+                "validated_jobs_count": 2,
+                "jobs_with_messages_count": 1,
+                "fresh_new_leads_count": 14,
+                "actionable_near_miss_count": 3,
+            },
+            "discovery": {"query_timeout_count": 4},
+            "validation": {"validated_yield": 0.143},
+        }
+    )
+
+    assert "Validated jobs: 2" in rendered
+    assert "Jobs with messages: 1" in rendered
+    assert "Fresh leads: 14" in rendered
+    assert "Actionable near-misses: 3" in rendered
+
+
+def test_scorecard_detail_lines_include_discovery_and_ollama_context() -> None:
+    lines = _scorecard_detail_lines(
+        {
+            "outcome": {"fresh_new_leads_count": 9, "actionable_near_miss_count": 2},
+            "discovery": {
+                "replayed_seed_leads_count": 4,
+                "repeated_failed_leads_suppressed_count": 7,
+                "query_timeout_count": 3,
+                "discovery_efficiency": 1.5,
+            },
+            "validation": {"message_coverage_rate": 0.5},
+            "ollama": {"request_count": 2, "useful_actions_per_request": 0.5},
+            "timing": {"duration_seconds": 720.0},
+        }
+    )
+
+    assert "Fresh new leads: 9" in lines
+    assert "Replay seeds: 4" in lines
+    assert "Ollama requests: 2" in lines

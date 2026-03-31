@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from .config import Settings
@@ -16,7 +15,6 @@ from .models import JobOutreachBundle, RunManifest
 from .ollama_runtime import (
     auto_tune_ollama_settings,
     build_ollama_run_summary,
-    prewarm_ollama_model,
     save_ollama_run_summary,
 )
 from .reports import (
@@ -27,6 +25,7 @@ from .reports import (
     build_near_miss_payload,
     build_summary_document,
 )
+from .scorecard import save_failed_run_scorecard
 from .status import StatusReporter
 from .storage import save_run_artifacts
 
@@ -61,43 +60,18 @@ async def _run_daily_workflow_body(
             if status:
                 status.emit(
                     "starting",
-                    "Skipping Ollama prewarm because optional Ollama steps are already degraded for this run.",
+                    "Optional Ollama steps are already degraded for this run.",
                     ollama_model=settings.ollama_model,
                     ollama_degraded_reason=settings.ollama_degraded_reason,
                 )
         else:
-            prewarm_ok, prewarm_error, prewarm_duration = await prewarm_ollama_model(settings, run_id=run_id)
-            if prewarm_ok:
-                if status:
-                    status.emit(
-                        "starting",
-                        "Prewarmed Ollama model for this run.",
-                        ollama_model=settings.ollama_model,
-                        ollama_prewarm_duration_seconds=prewarm_duration,
-                    )
-            else:
-                degraded_reason = f"Ollama prewarm failed before search: {prewarm_error or 'unknown error'}"
-                settings = replace(
-                    settings,
-                    ollama_degraded_for_run=True,
-                    ollama_degraded_reason=degraded_reason,
+            if status:
+                status.emit(
+                    "starting",
+                    "Deferred Ollama prewarm until the first actual local-model task for this run.",
+                    ollama_model=settings.ollama_model,
+                    ollama_degraded_for_run=False,
                 )
-                if tuning_profile is not None:
-                    tuning_profile = tuning_profile.model_copy(
-                        update={
-                            "degraded": True,
-                            "degraded_reason": degraded_reason,
-                        }
-                    )
-                if status:
-                    status.emit(
-                        "starting",
-                        "Ollama prewarm failed; optional Ollama steps will be skipped for this run.",
-                        ollama_model=settings.ollama_model,
-                        ollama_prewarm_duration_seconds=prewarm_duration,
-                        ollama_degraded_for_run=True,
-                        ollama_degraded_reason=degraded_reason,
-                    )
 
     jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(settings, status=status, run_id=run_id)
     linkedin = LinkedInClient(settings)
@@ -191,7 +165,7 @@ async def _run_daily_workflow_body(
 
     if status:
         status.emit("reporting", "Building Word documents and saving run artifacts.", qualifying_jobs=len(jobs))
-    generated_at = datetime.now()
+    generated_at = datetime.now(UTC)
     message_docx_path = build_message_document(bundles, settings.output_dir, generated_at=generated_at)
     summary_docx_path = build_summary_document(bundles, settings.output_dir, generated_at=generated_at)
     near_miss_docx_path = build_near_miss_document(
@@ -292,6 +266,12 @@ async def run_daily_workflow(
             status_payload=status.snapshot() if status else None,
             failure_message=f"Workflow timed out after {effective_timeout} seconds.",
         )
+        save_failed_run_scorecard(
+            settings.data_dir,
+            run_id=run_id,
+            status_payload=status.snapshot() if status else None,
+            failure_message=f"Workflow timed out after {effective_timeout} seconds.",
+        )
         raise
     except asyncio.CancelledError:
         if status:
@@ -302,11 +282,23 @@ async def run_daily_workflow(
             status_payload=status.snapshot() if status else None,
             failure_message="Workflow terminated before completion.",
         )
+        save_failed_run_scorecard(
+            settings.data_dir,
+            run_id=run_id,
+            status_payload=status.snapshot() if status else None,
+            failure_message="Workflow terminated before completion.",
+        )
         raise
     except Exception as exc:
         if status:
             status.fail(f"Workflow failed: {exc}")
         record_failed_run(
+            settings.data_dir,
+            run_id=run_id,
+            status_payload=status.snapshot() if status else None,
+            failure_message=f"Workflow failed: {exc}",
+        )
+        save_failed_run_scorecard(
             settings.data_dir,
             run_id=run_id,
             status_payload=status.snapshot() if status else None,

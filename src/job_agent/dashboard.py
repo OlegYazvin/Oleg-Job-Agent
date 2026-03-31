@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import load_settings
 from .history import load_job_history_entries, load_run_history_entries
+from .scorecard import load_latest_run_scorecard, load_run_scorecard_entries
 from .ollama_runtime import load_latest_ollama_summary, load_ollama_tuning_profile
 from .status import _pid_is_alive, _read_status_payload, can_launch_progress_gui
 
@@ -114,6 +115,46 @@ def _compute_dashboard_minimum_size(
     default_height: int = _DASHBOARD_DEFAULT_MIN_HEIGHT,
 ) -> tuple[int, int]:
     return max(default_width, required_width), max(default_height, required_height)
+
+
+def _format_scorecard_summary(scorecard: dict[str, Any] | None) -> str:
+    if not scorecard:
+        return "Latest scorecard: unavailable"
+    outcome = dict(scorecard.get("outcome") or {})
+    discovery = dict(scorecard.get("discovery") or {})
+    validation = dict(scorecard.get("validation") or {})
+    return (
+        f"Latest scorecard\n"
+        f"Validated jobs: {int(outcome.get('validated_jobs_count') or 0)} | "
+        f"Jobs with messages: {int(outcome.get('jobs_with_messages_count') or 0)}\n"
+        f"Fresh leads: {int(outcome.get('fresh_new_leads_count') or 0)} | "
+        f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}\n"
+        f"Timeouts: {int(discovery.get('query_timeout_count') or 0)} | "
+        f"Validation yield: {validation.get('validated_yield', 0.0)}"
+    )
+
+
+def _scorecard_detail_lines(scorecard: dict[str, Any] | None) -> list[str]:
+    if not scorecard:
+        return ["Run scorecard: unavailable"]
+    outcome = dict(scorecard.get("outcome") or {})
+    discovery = dict(scorecard.get("discovery") or {})
+    validation = dict(scorecard.get("validation") or {})
+    ollama = dict(scorecard.get("ollama") or {})
+    timing = dict(scorecard.get("timing") or {})
+    return [
+        "Run Scorecard",
+        f"Fresh new leads: {int(outcome.get('fresh_new_leads_count') or 0)}",
+        f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}",
+        f"Replay seeds: {int(discovery.get('replayed_seed_leads_count') or 0)}",
+        f"Repeated failures suppressed: {int(discovery.get('repeated_failed_leads_suppressed_count') or 0)}",
+        f"Query timeouts: {int(discovery.get('query_timeout_count') or 0)}",
+        f"Discovery efficiency: {discovery.get('discovery_efficiency', 0.0)}",
+        f"Message coverage: {validation.get('message_coverage_rate', 0.0)}",
+        f"Ollama requests: {int(ollama.get('request_count') or 0)}",
+        f"Ollama useful/request: {ollama.get('useful_actions_per_request', 0.0)}",
+        f"Duration (s): {timing.get('duration_seconds', 'n/a')}",
+    ]
 
 
 def _enforce_dashboard_minimum_size(root: tk.Tk) -> None:  # pragma: no cover - GUI-only
@@ -246,6 +287,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     current_updated_var = tk.StringVar(value="")
     current_metrics_var = tk.StringVar(value="")
     history_counts_var = tk.StringVar(value="")
+    scorecard_var = tk.StringVar(value="Latest scorecard: unavailable")
     ollama_var = tk.StringVar(value="")
 
     ttk.Label(current_card, textvariable=current_stage_var, style="Body.TLabel").pack(anchor="w", pady=(8, 2))
@@ -255,6 +297,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     ttk.Label(current_card, textvariable=current_updated_var, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
     ttk.Label(current_card, textvariable=current_metrics_var, style="Body.TLabel", justify="left").pack(anchor="w", pady=(10, 0))
     ttk.Label(current_card, textvariable=history_counts_var, style="Muted.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
+    ttk.Label(current_card, textvariable=scorecard_var, style="Muted.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
     ttk.Label(current_card, textvariable=ollama_var, style="Muted.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
 
     controls_card = ttk.Frame(right_panel, style="Card.TFrame")
@@ -348,6 +391,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     events_box.pack(fill="both", expand=True, pady=(10, 0))
 
     current_runs: list[dict[str, Any]] = []
+    scorecards_by_run_id: dict[str, dict[str, Any]] = {}
 
     def render_selected_run(*args) -> None:
         selection = tree.selection()
@@ -369,6 +413,8 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
             f"Message DOCX: {selected.get('message_docx_path') or 'n/a'}",
             f"Summary DOCX: {selected.get('summary_docx_path') or 'n/a'}",
             "",
+            *_scorecard_detail_lines(scorecards_by_run_id.get(run_id)),
+            "",
             f"Message: {selected.get('message') or ''}",
         ]
         run_details.delete("1.0", tk.END)
@@ -377,10 +423,13 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
     tree.bind("<<TreeviewSelect>>", render_selected_run)
 
     def refresh() -> None:
-        nonlocal current_runs
+        nonlocal current_runs, scorecards_by_run_id
         live_status = _read_status_payload(settings.live_status_path)
         run_history = load_run_history_entries(settings.data_dir)
         job_history = load_job_history_entries(settings.data_dir)
+        run_scorecards = load_run_scorecard_entries(settings.data_dir)
+        latest_scorecard = load_latest_run_scorecard(settings.data_dir)
+        scorecards_by_run_id = {entry.run_id: entry.model_dump(mode="json") for entry in run_scorecards}
         ollama_profile = load_ollama_tuning_profile(settings)
         ollama_summary = load_latest_ollama_summary(settings)
         current_runs = _build_runs_for_display(live_status, run_history)
@@ -404,7 +453,11 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
         current_metrics_var.set("\n".join(metrics_lines))
         history_counts_var.set(
             f"Historical runs logged: {len(run_history)}\n"
-            f"Unique jobs archived: {len(job_history)}"
+            f"Unique jobs archived: {len(job_history)}\n"
+            f"Run scorecards logged: {len(run_scorecards)}"
+        )
+        scorecard_var.set(
+            _format_scorecard_summary(latest_scorecard.model_dump(mode="json") if latest_scorecard else None)
         )
         ollama_lines = [
             f"Ollama profile: {ollama_profile.model} | ctx {ollama_profile.num_ctx} | batch {ollama_profile.num_batch}",

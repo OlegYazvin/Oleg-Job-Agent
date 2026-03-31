@@ -84,6 +84,7 @@ def test_run_daily_workflow_marks_status_failed_when_timeout_elapses(
     assert payload["stage"] == "failed"
     assert "timed out" in payload["message"].lower()
     assert payload["metrics"]["workflow_timeout_seconds"] == 0.01
+    assert (tmp_path / "data" / "run-scorecard-latest.json").exists()
 
 
 def test_run_daily_workflow_writes_near_miss_and_ollama_summary_artifacts(
@@ -141,10 +142,6 @@ def test_run_daily_workflow_writes_near_miss_and_ollama_summary_artifacts(
     monkeypatch.setattr("job_agent.workflow.find_matching_jobs", fake_find_matching_jobs)
     monkeypatch.setattr("job_agent.workflow.draft_outreach_bundle", fake_draft_outreach_bundle)
     monkeypatch.setattr("job_agent.workflow.auto_tune_ollama_settings", lambda configured, run_id=None: (configured, profile))
-    monkeypatch.setattr(
-        "job_agent.workflow.prewarm_ollama_model",
-        lambda configured, run_id=None: asyncio.sleep(0, result=(True, None, 1.25)),
-    )
 
     bundles, manifest = asyncio.run(run_daily_workflow(settings, status=status, timeout_seconds=10))
 
@@ -152,11 +149,13 @@ def test_run_daily_workflow_writes_near_miss_and_ollama_summary_artifacts(
     assert manifest.near_miss_count == 1
     assert (tmp_path / "data" / "near-misses-latest.json").exists()
     assert (tmp_path / "data" / "ollama-summary-latest.json").exists()
+    assert (tmp_path / "data" / "run-scorecard-latest.json").exists()
+    assert (tmp_path / "data" / "run-scorecards.jsonl").exists()
     summary_payload = json.loads((tmp_path / "data" / "ollama-summary-latest.json").read_text(encoding="utf-8"))
     assert summary_payload["run_id"] == manifest.run_id
 
 
-def test_run_daily_workflow_marks_ollama_degraded_when_prewarm_fails(
+def test_run_daily_workflow_defers_ollama_prewarm_until_needed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -179,15 +178,10 @@ def test_run_daily_workflow_marks_ollama_degraded_when_prewarm_fails(
 
     monkeypatch.setattr("job_agent.workflow.find_matching_jobs", fake_find_matching_jobs)
     monkeypatch.setattr("job_agent.workflow.auto_tune_ollama_settings", lambda configured, run_id=None: (configured, profile))
-    monkeypatch.setattr(
-        "job_agent.workflow.prewarm_ollama_model",
-        lambda configured, run_id=None: asyncio.sleep(0, result=(False, "ReadTimeout: timed out", 61.5)),
-    )
 
     bundles, manifest = asyncio.run(run_daily_workflow(settings, status=status, timeout_seconds=10))
 
     assert bundles == []
     assert manifest.jobs_kept_after_validation == 0
     summary_payload = json.loads((tmp_path / "data" / "ollama-summary-latest.json").read_text(encoding="utf-8"))
-    assert summary_payload["tuning_profile"]["degraded"] is True
-    assert "prewarm failed" in summary_payload["tuning_profile"]["degraded_reason"].lower()
+    assert summary_payload["tuning_profile"]["degraded"] is False

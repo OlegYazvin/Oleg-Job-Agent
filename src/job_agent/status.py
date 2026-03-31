@@ -106,8 +106,11 @@ def spawn_progress_gui(status_path: Path) -> subprocess.Popen[bytes] | None:
     try:
         return subprocess.Popen(
             [sys.executable, "-m", "job_agent.dashboard"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
     except Exception:
         return None

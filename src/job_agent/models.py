@@ -123,8 +123,10 @@ class SearchPassSummary(BaseModel):
 
 
 class SearchDiagnostics(BaseModel):
+    run_id: str | None = None
     minimum_qualifying_jobs: int
     unique_leads_discovered: int = 0
+    seed_replayed_lead_count: int = 0
     failures: list[SearchFailure] = Field(default_factory=list)
     passes: list[SearchPassSummary] = Field(default_factory=list)
     near_misses: list[NearMissJob] = Field(default_factory=list)
@@ -332,3 +334,160 @@ class OllamaRunSummary(BaseModel):
     caller_breakdown: dict[str, int] = Field(default_factory=dict)
     prompt_category_breakdown: dict[str, int] = Field(default_factory=dict)
     quality_counters: dict[str, float] = Field(default_factory=dict)
+
+
+class RunOutcomeMetrics(BaseModel):
+    validated_jobs_count: int = 0
+    jobs_with_messages_count: int = 0
+    unique_leads_discovered_count: int = 0
+    fresh_new_leads_count: int = 0
+    actionable_near_miss_count: int = 0
+    raw_near_miss_count: int = 0
+
+
+class RunDiscoveryMetrics(BaseModel):
+    unique_leads_discovered_count: int = 0
+    fresh_new_leads_count: int = 0
+    replayed_seed_leads_count: int = 0
+    repeated_failed_leads_suppressed_count: int = 0
+    executed_query_count: int = 0
+    query_timeout_count: int = 0
+    query_skipped_timeout_budget_count: int = 0
+    zero_yield_pass_count: int = 0
+    discovery_efficiency: float = 0.0
+
+
+class RunValidationMetrics(BaseModel):
+    validated_jobs_count: int = 0
+    validated_yield: float = 0.0
+    jobs_with_messages_count: int = 0
+    message_coverage_rate: float = 0.0
+    raw_near_miss_count: int = 0
+    actionable_near_miss_count: int = 0
+    actionable_near_miss_yield: float = 0.0
+    company_mismatch_count: int = 0
+    not_specific_job_page_count: int = 0
+    missing_salary_count: int = 0
+    fetch_non_200_count: int = 0
+    stale_posting_count: int = 0
+    not_remote_count: int = 0
+    false_negative_fixable_count: int = 0
+    false_negative_near_miss_count: int = 0
+    false_negative_correct_rejection_count: int = 0
+
+
+class RunOllamaMetrics(BaseModel):
+    model: str | None = None
+    degraded: bool = False
+    request_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    outer_timeout_count: int = 0
+    warm_hit_rate: float = 0.0
+    median_wall_duration_seconds: float | None = None
+    p95_wall_duration_seconds: float | None = None
+    useful_action_count: float = 0.0
+    useful_actions_per_request: float = 0.0
+    quality_counters: dict[str, float] = Field(default_factory=dict)
+
+
+class RunTimingMetrics(BaseModel):
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+    time_to_first_validated_job_seconds: float | None = None
+
+
+class RunScorecard(BaseModel):
+    run_id: str
+    generated_at: datetime
+    status: str
+    outcome: RunOutcomeMetrics = Field(default_factory=RunOutcomeMetrics)
+    discovery: RunDiscoveryMetrics = Field(default_factory=RunDiscoveryMetrics)
+    validation: RunValidationMetrics = Field(default_factory=RunValidationMetrics)
+    ollama: RunOllamaMetrics = Field(default_factory=RunOllamaMetrics)
+    timing: RunTimingMetrics = Field(default_factory=RunTimingMetrics)
+    message_docx_path: str | None = None
+    summary_docx_path: str | None = None
+    near_miss_docx_path: str | None = None
+    near_miss_json_path: str | None = None
+    ollama_summary_json_path: str | None = None
+
+
+class ImprovementPattern(BaseModel):
+    key: str
+    summary: str
+    severity_score: float = 0.0
+    evidence: dict[str, float | int | str | None] = Field(default_factory=dict)
+
+
+class RunImprovementAnalysis(BaseModel):
+    iteration_number: int
+    generated_at: datetime
+    target_run_id: str | None = None
+    analyzed_run_ids: list[str] = Field(default_factory=list)
+    current_run_status: str
+    current_metrics: dict[str, float | int | str | None] = Field(default_factory=dict)
+    metric_deltas: dict[str, float] = Field(default_factory=dict)
+    top_patterns: list[ImprovementPattern] = Field(default_factory=list)
+    selected_theme: str
+    selected_summary: str
+    acceptance_checks: list[str] = Field(default_factory=list)
+    artifact_paths: dict[str, str] = Field(default_factory=dict)
+
+
+class ValidationCommandResult(BaseModel):
+    command: str
+    passed: bool
+    exit_code: int
+    output_path: str | None = None
+
+
+class CodexIterationResult(BaseModel):
+    iteration_number: int
+    generated_at: datetime
+    status: Literal["succeeded", "failed", "validation_failed", "no_changes", "commit_failed", "session_failed"]
+    session_id: str | None = None
+    selected_theme: str | None = None
+    prompt_path: str | None = None
+    log_path: str | None = None
+    last_message_path: str | None = None
+    exit_code: int | None = None
+    summary: str | None = None
+    validation_commands: list[str] = Field(default_factory=list)
+    validation_results: list[ValidationCommandResult] = Field(default_factory=list)
+    commit_hash: str | None = None
+    commit_message: str | None = None
+
+
+class AutoLoopIteration(BaseModel):
+    iteration_number: int
+    run_id: str | None = None
+    run_status: Literal["completed", "failed", "unknown"] = "unknown"
+    started_at: datetime
+    completed_at: datetime | None = None
+    selected_theme: str | None = None
+    analysis_path: str | None = None
+    prompt_path: str | None = None
+    result_path: str | None = None
+    codex_log_path: str | None = None
+    codex_last_message_path: str | None = None
+    commit_hash: str | None = None
+    validation_passed: bool = False
+
+
+class AutoLoopState(BaseModel):
+    enabled: bool = False
+    status: Literal["idle", "running", "analysis", "waiting_for_codex", "validating", "stopped", "failed"] = "idle"
+    target_attempts: int = 0
+    completed_attempts: int = 0
+    current_iteration: int = 0
+    current_run_id: str | None = None
+    codex_session_id: str | None = None
+    baseline_commit_hash: str | None = None
+    latest_commit_hash: str | None = None
+    latest_validation_result: str | None = None
+    last_failure_summary: str | None = None
+    started_at: datetime | None = None
+    updated_at: datetime | None = None
+    iterations: list[AutoLoopIteration] = Field(default_factory=list)

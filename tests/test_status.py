@@ -1,22 +1,26 @@
-import json
 from pathlib import Path
+import subprocess
 
-from job_agent.status import StatusReporter
+import job_agent.status as status
 
 
-def test_status_reporter_writes_latest_state(tmp_path: Path) -> None:
-    status_path = tmp_path / "live-status.json"
-    reporter = StatusReporter(status_path)
+def test_spawn_progress_gui_detaches_dashboard(monkeypatch) -> None:
+    recorded: dict[str, object] = {}
 
-    reporter.emit("search", "Searching for jobs.", qualifying_jobs=3)
-    reporter.heartbeat("Still running.")
-    reporter.complete("Done.", qualifying_jobs=5)
+    def fake_popen(args, **kwargs):
+        recorded["args"] = args
+        recorded["kwargs"] = kwargs
+        return "process"
 
-    payload = json.loads(status_path.read_text(encoding="utf-8"))
-    assert payload["done"] is True
-    assert payload["failed"] is False
-    assert payload["stage"] == "completed"
-    assert payload["message"] == "Done."
-    assert payload["metrics"]["qualifying_jobs"] == 5
-    assert payload["metrics"]["heartbeat_count"] == 1
-    assert payload["recent_events"]
+    monkeypatch.setattr(status, "can_launch_progress_gui", lambda: True)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    launched = status.spawn_progress_gui(Path("data/live-status.json"))
+
+    assert launched == "process"
+    assert recorded["args"] == [status.sys.executable, "-m", "job_agent.dashboard"]
+    assert recorded["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert recorded["kwargs"]["stdout"] is subprocess.DEVNULL
+    assert recorded["kwargs"]["stderr"] is subprocess.DEVNULL
+    assert recorded["kwargs"]["start_new_session"] is True
+    assert recorded["kwargs"]["close_fds"] is True

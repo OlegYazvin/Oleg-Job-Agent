@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 import shutil
 
@@ -37,7 +37,7 @@ def build_message_document(
     *,
     generated_at: datetime | None = None,
 ) -> Path:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now(UTC)
     document = Document()
     document.add_heading("LinkedIn Outreach Drafts", level=0)
     document.add_paragraph(f"Generated at: {generated_at.isoformat(timespec='seconds')}")
@@ -90,7 +90,7 @@ def build_summary_document(
     *,
     generated_at: datetime | None = None,
 ) -> Path:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now(UTC)
     document = Document()
     document.add_heading("Job Summary", level=0)
     document.add_paragraph(f"Generated at: {generated_at.isoformat(timespec='seconds')}")
@@ -132,7 +132,7 @@ def build_near_miss_document(
     *,
     generated_at: datetime | None = None,
 ) -> Path:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now(UTC)
     document = Document()
     document.add_heading("Job Near Misses", level=0)
     document.add_paragraph(f"Generated at: {generated_at.isoformat(timespec='seconds')}")
@@ -195,7 +195,7 @@ def build_live_outreach_payload(
     run_id: str,
     generated_at: datetime | None = None,
 ) -> dict[str, object]:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now(UTC)
     items: list[dict[str, object]] = []
     priority_rank = 1
 
@@ -264,7 +264,7 @@ def build_near_miss_payload(
     run_id: str,
     generated_at: datetime | None = None,
 ) -> dict[str, object]:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now(UTC)
     return {
         "run_id": run_id,
         "generated_at": generated_at.isoformat(timespec="seconds"),
@@ -286,7 +286,7 @@ def build_manifest(
     ollama_summary_json_path: Path | None = None,
     generated_at: datetime | None = None,
 ) -> RunManifest:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now(UTC)
     return RunManifest(
         run_id=run_id,
         generated_at=generated_at,

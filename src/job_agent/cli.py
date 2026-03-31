@@ -7,6 +7,7 @@ import shlex
 import signal
 import shutil
 
+from .auto_loop import run_autonomous_loop
 from .config import load_settings
 from .dashboard import run_dashboard
 from .firefox_extension_host import (
@@ -37,6 +38,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Hard-stop the workflow after this many seconds. Overrides WORKFLOW_TIMEOUT_SECONDS for this run.",
+    )
+    auto_loop_parser = subparsers.add_parser(
+        "autonomous-loop",
+        help="Run the autonomous 20-run Codex improvement loop.",
+    )
+    auto_loop_parser.add_argument(
+        "--attempts",
+        type=int,
+        default=20,
+        help="Maximum number of workflow attempts to run before stopping.",
+    )
+    auto_loop_parser.add_argument("--no-gui", action="store_true", help="Do not open the live progress window.")
+    auto_loop_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=None,
+        help="Hard-stop each workflow attempt after this many seconds.",
     )
     subparsers.add_parser("doctor", help="Show the current setup and authentication readiness.")
     subparsers.add_parser("install-cron", help="Install or update a daily user crontab entry.")
@@ -107,6 +125,17 @@ async def _run_workflow(*, show_gui: bool, timeout_seconds: int | None = None) -
 
     print(json.dumps(manifest.model_dump(mode="json"), indent=2))
     print(f"Generated {len(bundles)} job bundles.")
+
+
+async def _run_autonomous_loop(*, show_gui: bool, attempts: int, timeout_seconds: int | None = None) -> None:
+    settings = load_settings()
+    state = await run_autonomous_loop(
+        settings,
+        attempts=attempts,
+        show_gui=show_gui,
+        timeout_seconds=timeout_seconds,
+    )
+    print(json.dumps(state.model_dump(mode="json"), indent=2))
 
 
 def _run_doctor() -> None:
@@ -203,6 +232,14 @@ def main() -> None:
         asyncio.run(_run_bootstrap_google())
     elif args.command == "run":
         asyncio.run(_run_workflow(show_gui=not args.no_gui, timeout_seconds=args.timeout_seconds))
+    elif args.command == "autonomous-loop":
+        asyncio.run(
+            _run_autonomous_loop(
+                show_gui=not args.no_gui,
+                attempts=args.attempts,
+                timeout_seconds=args.timeout_seconds,
+            )
+        )
     elif args.command == "doctor":
         _run_doctor()
     elif args.command == "install-cron":

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from html import unescape
 import json
+from pathlib import Path
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
@@ -35,7 +36,7 @@ from .models import (
     SearchFailure,
     SearchPassSummary,
 )
-from .ollama_runtime import record_ollama_event
+from .ollama_runtime import prewarm_ollama_model, record_ollama_event
 from .status import StatusReporter
 from .storage import save_json_snapshot
 
@@ -213,6 +214,48 @@ RECENCY_REASON_CODES = {"stale_posting", "missing_posted_date"}
 SALARY_REASON_CODES = {"missing_salary", "salary_below_min", "salary_not_base"}
 REMOTE_REASON_CODES = {"not_remote", "remote_unclear"}
 RESOLUTION_REASON_CODES = {"resolution_missing", "resolution_blocked_url", "not_specific_job_page", "fetch_non_200"}
+REPLAYABLE_FAILURE_REASON_CODES = {
+    "resolution_missing",
+    "resolution_blocked_url",
+    "fetch_non_200",
+    "missing_salary",
+    "missing_posted_date",
+    "remote_unclear",
+    "validation_timeout",
+    "resolution_timeout",
+}
+FAILED_LEAD_TRACKED_REASON_CODES = {
+    "stale_posting",
+    "not_remote",
+    "remote_unclear",
+    "salary_below_min",
+    "salary_not_base",
+    "company_mismatch",
+    "direct_url_not_allowed",
+    "not_specific_job_page",
+    "fetch_non_200",
+    "resolution_missing",
+    "resolution_blocked_url",
+    "not_ai_product_manager",
+    "already_reported",
+}
+FAILED_LEAD_IMMEDIATE_SUPPRESS_REASON_CODES = {
+    "company_mismatch",
+    "direct_url_not_allowed",
+    "not_specific_job_page",
+    "already_reported",
+}
+FAILED_LEAD_REPEAT_SUPPRESS_THRESHOLDS = {
+    "stale_posting": 2,
+    "not_remote": 2,
+    "remote_unclear": 3,
+    "salary_below_min": 2,
+    "salary_not_base": 2,
+    "not_ai_product_manager": 2,
+    "fetch_non_200": 3,
+    "resolution_missing": 3,
+    "resolution_blocked_url": 3,
+}
 ADAPTIVE_FOCUS_REASON_CODES = {
     "resolution_missing",
     "resolution_blocked_url",
@@ -233,6 +276,13 @@ FOCUSABLE_REASON_CODES = {
     "remote_unclear",
 }
 BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD = 6
+TIMEOUT_SENSITIVE_QUERY_MARKERS = (
+    "site:workatastartup.com/jobs",
+    "site:getro.com/companies",
+    "site:ycombinator.com/companies",
+    "site:wellfound.com/jobs",
+)
+TIMEOUT_SENSITIVE_QUERY_SKIP_THRESHOLD = 2
 
 LOCAL_OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
 BUILTIN_PRIMARY_BASE_URL = "https://builtin.com"
@@ -318,8 +368,32 @@ LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT = 3
 LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT = 2
 LOCAL_SEARCH_TOTAL_QUERY_LIMIT = 14
 SEARCH_QUERY_RESULT_CACHE: dict[tuple[str, int], list[tuple[str, str, str]]] = {}
+FORCED_OLLAMA_REFINEMENT_ATTEMPTS: set[tuple[str, int]] = set()
+FORCED_OLLAMA_ROUND_REFINEMENT_ATTEMPTS: set[tuple[str, int]] = set()
+FORCED_OLLAMA_SEED_REFINEMENT_RUNS: set[str] = set()
+LAZY_OLLAMA_PREWARM_RUNS: set[str] = set()
 SEED_LEADS_FILENAME = "seed-leads.json"
+FAILED_LEAD_HISTORY_FILENAME = "failed-lead-history.json"
+QUERY_FAMILY_HISTORY_FILENAME = "query-family-history.json"
 NOVEL_COMPANY_TARGET_RATIO = 0.90
+LOW_TRUST_REPLAY_SOURCE_HOST_FRAGMENTS = (
+    "mediabistro.com",
+    "smartrecruiterscareers.com",
+    "jobgether.com",
+    "thatstartupjob.com",
+    "remotejobshive.com",
+    "tracxn.com",
+    "remoterocketship.com",
+)
+QUERY_FAMILY_COOLDOWN_ELIGIBLE = {
+    "broad_generic",
+    "generic_discovery",
+    "startup_getro",
+    "startup_generic",
+    "startup_wellfound",
+    "startup_workatastartup",
+    "startup_ycombinator",
+}
 TRACKING_QUERY_PARAM_NAMES = {
     "gh_src",
     "gh_sid",
@@ -769,6 +843,151 @@ def _job_history_primary_key(url: str | None) -> str:
     if canonical:
         return canonical
     return _normalize_direct_job_url(str(url or ""))
+
+
+def _failed_lead_history_key_candidates(
+    company_name: str | None,
+    role_title: str | None,
+    *,
+    source_url: str | None = None,
+    direct_job_url: str | None = None,
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for url in (direct_job_url, source_url):
+        for candidate in sorted(_job_history_key_candidates(url)):
+            key = f"url:{candidate}"
+            if key not in seen:
+                seen.add(key)
+                candidates.append(key)
+    normalized_role_key = ""
+    if str(company_name or "").strip() and str(role_title or "").strip():
+        normalized_role_key = _normalize_job_key(str(company_name), str(role_title))
+    if normalized_role_key:
+        role_key = f"role:{normalized_role_key}"
+        if role_key not in seen:
+            candidates.append(role_key)
+    return candidates
+
+
+def _record_failed_lead_history_entry(
+    history: dict[str, dict[str, object]],
+    failure: SearchFailure,
+    *,
+    generated_at: str,
+) -> None:
+    if failure.reason_code not in FAILED_LEAD_TRACKED_REASON_CODES:
+        return
+    keys = _failed_lead_history_key_candidates(
+        failure.company_name,
+        failure.role_title,
+        source_url=failure.source_url,
+        direct_job_url=failure.direct_job_url,
+    )
+    if not keys:
+        return
+    for key in keys:
+        entry = dict(history.get(key) or {})
+        reason_counts = {
+            str(reason): int(count)
+            for reason, count in dict(entry.get("recent_rejection_reasons") or {}).items()
+            if str(reason).strip()
+        }
+        reason_counts[failure.reason_code] = reason_counts.get(failure.reason_code, 0) + 1
+        source_urls = [str(item).strip() for item in entry.get("source_urls", []) if str(item).strip()]
+        direct_job_urls = [str(item).strip() for item in entry.get("direct_job_urls", []) if str(item).strip()]
+        if failure.source_url and failure.source_url not in source_urls:
+            source_urls.append(failure.source_url)
+        if failure.direct_job_url and failure.direct_job_url not in direct_job_urls:
+            direct_job_urls.append(failure.direct_job_url)
+        entry.update(
+            {
+                "lead_key": key,
+                "company_name": failure.company_name,
+                "role_title": failure.role_title,
+                "first_seen_at": entry.get("first_seen_at") or generated_at,
+                "last_seen_at": generated_at,
+                "watch_count": int(entry.get("watch_count") or 0) + 1,
+                "last_reason_code": failure.reason_code,
+                "last_detail": failure.detail[:240],
+                "source_urls": source_urls[:6],
+                "direct_job_urls": direct_job_urls[:6],
+                "recent_rejection_reasons": reason_counts,
+            }
+        )
+        history[key] = entry
+
+
+def _load_failed_lead_history(settings: Settings) -> dict[str, dict[str, object]]:
+    history: dict[str, dict[str, object]] = {}
+    for path in sorted(settings.data_dir.glob("run-*.json"), reverse=True)[:30]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        generated_at = str((payload.get("manifest") or {}).get("generated_at") or path.stem)
+        diagnostics = payload.get("search_diagnostics")
+        failures = diagnostics.get("failures") if isinstance(diagnostics, dict) else None
+        if not isinstance(failures, list):
+            continue
+        for raw_failure in failures:
+            if not isinstance(raw_failure, dict):
+                continue
+            try:
+                failure = SearchFailure.model_validate(raw_failure)
+            except Exception:
+                continue
+            _record_failed_lead_history_entry(history, failure, generated_at=generated_at)
+    save_json_snapshot(settings.data_dir / FAILED_LEAD_HISTORY_FILENAME, history)
+    return history
+
+
+def _failed_lead_history_skip_reason(
+    lead: JobLead,
+    settings: Settings,
+    failed_lead_history: dict[str, dict[str, object]],
+) -> tuple[str, str] | None:
+    matched_entry: dict[str, object] | None = None
+    matched_key = ""
+    for key in _failed_lead_history_key_candidates(
+        lead.company_name,
+        lead.role_title,
+        source_url=lead.source_url,
+        direct_job_url=lead.direct_job_url,
+    ):
+        entry = failed_lead_history.get(key)
+        if not entry:
+            continue
+        if matched_entry is None or int(entry.get("watch_count") or 0) > int(matched_entry.get("watch_count") or 0):
+            matched_entry = entry
+            matched_key = key
+    if matched_entry is None:
+        return None
+    reason_counts = {
+        str(reason): int(count)
+        for reason, count in dict(matched_entry.get("recent_rejection_reasons") or {}).items()
+        if str(reason).strip()
+    }
+    for reason_code in FAILED_LEAD_IMMEDIATE_SUPPRESS_REASON_CODES:
+        if reason_counts.get(reason_code, 0) >= 1:
+            return (
+                reason_code,
+                f"Lead matched prior failed lead history ({matched_key}) with persistent reason {reason_code}.",
+            )
+    if _lead_has_strong_override_hints(lead, settings):
+        return None
+    for reason_code, threshold in FAILED_LEAD_REPEAT_SUPPRESS_THRESHOLDS.items():
+        if reason_counts.get(reason_code, 0) >= threshold:
+            return (
+                reason_code,
+                (
+                    f"Lead matched prior failed lead history ({matched_key}) and had repeated "
+                    f"{reason_code} outcomes ({reason_counts.get(reason_code, 0)}x)."
+                ),
+            )
+    return None
 
 
 def _strip_tracking_query_params(query: str) -> str:
@@ -1482,6 +1701,23 @@ def _is_supported_discovery_source_url(url: str) -> bool:
     return False
 
 
+def _is_low_trust_replay_source_url(url: str | None) -> bool:
+    if not url:
+        return False
+    host = (urlparse(url).netloc or "").lower()
+    return any(fragment in host for fragment in LOW_TRUST_REPLAY_SOURCE_HOST_FRAGMENTS)
+
+
+def _lead_is_replay_source_trustworthy(lead: JobLead) -> bool:
+    if _is_low_trust_replay_source_url(lead.source_url):
+        return False
+    if lead.direct_job_url and _is_low_trust_replay_source_url(lead.direct_job_url):
+        return False
+    if _normalize_company_key(lead.company_name) == "jobgether":
+        return False
+    return True
+
+
 def _hint_is_recent(posted_date_hint: str | None, settings: Settings) -> bool | None:
     if not posted_date_hint:
         return None
@@ -1862,8 +2098,9 @@ def _build_small_company_scout_queries(settings: Settings, tuning: SearchTuning)
         tuning.attempt_number,
         max(4, min(6, settings.search_round_query_limit)),
     )
+    topic_pool = [topic for topic in SMALL_COMPANY_SCOUT_TOPICS if topic != "voice AI" or tuning.attempt_number >= 4]
     topic_window = _attempt_query_window(
-        list(SMALL_COMPANY_SCOUT_TOPICS),
+        topic_pool,
         tuning.attempt_number,
         max(3, min(4, settings.search_round_query_limit)),
     )
@@ -1882,16 +2119,20 @@ def _build_small_company_scout_queries(settings: Settings, tuning: SearchTuning)
 
 def _build_portfolio_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
     recency_terms = _current_recency_terms(settings.timezone)
+    topic_pool = [topic for topic in SMALL_COMPANY_SCOUT_TOPICS if topic != "voice AI" or tuning.attempt_number >= 4]
     topic_window = _attempt_query_window(
-        list(SMALL_COMPANY_SCOUT_TOPICS),
+        topic_pool,
         tuning.attempt_number,
         max(3, min(5, settings.search_round_query_limit)),
     )
-    domain_window = _attempt_query_window(
-        list(PORTFOLIO_BOARD_SCOUT_DOMAINS),
-        tuning.attempt_number,
-        max(2, min(3, settings.search_round_query_limit)),
+    preferred_domains = (
+        ["workatastartup.com/jobs", "wellfound.com/jobs", "ycombinator.com/companies"]
+        if tuning.attempt_number <= 1
+        else ["ycombinator.com/companies", "workatastartup.com/jobs", "wellfound.com/jobs"]
+        if tuning.attempt_number == 2
+        else ["ycombinator.com/companies", "workatastartup.com/jobs", "getro.com/companies"]
     )
+    domain_window = preferred_domains[: max(2, min(3, settings.search_round_query_limit))]
     queries: list[str] = []
     for domain in domain_window:
         for topic in topic_window:
@@ -1958,6 +2199,67 @@ def _build_focus_company_queries(
     return _dedupe_queries(_interleave_query_groups(company_groups))
 
 
+def _site_hints_from_board_identifiers(entry: dict[str, object]) -> list[str]:
+    hints: list[str] = []
+    seen: set[str] = set()
+    for raw_identifier in entry.get("board_identifiers", []) if isinstance(entry.get("board_identifiers"), list) else []:
+        identifier = str(raw_identifier or "").strip().lower()
+        if not identifier or ":" not in identifier:
+            continue
+        prefix, token = identifier.split(":", 1)
+        token = token.strip()
+        candidates: list[str] = []
+        if prefix == "greenhouse" and token:
+            candidates = [
+                f"site:job-boards.greenhouse.io/{token}",
+                f"site:boards.greenhouse.io/{token}",
+            ]
+        elif prefix == "lever" and token:
+            candidates = [f"site:jobs.lever.co/{token}"]
+        elif prefix == "ashby" and token:
+            candidates = [f"site:jobs.ashbyhq.com/{token}"]
+        elif prefix == "smartrecruiters" and token:
+            candidates = [f"site:jobs.smartrecruiters.com/{token}"]
+        elif prefix == "recruitee" and token:
+            candidates = [
+                f"site:jobs.recruitee.com/{token}",
+                f"site:careers.tellent.com/o/{token}",
+            ]
+        elif prefix == "jobscore" and token:
+            candidates = [f"site:{token}.jobscore.com"]
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                hints.append(candidate)
+    return hints
+
+
+def _build_watchlist_board_focus_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    focus_roles = tuning.focus_roles or _default_focus_role_terms()
+    if not tuning.focus_companies or not focus_roles:
+        return []
+    watchlist = load_company_watchlist_entries(settings.data_dir)
+    recency_terms = _current_recency_terms(settings.timezone)
+    salary_terms = [f"\"${settings.min_base_salary_usd:,}\"", *_salary_disclosure_terms()]
+    queries: list[str] = []
+    for company in tuning.focus_companies[:8]:
+        entry = watchlist.get(_normalize_company_key(company))
+        if not entry or not _watchlist_entry_is_focusable(entry):
+            continue
+        site_hints = _site_hints_from_board_identifiers(entry)
+        if not site_hints:
+            continue
+        company_term = f"\"{company}\""
+        for role_term in focus_roles[:4]:
+            for site_hint in site_hints[:3]:
+                queries.append(f"{company_term} {role_term} remote {site_hint}")
+                if tuning.prioritize_recency:
+                    queries.append(f"{company_term} {role_term} remote {site_hint} {recency_terms[0]}")
+                if tuning.prioritize_salary:
+                    queries.append(f"{company_term} {role_term} remote {site_hint} {salary_terms[0]}")
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 10)]
+
+
 def _build_local_small_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
     recency_terms = _current_recency_terms(settings.timezone)
     salary_term = f"\"${settings.min_base_salary_usd:,}\""
@@ -2003,6 +2305,16 @@ def _build_local_targeted_attempt_queries(settings: Settings, tuning: SearchTuni
     ]
     recency_terms = _current_recency_terms(settings.timezone)
     salary_term = f"\"${settings.min_base_salary_usd:,}\""
+    ats_domains = [
+        "jobs.lever.co",
+        "boards.greenhouse.io",
+        "job-boards.greenhouse.io",
+        "jobs.ashbyhq.com",
+        "myworkdayjobs.com",
+        "jobs.smartrecruiters.com",
+        "jobs.icims.com",
+        "careers.workday.com",
+    ]
     role_batch = _role_query_batch_for_attempt(
         role_pool,
         tuning.attempt_number,
@@ -2010,11 +2322,17 @@ def _build_local_targeted_attempt_queries(settings: Settings, tuning: SearchTuni
     )
     queries: list[str] = []
     for role_query in role_batch:
-        queries.append(f"{role_query} remote")
-        queries.append(f"{role_query} remote careers")
-        queries.append(f"{role_query} remote {recency_terms[0]}")
-        if tuning.prioritize_salary:
-            queries.append(f"{role_query} remote {salary_term}")
+        for domain in ats_domains:
+            queries.append(f"site:{domain} {role_query} remote")
+            queries.append(f"site:{domain} {role_query} remote {recency_terms[0]}")
+            if tuning.prioritize_salary:
+                queries.append(f"site:{domain} {role_query} remote {salary_term}")
+        if tuning.attempt_number > 1:
+            queries.append(f"{role_query} remote")
+            queries.append(f"{role_query} remote careers")
+            queries.append(f"{role_query} remote {recency_terms[0]}")
+            if tuning.prioritize_salary:
+                queries.append(f"{role_query} remote {salary_term}")
     return _dedupe_queries(queries)
 
 
@@ -2325,6 +2643,7 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
     role_queries = _base_role_queries()
     scout_queries = _build_small_company_scout_queries(settings, tuning)
     portfolio_scout_queries = _build_portfolio_company_scout_queries(settings, tuning)
+    board_focus_queries = _build_watchlist_board_focus_queries(settings, tuning)
     ats_domains = [
         "boards.greenhouse.io",
         "job-boards.greenhouse.io",
@@ -2422,6 +2741,7 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
 
     queries = [
         *focus_queries,
+        *board_focus_queries,
         *portfolio_scout_queries,
         *scout_queries,
         *_interleave_query_groups(query_groups),
@@ -2450,23 +2770,37 @@ def _build_local_query_rounds(settings: Settings, tuning: SearchTuning | None = 
     local_role_queries = _build_local_role_queries()
     scout_queries = _build_local_small_company_scout_queries(settings, tuning)
     portfolio_scout_queries = _build_portfolio_company_scout_queries(settings, tuning)
+    board_focus_queries = _build_watchlist_board_focus_queries(settings, tuning)
     per_attempt_budget = settings.max_search_rounds * settings.search_round_query_limit
 
     focused_roles = _dedupe_queries((tuning.focus_roles or [])[:6])
-    focus_company_queries = _build_focus_company_queries(settings, tuning, include_site_domains=False)
+    focus_company_queries = _build_focus_company_queries(
+        settings,
+        tuning,
+        include_site_domains=tuning.attempt_number > 1,
+    )
     targeted_queries = _build_local_targeted_attempt_queries(settings, tuning)[:per_attempt_budget]
-    local_window = _attempt_query_window(local_role_queries, tuning.attempt_number, per_attempt_budget)
+    structured_targeted_queries = [query for query in targeted_queries if _query_uses_structured_source_hint(query)]
+    generic_targeted_queries = [query for query in targeted_queries if query not in structured_targeted_queries]
+    local_window_budget = per_attempt_budget if tuning.attempt_number == 1 else max(2, settings.search_round_query_limit)
+    local_window = _attempt_query_window(local_role_queries, tuning.attempt_number, local_window_budget)
+    if tuning.attempt_number == 1:
+        local_window = []
+    else:
+        local_window = [query for query in local_window if not _query_is_broad_generic(query)]
+    query_groups = [
+        focus_company_queries,
+        board_focus_queries,
+        structured_targeted_queries,
+        portfolio_scout_queries,
+    ]
+    if tuning.attempt_number == 1:
+        query_groups.extend([scout_queries, generic_targeted_queries])
+    else:
+        query_groups.extend([scout_queries, generic_targeted_queries, local_window])
     query_bank = [
         *focused_roles,
-        *_interleave_query_groups(
-            [
-                focus_company_queries,
-                portfolio_scout_queries,
-                scout_queries,
-                targeted_queries,
-                local_window,
-            ]
-        ),
+        *_interleave_query_groups(query_groups),
     ]
     query_bank = _dedupe_queries(query_bank)
     limited_bank = query_bank[:per_attempt_budget]
@@ -2495,6 +2829,215 @@ def _query_uses_structured_source_hint(query: str) -> bool:
             "jobscore",
             "workday",
             "icims",
+        )
+    )
+
+
+def _query_family_history_path(settings: Settings) -> Path:
+    return settings.data_dir / QUERY_FAMILY_HISTORY_FILENAME
+
+
+def _load_query_family_history(settings: Settings) -> dict[str, dict[str, object]]:
+    path = _query_family_history_path(settings)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    raw_families = payload.get("families") if isinstance(payload, dict) else None
+    if not isinstance(raw_families, dict):
+        return {}
+    families: dict[str, dict[str, object]] = {}
+    for family, metrics in raw_families.items():
+        if isinstance(family, str) and isinstance(metrics, dict):
+            families[family] = dict(metrics)
+    return families
+
+
+def _save_query_family_history(settings: Settings, families: dict[str, dict[str, object]]) -> None:
+    path = _query_family_history_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "families": families,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _query_family_key(query: str) -> str:
+    lowered = " ".join(query.lower().split())
+    if not lowered:
+        return "other"
+    if "site:getro.com/companies" in lowered:
+        return "startup_getro"
+    if "site:workatastartup.com/jobs" in lowered:
+        return "startup_workatastartup"
+    if "site:ycombinator.com/companies" in lowered:
+        return "startup_ycombinator"
+    if "site:wellfound.com/jobs" in lowered:
+        return "startup_wellfound"
+    if any(marker in lowered for marker in ("site:linkedin.com/jobs/view", "site:builtin", "site:glassdoor.com/job")):
+        return "generic_discovery"
+    if any(
+        marker in lowered
+        for marker in (
+            "site:job-boards.greenhouse.io",
+            "site:boards.greenhouse.io",
+            "site:jobs.lever.co",
+            "site:jobs.ashbyhq.com",
+            "site:jobs.recruitee.com",
+            "site:careers.tellent.com/o",
+            "site:jobscore.com",
+            "site:myworkdayjobs.com",
+            "site:jobs.smartrecruiters.com",
+            "site:jobs.jobvite.com",
+            "site:jobs.workable.com",
+            "site:jobs.icims.com",
+            "site:careers.workday.com",
+        )
+    ):
+        return "structured_ats"
+    if _query_targets_startup_ecosystem(lowered):
+        return "startup_generic"
+    if _query_is_broad_generic(lowered):
+        return "broad_generic"
+    if "site:" in lowered:
+        return "site_scoped_other"
+    return "company_focus"
+
+
+def _query_family_is_timeout_cooldown_eligible(family: str) -> bool:
+    return family in QUERY_FAMILY_COOLDOWN_ELIGIBLE
+
+
+def _query_family_cooldown_reason(
+    query: str,
+    *,
+    query_family_history: dict[str, dict[str, object]] | None = None,
+) -> str | None:
+    if not query_family_history:
+        return None
+    family = _query_family_key(query)
+    if not _query_family_is_timeout_cooldown_eligible(family):
+        return None
+    metrics = query_family_history.get(family) or {}
+    timeout_streak = int(metrics.get("consecutive_timeout_heavy_runs") or 0)
+    zero_yield_streak = int(metrics.get("consecutive_zero_yield_runs") or 0)
+    if timeout_streak >= 2:
+        return (
+            f"The {family.replace('_', ' ')} query family is cooling down after "
+            f"{timeout_streak} timeout-heavy runs with no meaningful yield."
+        )
+    if zero_yield_streak >= 2:
+        return (
+            f"The {family.replace('_', ' ')} query family is cooling down after "
+            f"{zero_yield_streak} zero-yield runs."
+        )
+    return None
+
+
+def _query_family_metrics_template() -> dict[str, int]:
+    return {
+        "executed_queries": 0,
+        "timeout_count": 0,
+        "zero_yield_queries": 0,
+        "fresh_lead_count": 0,
+        "validated_job_count": 0,
+    }
+
+
+def _update_query_family_run_metrics(
+    query_family_metrics: dict[str, dict[str, int]],
+    query: str,
+    *,
+    count_execution: bool = True,
+    timed_out: bool = False,
+    fresh_leads: int = 0,
+    validated_jobs: int = 0,
+) -> None:
+    family = _query_family_key(query)
+    metrics = query_family_metrics.setdefault(family, _query_family_metrics_template())
+    if count_execution:
+        metrics["executed_queries"] += 1
+    if timed_out:
+        metrics["timeout_count"] += 1
+    if count_execution and fresh_leads <= 0:
+        metrics["zero_yield_queries"] += 1
+    elif fresh_leads > 0:
+        metrics["fresh_lead_count"] += fresh_leads
+    if validated_jobs > 0:
+        metrics["validated_job_count"] += validated_jobs
+
+
+def _persist_query_family_history(
+    settings: Settings,
+    *,
+    run_id: str | None,
+    query_family_metrics: dict[str, dict[str, int]],
+) -> None:
+    if not query_family_metrics:
+        return
+    history = _load_query_family_history(settings)
+    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    for family, run_metrics in query_family_metrics.items():
+        previous = dict(history.get(family) or {})
+        executed_queries = int(run_metrics.get("executed_queries") or 0)
+        timeout_count = int(run_metrics.get("timeout_count") or 0)
+        fresh_lead_count = int(run_metrics.get("fresh_lead_count") or 0)
+        validated_job_count = int(run_metrics.get("validated_job_count") or 0)
+        zero_yield_run = executed_queries > 0 and fresh_lead_count == 0
+        timeout_heavy_run = executed_queries > 0 and timeout_count >= max(2, executed_queries // 2) and fresh_lead_count == 0
+        history[family] = {
+            "run_count": int(previous.get("run_count") or 0) + 1,
+            "executed_queries_total": int(previous.get("executed_queries_total") or 0) + executed_queries,
+            "timeout_count_total": int(previous.get("timeout_count_total") or 0) + timeout_count,
+            "zero_yield_queries_total": int(previous.get("zero_yield_queries_total") or 0)
+            + int(run_metrics.get("zero_yield_queries") or 0),
+            "fresh_lead_count_total": int(previous.get("fresh_lead_count_total") or 0) + fresh_lead_count,
+            "validated_job_count_total": int(previous.get("validated_job_count_total") or 0) + validated_job_count,
+            "consecutive_zero_yield_runs": int(previous.get("consecutive_zero_yield_runs") or 0) + 1
+            if zero_yield_run
+            else 0,
+            "consecutive_timeout_heavy_runs": int(previous.get("consecutive_timeout_heavy_runs") or 0) + 1
+            if timeout_heavy_run
+            else 0,
+            "last_run_id": run_id,
+            "last_updated_at": updated_at,
+        }
+    _save_query_family_history(settings, history)
+
+
+def _query_timeout_sensitive_marker(query: str) -> str | None:
+    lowered = query.lower()
+    for marker in TIMEOUT_SENSITIVE_QUERY_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _query_targets_startup_ecosystem(query: str) -> bool:
+    lowered = query.lower()
+    if _query_timeout_sensitive_marker(lowered):
+        return True
+    return any(
+        token in lowered
+        for token in (
+            "startup",
+            "series a",
+            "series b",
+            "series c",
+            "seed stage",
+            "venture backed",
+            "vc backed",
+            "portfolio company",
+            "early stage",
+            "growth stage",
+            "founding team",
+            "vertical ai",
+            "voice ai",
+            "conversational ai",
+            "applied intelligence",
         )
     )
 
@@ -2533,6 +3076,8 @@ def _query_timeout_seconds_for_query(settings: Settings, query: str) -> int:
     base_timeout = max(10, settings.per_query_timeout_seconds)
     if settings.llm_provider != "ollama":
         return base_timeout
+    if _query_timeout_sensitive_marker(query):
+        return min(max(base_timeout - 12, 18), 22)
     if _query_is_broad_generic(query):
         return min(max(base_timeout - 15, 15), 25)
     if _query_uses_structured_source_hint(query):
@@ -2564,17 +3109,57 @@ def _broad_generic_query_timeout_count(diagnostics: SearchDiagnostics, *, attemp
     )
 
 
+def _timeout_sensitive_query_timeout_count(
+    diagnostics: SearchDiagnostics,
+    *,
+    attempt_number: int,
+    marker: str,
+) -> int:
+    return sum(
+        1
+        for failure in diagnostics.failures
+        if failure.reason_code == "query_timeout"
+        and failure.attempt_number == attempt_number
+        and failure.source_query
+        and marker in failure.source_query.lower()
+    )
+
+
 def _query_timeout_skip_reason(
     diagnostics: SearchDiagnostics,
     query: str,
     *,
     attempt_number: int,
+    query_family_history: dict[str, dict[str, object]] | None = None,
 ) -> str | None:
     normalized_query = " ".join(query.split())
     if not normalized_query:
         return None
+    family_cooldown_reason = _query_family_cooldown_reason(
+        normalized_query,
+        query_family_history=query_family_history,
+    )
+    if family_cooldown_reason is not None:
+        return family_cooldown_reason
     if normalized_query in _timed_out_queries(diagnostics):
         return "The same discovery query already timed out earlier in this run."
+    lowered_query = normalized_query.lower()
+    if attempt_number >= 3 and "site:getro.com/companies" in lowered_query:
+        return "Late-pass Getro company-board queries are being suppressed after repeated low-yield timeout behavior."
+    if attempt_number >= 3 and '"voice ai"' in lowered_query:
+        return "Late-pass voice-AI scout queries are being suppressed because they have been low-yield timeout sinks."
+    timeout_sensitive_marker = _query_timeout_sensitive_marker(normalized_query)
+    if timeout_sensitive_marker is not None:
+        timeout_sensitive_count = _timeout_sensitive_query_timeout_count(
+            diagnostics,
+            attempt_number=attempt_number,
+            marker=timeout_sensitive_marker,
+        )
+        if timeout_sensitive_count >= TIMEOUT_SENSITIVE_QUERY_SKIP_THRESHOLD:
+            return (
+                "The startup-board timeout circuit breaker is open for "
+                f"{timeout_sensitive_marker} after {timeout_sensitive_count} timeouts in this pass."
+            )
     if not _query_is_broad_generic(normalized_query):
         return None
     broad_timeout_count = _broad_generic_query_timeout_count(diagnostics, attempt_number=attempt_number)
@@ -2588,6 +3173,41 @@ def _query_timeout_skip_reason(
 
 def _failure_counts_for_attempt(diagnostics: SearchDiagnostics, attempt_number: int) -> Counter[str]:
     return Counter(failure.reason_code for failure in diagnostics.failures if failure.attempt_number == attempt_number)
+
+
+def _timeout_budget_failure_count(diagnostics: SearchDiagnostics, attempt_number: int) -> int:
+    counts = _failure_counts_for_attempt(diagnostics, attempt_number)
+    return counts.get("query_timeout", 0) + counts.get("query_skipped_timeout_budget", 0)
+
+
+def _should_abort_dead_attempt_round(
+    diagnostics: SearchDiagnostics,
+    *,
+    attempt_number: int,
+    consecutive_zero_yield_rounds: int,
+    attempt_discovery_gain: int,
+) -> bool:
+    return (
+        attempt_number >= 2
+        and consecutive_zero_yield_rounds >= 2
+        and attempt_discovery_gain == 0
+        and _timeout_budget_failure_count(diagnostics, attempt_number) >= 4
+    )
+
+
+def _should_stop_after_dead_attempt(
+    diagnostics: SearchDiagnostics,
+    *,
+    attempt_number: int,
+    attempt_discovery_gain: int,
+    resolved_leads_this_attempt: int,
+) -> bool:
+    return (
+        attempt_number >= 2
+        and attempt_discovery_gain == 0
+        and resolved_leads_this_attempt == 0
+        and _timeout_budget_failure_count(diagnostics, attempt_number) >= 4
+    )
 
 
 def _top_failure_summary(diagnostics: SearchDiagnostics, attempt_number: int, *, limit: int = 4) -> str:
@@ -3154,20 +3774,28 @@ def _ollama_refinement_mode_for_local_leads(
         return "low_confidence"
     if trustworthy_direct_url_count == 0:
         return "no_trustworthy_direct_urls"
+    if (
+        _query_targets_startup_ecosystem(query)
+        and candidate_pool_count >= 5
+        and cleanup_signal_count >= 1
+        and low_trust_source_count >= 1
+        and average_confidence < 0.99
+    ):
+        return "startup_board_bundle"
     if cleanup_signal_count >= 2 or low_trust_source_count >= 3:
         return "high_noise"
     if (
-        3 <= candidate_pool_count <= 6
+        3 <= candidate_pool_count <= 8
         and cleanup_signal_count >= 1
         and low_trust_source_count >= 1
-        and average_confidence < 0.98
+        and average_confidence < 0.985
     ):
         return "borderline_bundle"
     if (
         candidate_pool_count >= 8
         and cleanup_signal_count >= 1
         and low_trust_source_count >= 1
-        and average_confidence < 0.95
+        and average_confidence < 0.97
         and _query_is_broad_generic(query)
     ):
         return "broad_generic"
@@ -4369,7 +4997,11 @@ def _load_seed_leads_from_file(settings: Settings) -> list[JobLead]:
 
 
 def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
+    if failure.reason_code not in REPLAYABLE_FAILURE_REASON_CODES:
+        return None
     if not failure.company_name or not failure.role_title or not failure.direct_job_url:
+        return None
+    if _is_low_trust_replay_source_url(failure.source_url) or _is_low_trust_replay_source_url(failure.direct_job_url):
         return None
     direct_job_url = _normalize_direct_job_url(failure.direct_job_url)
     if not _is_allowed_direct_job_url(direct_job_url):
@@ -4394,6 +5026,8 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
         evidence_notes=(failure.detail or "Historical lead from prior diagnostics.")[:400],
     )
     if not _lead_is_ai_related_product_manager(lead):
+        return None
+    if not _lead_is_replay_source_trustworthy(lead):
         return None
     return lead
 
@@ -4465,6 +5099,8 @@ def _collect_replay_seed_leads(settings: Settings) -> list[JobLead]:
     curated_seed_keys = {_lead_dedupe_key(lead) for lead in file_seed_leads}
     deduped: dict[str, JobLead] = {}
     for lead in [*file_seed_leads, *_load_historical_seed_leads(settings)]:
+        if not _lead_is_replay_source_trustworthy(lead):
+            continue
         key = _lead_dedupe_key(lead)
         existing = deduped.get(key)
         if existing is None or _lead_priority(lead, settings) < _lead_priority(existing, settings):
@@ -4484,6 +5120,7 @@ async def _replay_seed_leads(
     settings: Settings,
     diagnostics: SearchDiagnostics,
     company_watchlist: dict[str, dict[str, object]],
+    failed_lead_history: dict[str, dict[str, object]],
     jobs_by_url: dict[str, JobPosting],
     previously_reported_company_keys: set[str],
     previously_reported_job_keys: set[str],
@@ -4502,6 +5139,23 @@ async def _replay_seed_leads(
 
     fresh_seed_leads: list[JobLead] = []
     for lead in seed_leads:
+        failed_history_skip = _failed_lead_history_skip_reason(lead, settings, failed_lead_history)
+        if failed_history_skip is not None:
+            reason_code, detail = failed_history_skip
+            _record_failure_live(
+                settings,
+                diagnostics,
+                _make_failure(
+                    stage="filter",
+                    reason_code="repeated_failed_lead",
+                    detail=detail,
+                    lead=lead,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                ),
+                unique_leads_discovered=total_unique_leads,
+            )
+            continue
         key = _lead_dedupe_key(lead)
         if key in seen_lead_keys:
             continue
@@ -4521,6 +5175,12 @@ async def _replay_seed_leads(
         min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
         limit=seed_replay_cap,
     )
+    fresh_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
+        settings,
+        fresh_seed_leads,
+        run_id=run_id,
+    )
+    diagnostics.seed_replayed_lead_count = len(fresh_seed_leads)
     if status:
         status.emit(
             "search",
@@ -4786,6 +5446,7 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
     if not normalized:
         return []
     broad_generic_query = _query_is_broad_generic(normalized)
+    startup_ecosystem_query = _query_targets_startup_ecosystem(normalized)
 
     board_batch_index = _stable_text_index(normalized.lower(), len(LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES))
     ats_batch_index = _stable_text_index(normalized.lower()[::-1], len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES))
@@ -4797,8 +5458,8 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
     for offset in range(min(LOCAL_SEARCH_DOMAIN_BATCH_SPAN, len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES))):
         ats_domains.extend(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES[(ats_batch_index + offset) % len(LOCAL_SEARCH_DIRECT_ATS_DOMAIN_BATCHES)])
 
-    ats_limit = max(2, LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT - 1) if broad_generic_query else LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT
-    board_limit = LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT
+    ats_limit = LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT if broad_generic_query else LOCAL_SEARCH_ATS_DOMAIN_QUERY_LIMIT + 1
+    board_limit = 1 if broad_generic_query else (LOCAL_SEARCH_BOARD_DOMAIN_QUERY_LIMIT if startup_ecosystem_query else 1)
     prioritized_ats_domains = list(dict.fromkeys(ats_domains))[:ats_limit]
     prioritized_board_domains = list(dict.fromkeys(board_domains))[:board_limit]
 
@@ -4814,18 +5475,26 @@ def _build_local_search_engine_queries(query: str) -> list[str]:
     broad_query_expansions = [
         f"{normalized} remote",
         f'{normalized} "$200,000"',
-        f'site:workatastartup.com/jobs {normalized} remote',
-        f'site:getro.com/companies {normalized} remote',
     ]
+    startup_board_expansions = (
+        [
+            f'site:workatastartup.com/jobs {normalized} remote',
+            f'site:getro.com/companies {normalized} remote',
+            f'site:ycombinator.com/companies {normalized} remote',
+        ]
+        if startup_ecosystem_query
+        else []
+    )
     targeted_query_expansions = [
         f'"{normalized}" remote',
         *broad_query_expansions,
+        *startup_board_expansions,
         f'{normalized} "posted this week"',
     ]
     queries.extend(broad_query_expansions if broad_generic_query else targeted_query_expansions)
 
     deduped = _dedupe_queries(queries)
-    total_limit = 12 if broad_generic_query else LOCAL_SEARCH_TOTAL_QUERY_LIMIT
+    total_limit = 10 if broad_generic_query else LOCAL_SEARCH_TOTAL_QUERY_LIMIT
     return deduped[:total_limit]
 
 
@@ -4867,6 +5536,35 @@ async def _run_local_search_engine_queries(query: str, *, max_results_per_query:
     return merged_results
 
 
+async def _ensure_lazy_ollama_prewarm(settings: Settings, *, run_id: str | None) -> bool:
+    if settings.llm_provider != "ollama" or settings.ollama_degraded_for_run or run_id is None:
+        return not settings.ollama_degraded_for_run
+    if run_id in LAZY_OLLAMA_PREWARM_RUNS:
+        return True
+    LAZY_OLLAMA_PREWARM_RUNS.add(run_id)
+    prewarm_ok, prewarm_error, prewarm_duration = await prewarm_ollama_model(settings, run_id=run_id)
+    if prewarm_ok:
+        record_ollama_event(
+            settings,
+            "lazy_prewarm_success",
+            run_id=run_id,
+            model=settings.ollama_model,
+            wall_duration_seconds=prewarm_duration,
+        )
+        return True
+    settings.ollama_degraded_for_run = True
+    settings.ollama_degraded_reason = f"Ollama lazy prewarm failed before lead refinement: {prewarm_error or 'unknown error'}"
+    record_ollama_event(
+        settings,
+        "lazy_prewarm_failure",
+        run_id=run_id,
+        model=settings.ollama_model,
+        wall_duration_seconds=prewarm_duration,
+        error_message=prewarm_error,
+    )
+    return False
+
+
 async def _cleanup_local_leads_with_ollama(
     settings: Settings,
     query: str,
@@ -4877,6 +5575,17 @@ async def _cleanup_local_leads_with_ollama(
     if not leads or settings.llm_provider != "ollama":
         return leads
     if settings.ollama_degraded_for_run:
+        record_ollama_event(
+            settings,
+            "ollama_degraded_skip",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            reason=settings.ollama_degraded_reason,
+            skipped_count=len(leads),
+        )
+        return leads
+    if run_id is not None and not await _ensure_lazy_ollama_prewarm(settings, run_id=run_id):
         record_ollama_event(
             settings,
             "ollama_degraded_skip",
@@ -5047,6 +5756,84 @@ async def _refine_local_leads_with_ollama(
     return merged
 
 
+async def _maybe_force_round_lead_refinement_with_ollama(
+    settings: Settings,
+    round_leads: list[JobLead],
+    *,
+    attempt_number: int,
+    round_number: int,
+    run_id: str | None = None,
+) -> list[JobLead]:
+    if (
+        settings.llm_provider != "ollama"
+        or settings.ollama_degraded_for_run
+        or run_id is None
+        or len(round_leads) < 2
+    ):
+        return round_leads
+    forced_key = (run_id, attempt_number)
+    if forced_key in FORCED_OLLAMA_ROUND_REFINEMENT_ATTEMPTS:
+        return round_leads
+    FORCED_OLLAMA_ROUND_REFINEMENT_ATTEMPTS.add(forced_key)
+    confidences = [_lead_confidence(lead) for lead in round_leads]
+    average_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0
+    cleanup_window = round_leads[:5]
+    cleanup_signal_count = sum(1 for lead in cleanup_window if _lead_needs_local_cleanup(lead))
+    trustworthy_direct_url_count = sum(
+        1
+        for lead in cleanup_window
+        if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
+    )
+    return await _refine_local_leads_with_ollama(
+        settings,
+        f"attempt {attempt_number} round {round_number} aggregate cleanup",
+        round_leads,
+        cleanup_limit=2,
+        refinement_mode="forced_round_sample",
+        pre_refinement_average_confidence=average_confidence,
+        pre_refinement_cleanup_signal_count=cleanup_signal_count,
+        pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
+        run_id=run_id,
+    )
+
+
+async def _maybe_force_seed_lead_refinement_with_ollama(
+    settings: Settings,
+    seed_leads: list[JobLead],
+    *,
+    run_id: str | None = None,
+) -> list[JobLead]:
+    if (
+        settings.llm_provider != "ollama"
+        or settings.ollama_degraded_for_run
+        or run_id is None
+        or len(seed_leads) < 2
+        or run_id in FORCED_OLLAMA_SEED_REFINEMENT_RUNS
+    ):
+        return seed_leads
+    FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
+    seed_window = seed_leads[:5]
+    confidences = [_lead_confidence(lead) for lead in seed_window]
+    average_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0
+    cleanup_signal_count = sum(1 for lead in seed_window if _lead_needs_local_cleanup(lead))
+    trustworthy_direct_url_count = sum(
+        1
+        for lead in seed_window
+        if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
+    )
+    return await _refine_local_leads_with_ollama(
+        settings,
+        "seed replay triage",
+        seed_leads,
+        cleanup_limit=2,
+        refinement_mode="forced_seed_triage",
+        pre_refinement_average_confidence=average_confidence,
+        pre_refinement_cleanup_signal_count=cleanup_signal_count,
+        pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
+        run_id=run_id,
+    )
+
+
 def _merge_and_dedupe_leads(*groups: list[JobLead]) -> list[JobLead]:
     merged: list[JobLead] = []
     seen: set[str] = set()
@@ -5073,6 +5860,7 @@ async def _search_single_query_local(
     settings: Settings,
     query: str,
     *,
+    attempt_number: int | None = None,
     run_id: str | None = None,
 ) -> tuple[list[JobLead], float]:
     async def _run_named(name: str, coro, *, timeout_seconds: float | None = None):
@@ -5171,8 +5959,28 @@ async def _search_single_query_local(
         low_trust_source_count=low_trust_source_count,
         trustworthy_direct_url_count=trustworthy_direct_url_count,
     )
+    if (
+        refinement_mode is None
+        and settings.llm_provider == "ollama"
+        and run_id is not None
+        and attempt_number is not None
+        and len(candidate_pool) >= 2
+    ):
+        forced_key = (run_id, attempt_number)
+        if forced_key not in FORCED_OLLAMA_REFINEMENT_ATTEMPTS:
+            FORCED_OLLAMA_REFINEMENT_ATTEMPTS.add(forced_key)
+            refinement_mode = "forced_sample"
     if refinement_mode is not None:
-        cleanup_limit = 3 if refinement_mode == "borderline_bundle" else max(settings.max_leads_per_query, 8)
+        cleanup_limit = (
+            2
+            if refinement_mode == "forced_sample"
+            else
+            4
+            if refinement_mode == "startup_board_bundle"
+            else 3
+            if refinement_mode == "borderline_bundle"
+            else max(settings.max_leads_per_query, 8)
+        )
         refined_pool = await _refine_local_leads_with_ollama(
             settings,
             query,
@@ -5212,10 +6020,16 @@ async def _search_single_query(
     settings: Settings,
     query: str,
     *,
+    attempt_number: int | None = None,
     run_id: str | None = None,
 ) -> list[JobLead]:
     if settings.llm_provider == "ollama":
-        local_leads, confidence = await _search_single_query_local(settings, query, run_id=run_id)
+        local_leads, confidence = await _search_single_query_local(
+            settings,
+            query,
+            attempt_number=attempt_number,
+            run_id=run_id,
+        )
         should_fallback = (
             settings.use_openai_fallback
             and agent is not None
@@ -5237,11 +6051,12 @@ async def _search_query_with_context(
     query: str,
     timeout_seconds: int,
     *,
+    attempt_number: int | None = None,
     run_id: str | None = None,
 ) -> tuple[str, list[JobLead]]:
     try:
         return query, await asyncio.wait_for(
-            _search_single_query(agent, settings, query, run_id=run_id),
+            _search_single_query(agent, settings, query, attempt_number=attempt_number, run_id=run_id),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError as exc:
@@ -6285,6 +7100,62 @@ def _lead_has_trusted_source_fallback_evidence(lead: JobLead, settings: Settings
     )
 
 
+def _trusted_source_fallback_direct_url(
+    lead: JobLead,
+    candidate: JobPosting,
+    settings: Settings,
+) -> str | None:
+    if not _lead_has_trusted_source_fallback_evidence(lead, settings):
+        return None
+    if (lead.source_quality_score_hint or _lead_source_quality_score(lead, settings)) < 16:
+        return None
+    for direct_url in (
+        str(candidate.direct_job_url or ""),
+        str(candidate.resolved_job_url or ""),
+        str(lead.direct_job_url or ""),
+    ):
+        if not direct_url:
+            continue
+        if not _url_has_strong_expected_company_hint(direct_url, lead.company_name):
+            continue
+        if _looks_like_company_job_page(direct_url) or _is_allowed_direct_job_url(direct_url):
+            return direct_url
+    return None
+
+
+def _should_accept_trusted_source_fallback_on_fetch_failure(
+    lead: JobLead,
+    candidate: JobPosting,
+    settings: Settings,
+) -> bool:
+    return _trusted_source_fallback_direct_url(lead, candidate, settings) is not None
+
+
+def _build_trusted_source_fallback_job(
+    lead: JobLead,
+    candidate: JobPosting,
+    settings: Settings,
+    *,
+    status_code: int,
+) -> JobPosting:
+    source_quality_score = lead.source_quality_score_hint or _lead_source_quality_score(lead, settings)
+    direct_url = _trusted_source_fallback_direct_url(lead, candidate, settings) or str(candidate.direct_job_url)
+    evidence_note = (
+        f"Accepted via trusted source fallback after the direct page returned HTTP {status_code}; "
+        "remote, salary, freshness, and AI PM signals were retained from the trusted discovery source."
+    )
+    validation_evidence = list(dict.fromkeys([*candidate.validation_evidence, evidence_note]))[:8]
+    return candidate.model_copy(
+        update={
+            "direct_job_url": direct_url,
+            "resolved_job_url": direct_url,
+            "validation_evidence": validation_evidence,
+            "evidence_notes": " ".join(part for part in (candidate.evidence_notes, evidence_note) if part).strip(),
+            "source_quality_score": source_quality_score,
+        }
+    )
+
+
 def _job_has_geo_limited_remote_restriction(
     job: JobPosting,
     snapshot: JobPageSnapshot,
@@ -6507,6 +7378,14 @@ async def _validate_candidate(
             snapshot = await fetch_job_page(repaired_url)
 
     if snapshot.status_code != 200:
+        if _should_accept_trusted_source_fallback_on_fetch_failure(lead, candidate, settings):
+            fallback_job = _build_trusted_source_fallback_job(
+                lead,
+                candidate,
+                settings,
+                status_code=snapshot.status_code,
+            )
+            return fallback_job, None, None, None
         failure = _make_failure(
             stage="validation",
             reason_code="fetch_non_200",
@@ -6644,13 +7523,16 @@ async def find_matching_jobs(
     run_id: str | None = None,
 ) -> tuple[list[JobPosting], int, SearchDiagnostics]:
     stop_goal = max(1, settings.minimum_qualifying_jobs, settings.target_job_count)
-    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=stop_goal)
+    diagnostics = SearchDiagnostics(run_id=run_id, minimum_qualifying_jobs=stop_goal)
     _persist_search_diagnostics(settings, diagnostics)
     jobs_by_url: dict[str, JobPosting] = {}
     _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
     previously_reported_job_keys = load_previously_reported_job_keys(settings.data_dir)
     previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
     company_watchlist = load_company_watchlist_entries(settings.data_dir)
+    failed_lead_history = _load_failed_lead_history(settings)
+    query_family_history = _load_query_family_history(settings)
+    query_family_metrics: dict[str, dict[str, int]] = {}
     seen_lead_keys: set[str] = set()
     total_unique_leads = 0
 
@@ -6692,6 +7574,7 @@ async def find_matching_jobs(
                 settings=settings,
                 diagnostics=diagnostics,
                 company_watchlist=company_watchlist,
+                failed_lead_history=failed_lead_history,
                 jobs_by_url=jobs_by_url,
                 previously_reported_company_keys=previously_reported_company_keys,
                 previously_reported_job_keys=previously_reported_job_keys,
@@ -6710,6 +7593,7 @@ async def find_matching_jobs(
                 _persist_search_diagnostics(settings, diagnostics)
                 break
 
+        consecutive_zero_yield_rounds = 0
         for round_number, queries in enumerate(query_rounds, start=1):
             if len(jobs_by_url) >= stop_goal:
                 break
@@ -6737,6 +7621,7 @@ async def find_matching_jobs(
                         diagnostics,
                         query,
                         attempt_number=attempt_number,
+                        query_family_history=query_family_history,
                     )
                     if skip_reason is None:
                         runnable_queries.append(query)
@@ -6773,6 +7658,7 @@ async def find_matching_jobs(
                             settings,
                             query,
                             _query_timeout_seconds_for_query(settings, query),
+                            attempt_number=attempt_number,
                             run_id=run_id,
                         )
                     )
@@ -6783,6 +7669,11 @@ async def find_matching_jobs(
                     try:
                         query, results = await task
                     except SearchQueryTimeoutError as exc:
+                        _update_query_family_run_metrics(
+                            query_family_metrics,
+                            exc.query,
+                            timed_out=True,
+                        )
                         _record_failure_live(
                             settings,
                             diagnostics,
@@ -6809,6 +7700,7 @@ async def find_matching_jobs(
                             )
                         continue
                     except SearchQueryExecutionError as exc:
+                        _update_query_family_run_metrics(query_family_metrics, exc.query)
                         if _is_insufficient_quota_error(exc.cause):
                             _record_failure_live(
                                 settings,
@@ -6851,6 +7743,23 @@ async def find_matching_jobs(
 
                     fresh_leads = 0
                     for lead in results:
+                        failed_history_skip = _failed_lead_history_skip_reason(lead, settings, failed_lead_history)
+                        if failed_history_skip is not None:
+                            reason_code, detail = failed_history_skip
+                            _record_failure_live(
+                                settings,
+                                diagnostics,
+                                _make_failure(
+                                    stage="filter",
+                                    reason_code="repeated_failed_lead",
+                                    detail=detail,
+                                    lead=lead,
+                                    attempt_number=attempt_number,
+                                    round_number=round_number,
+                                ),
+                                unique_leads_discovered=total_unique_leads,
+                            )
+                            continue
                         key = _lead_dedupe_key(lead)
                         if key in seen_lead_keys:
                             continue
@@ -6869,6 +7778,11 @@ async def find_matching_jobs(
                             unique_leads_discovered=total_unique_leads,
                             qualifying_jobs=len(jobs_by_url),
                         )
+                    _update_query_family_run_metrics(
+                        query_family_metrics,
+                        query,
+                        fresh_leads=fresh_leads,
+                    )
                     diagnostics.unique_leads_discovered = total_unique_leads
                     _persist_search_diagnostics(settings, diagnostics)
 
@@ -6884,6 +7798,17 @@ async def find_matching_jobs(
                 min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
                 limit=remaining_resolution_budget or None,
             )
+            round_leads = await _maybe_force_round_lead_refinement_with_ollama(
+                settings,
+                round_leads,
+                attempt_number=attempt_number,
+                round_number=round_number,
+                run_id=run_id,
+            )
+            if round_leads:
+                consecutive_zero_yield_rounds = 0
+            else:
+                consecutive_zero_yield_rounds += 1
             if status:
                 status.emit(
                     "search",
@@ -6893,6 +7818,26 @@ async def find_matching_jobs(
                     unique_leads_discovered=total_unique_leads,
                     qualifying_jobs=len(jobs_by_url),
                 )
+
+            if _should_abort_dead_attempt_round(
+                diagnostics,
+                attempt_number=attempt_number,
+                consecutive_zero_yield_rounds=consecutive_zero_yield_rounds,
+                attempt_discovery_gain=total_unique_leads - attempt_start_leads,
+            ):
+                if status:
+                    status.emit(
+                        "search",
+                        (
+                            f"Ending pass {attempt_number} early after {consecutive_zero_yield_rounds} "
+                            "zero-yield rounds and repeated timeout-budget failures."
+                        ),
+                        attempt_number=attempt_number,
+                        round_number=round_number,
+                        unique_leads_discovered=total_unique_leads,
+                        qualifying_jobs=len(jobs_by_url),
+                    )
+                break
 
             for lead_index, lead in enumerate(round_leads, start=1):
                 if len(jobs_by_url) >= stop_goal:
@@ -7185,7 +8130,15 @@ async def find_matching_jobs(
                     )
                     continue
 
+                accepted_before = len(jobs_by_url)
                 jobs_by_url.setdefault(validated_key, validated)
+                if len(jobs_by_url) > accepted_before:
+                    _update_query_family_run_metrics(
+                        query_family_metrics,
+                        validated.source_query or lead.source_query or "",
+                        count_execution=False,
+                        validated_jobs=1,
+                    )
                 diagnostics.unique_leads_discovered = total_unique_leads
                 _persist_search_diagnostics(settings, diagnostics)
                 _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
@@ -7223,6 +8176,25 @@ async def find_matching_jobs(
                 unique_leads_discovered=total_unique_leads,
             )
 
+        if _should_stop_after_dead_attempt(
+            diagnostics,
+            attempt_number=attempt_number,
+            attempt_discovery_gain=total_unique_leads - attempt_start_leads,
+            resolved_leads_this_attempt=resolved_leads_this_attempt,
+        ):
+            if status:
+                status.emit(
+                    "search",
+                    (
+                        f"Stopping adaptive search after pass {attempt_number} because it produced no new "
+                        "leads and exhausted the timeout budget."
+                    ),
+                    attempt_number=attempt_number,
+                    qualifying_jobs=len(jobs_by_url),
+                    unique_leads_discovered=total_unique_leads,
+                )
+            break
+
         if len(jobs_by_url) >= stop_goal:
             break
 
@@ -7248,4 +8220,9 @@ async def find_matching_jobs(
                 top_rejection_reasons=_top_failure_summary(diagnostics, diagnostics.passes[-1].attempt_number if diagnostics.passes else 1),
             )
     _persist_search_diagnostics(settings, diagnostics)
+    _persist_query_family_history(
+        settings,
+        run_id=run_id,
+        query_family_metrics=query_family_metrics,
+    )
     return jobs, total_unique_leads, diagnostics

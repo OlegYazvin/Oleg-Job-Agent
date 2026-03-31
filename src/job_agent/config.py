@@ -76,6 +76,7 @@ class Settings:
     ollama_start_timeout_seconds: int = 45
     ollama_retry_backoff_seconds: float = 3.0
     ollama_command: str = "ollama"
+    codex_command: str = "codex"
     firefox_extension_profile_dir: Path | None = None
     ollama_degraded_model: str = "qwen2.5:7b-instruct"
     ollama_enable_auto_tune: bool = True
@@ -123,6 +124,25 @@ class Settings:
     @property
     def ollama_summary_path(self) -> Path:
         return self.data_dir / "ollama-summary-latest.json"
+
+    @property
+    def auto_loop_state_path(self) -> Path:
+        return self.data_dir / "auto-loop-state.json"
+
+    @property
+    def auto_loop_dir(self) -> Path:
+        return self.data_dir / "auto-loop"
+
+    @property
+    def codex_home_dir(self) -> Path:
+        raw_home = os.getenv("CODEX_HOME")
+        if raw_home:
+            return Path(raw_home).expanduser()
+        return Path.home() / ".codex"
+
+    @property
+    def codex_session_index_path(self) -> Path:
+        return self.codex_home_dir / "session_index.jsonl"
 
 
 def load_settings(project_root: Path | None = None, *, require_openai: bool = True) -> Settings:
@@ -228,6 +248,7 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         ollama_start_timeout_seconds=int(os.getenv("OLLAMA_START_TIMEOUT_SECONDS", "45")),
         ollama_retry_backoff_seconds=float(os.getenv("OLLAMA_RETRY_BACKOFF_SECONDS", "3")),
         ollama_command=os.getenv("OLLAMA_COMMAND", "ollama"),
+        codex_command=os.getenv("CODEX_COMMAND", "codex"),
         firefox_extension_profile_dir=firefox_extension_profile_dir,
         ollama_degraded_model=os.getenv("OLLAMA_DEGRADED_MODEL", "qwen2.5:7b-instruct"),
         ollama_enable_auto_tune=os.getenv("OLLAMA_ENABLE_AUTO_TUNE", "true").lower() == "true",

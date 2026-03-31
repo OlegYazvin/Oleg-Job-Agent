@@ -14,6 +14,7 @@ from job_agent.job_search import (
     _build_near_miss,
     _build_portfolio_company_scout_queries,
     _build_small_company_scout_queries,
+    _build_watchlist_board_focus_queries,
     _build_local_search_engine_queries,
     _builtin_category_urls_for_query,
     _builtin_paginated_category_urls,
@@ -21,6 +22,7 @@ from job_agent.job_search import (
     _extract_builtin_remote_hint,
     _builtin_search_terms_for_query,
     _build_local_query_rounds,
+    _build_local_targeted_attempt_queries,
     _build_query_rounds,
     _build_search_query_bank,
     _chunk_queries,
@@ -29,6 +31,7 @@ from job_agent.job_search import (
     _collect_replay_seed_leads,
     _dedupe_round_leads,
     _deterministic_trim_local_leads,
+    _ensure_lazy_ollama_prewarm,
     _extract_direct_job_url_from_source,
     _extract_experience_years_floor,
     _extract_linkedin_guest_search_leads,
@@ -38,6 +41,7 @@ from job_agent.job_search import (
     _extract_startpage_search_results,
     _extract_role_company_from_title,
     _extract_yahoo_search_results,
+    _failed_lead_history_skip_reason,
     _is_allowed_direct_job_url,
     _extract_salary_hint,
     _is_ai_related_product_manager,
@@ -58,6 +62,7 @@ from job_agent.job_search import (
     _evaluate_merged_job,
     _is_weak_company_hint,
     _merge_candidate_with_snapshot,
+    _maybe_force_round_lead_refinement_with_ollama,
     _normalize_and_filter_discovery_leads,
     _normalize_company_key,
     _normalize_role_title_to_focus_queries,
@@ -70,10 +75,14 @@ from job_agent.job_search import (
     _resolve_greenhouse_board_job_url_from_lead,
     _resolve_lead_via_company_careers_pages,
     _salary_is_base_salary,
+    _search_single_query_local,
     _seed_lead_from_failure,
     _select_watchlist_focus_companies,
     _select_focus_roles,
+    _should_abort_dead_attempt_round,
     _should_refine_local_leads_with_ollama,
+    _should_stop_after_dead_attempt,
+    _should_accept_trusted_source_fallback_on_fetch_failure,
     _url_has_strong_expected_company_hint,
     _url_candidate_score,
 )
@@ -419,7 +428,7 @@ def test_build_local_query_rounds_include_startup_biased_queries() -> None:
     rounds = _build_local_query_rounds(settings, tuning=SearchTuning(attempt_number=1))
     flattened = [query for group in rounds for query in group]
     assert any("startup" in query.lower() or "careers" in query.lower() for query in flattened)
-    assert any(query == "AI product manager" for query in flattened)
+    assert any("ai product manager" in query.lower() for query in flattened)
 
 
 def test_load_seed_leads_from_file_filters_invalid_and_non_ai_entries() -> None:
@@ -1264,6 +1273,23 @@ def test_lead_ai_classifier_allows_builtin_description_evidence_for_generic_titl
     assert _lead_is_ai_related_product_manager(lead)
 
 
+def test_seed_lead_from_failure_skips_low_trust_replay_sources() -> None:
+    failure = SearchFailure(
+        stage="validation",
+        reason_code="missing_salary",
+        detail="Mirror page omitted salary details.",
+        company_name="Acme",
+        role_title="Senior Product Manager, AI",
+        direct_job_url="https://jobs.lever.co/acme/123",
+        source_url="https://www.mediabistro.com/jobs/acme/senior-product-manager-ai/",
+        is_remote=True,
+        attempt_number=1,
+        round_number=1,
+    )
+
+    assert _seed_lead_from_failure(failure) is None
+
+
 def test_is_ai_related_product_manager_accepts_direct_page_ai_context_even_if_title_is_generic() -> None:
     job = JobPosting(
         company_name="Zapier",
@@ -1333,11 +1359,11 @@ def test_local_query_rounds_use_simpler_builtin_friendly_terms() -> None:
     settings.llm_provider = "ollama"
     rounds = _build_query_rounds(settings)
     flattened = [query for query_round in rounds for query in query_round]
-    assert "AI product manager" in flattened
+    assert any("ai product manager" in query.lower() for query in flattened)
     assert any(query.startswith("site:") for query in flattened)
     assert all(query.count("site:") <= 1 for query in flattened)
     assert any("posted this week" in query.lower() for query in flattened)
-    assert any("machine learning product manager" == query for query in flattened)
+    assert any("machine learning product manager" in query.lower() for query in flattened)
 
 
 def test_local_query_rounds_prefer_focus_roles_before_company_drilldown() -> None:
@@ -1479,8 +1505,11 @@ def test_local_search_engine_queries_cover_non_builtin_boards_and_direct_ats() -
         "careers.adp.com",
         "careers.workday.com",
     )
-    assert sum(1 for query in queries if any(f"site:{domain}" in query for domain in board_domains)) >= 4
-    assert sum(1 for query in queries if any(f"site:{domain}" in query for domain in ats_domains)) >= 4
+    board_query_count = sum(1 for query in queries if any(f"site:{domain}" in query for domain in board_domains))
+    ats_query_count = sum(1 for query in queries if any(f"site:{domain}" in query for domain in ats_domains))
+    assert board_query_count >= 2
+    assert ats_query_count >= 4
+    assert ats_query_count >= board_query_count
     assert any('"$200,000"' in query for query in queries)
     assert queries[0].startswith("site:")
     assert any(f"site:{domain}" in queries[0] for domain in ats_domains)
@@ -1610,9 +1639,9 @@ def test_query_timeout_seconds_for_query_keeps_broad_queries_tighter_than_target
         'site:workatastartup.com/jobs "principal product manager" "AI" remote "posted this week"',
     )
 
-    assert broad_timeout < targeted_timeout
+    assert targeted_timeout < broad_timeout
     assert broad_timeout <= 25
-    assert targeted_timeout <= 45
+    assert targeted_timeout <= 22
 
 
 def test_build_search_query_bank_defers_generic_discovery_domains_until_later_attempts() -> None:
@@ -1623,6 +1652,17 @@ def test_build_search_query_bank_defers_generic_discovery_domains_until_later_at
 
     assert not any("site:linkedin.com/jobs/view" in query for query in first_attempt_queries)
     assert any("site:linkedin.com/jobs/view" in query for query in second_attempt_queries)
+
+
+def test_build_local_targeted_attempt_queries_biases_first_attempt_to_ats_sites() -> None:
+    settings = build_settings()
+
+    first_attempt_queries = _build_local_targeted_attempt_queries(settings, SearchTuning(attempt_number=1))
+    second_attempt_queries = _build_local_targeted_attempt_queries(settings, SearchTuning(attempt_number=2))
+
+    assert first_attempt_queries
+    assert all("site:" in query for query in first_attempt_queries)
+    assert any("site:" not in query for query in second_attempt_queries)
 
 
 def test_query_timeout_skip_reason_repeats_and_broad_circuit_breaker() -> None:
@@ -1674,6 +1714,79 @@ def test_query_timeout_skip_reason_repeats_and_broad_circuit_breaker() -> None:
     assert targeted_reason is None
 
 
+def test_query_timeout_skip_reason_opens_startup_board_family_circuit_breaker() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='site:workatastartup.com/jobs "product manager" "AI" remote startup',
+                attempt_number=1,
+                round_number=1,
+            ),
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='site:workatastartup.com/jobs "senior product manager" "AI" remote startup',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        'site:workatastartup.com/jobs "staff product manager" "AI" remote startup',
+        attempt_number=1,
+    )
+
+    assert skip_reason is not None
+    assert "startup-board timeout circuit breaker" in skip_reason.lower()
+
+
+def test_query_timeout_skip_reason_suppresses_late_pass_getro_and_voice_ai_queries() -> None:
+    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
+
+    getro_reason = _query_timeout_skip_reason(
+        diagnostics,
+        'site:getro.com/companies "product manager" "AI agents" remote startup',
+        attempt_number=3,
+    )
+    voice_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"product manager" "voice AI" remote "growth stage"',
+        attempt_number=3,
+    )
+
+    assert getro_reason is not None
+    assert "getro" in getro_reason.lower()
+    assert voice_reason is not None
+    assert "voice" in voice_reason.lower()
+
+
+def test_query_timeout_skip_reason_respects_cross_run_family_cooldown() -> None:
+    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
+    history = {
+        "broad_generic": {
+            "consecutive_timeout_heavy_runs": 2,
+            "consecutive_zero_yield_runs": 1,
+        }
+    }
+
+    reason = _query_timeout_skip_reason(
+        diagnostics,
+        "AI product manager remote",
+        attempt_number=1,
+        query_family_history=history,
+    )
+
+    assert reason is not None
+    assert "cooling down" in reason.lower()
+
+
 def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
@@ -1705,6 +1818,107 @@ def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -
         low_trust_source_count=1,
         trustworthy_direct_url_count=2,
     )
+    assert _should_refine_local_leads_with_ollama(
+        settings,
+        query='site:workatastartup.com/jobs "senior product manager" "AI" remote startup',
+        candidate_pool_count=8,
+        average_confidence=0.975,
+        cleanup_signal_count=1,
+        low_trust_source_count=1,
+        trustworthy_direct_url_count=4,
+    )
+
+
+def test_should_accept_trusted_source_fallback_on_fetch_failure_for_strong_company_hosted_role(monkeypatch) -> None:
+    settings = build_settings()
+    settings.posted_within_days = 14
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 30))
+    lead = JobLead(
+        company_name="Caterpillar",
+        role_title="Principal Digital GenAI Product Manager; In-Cab Experience",
+        source_url="https://builtin.com/job/principal-digital-genai-product-manager-cab-experience/8233588",
+        source_type="builtin",
+        direct_job_url="https://careers.caterpillar.com/en/jobs/r0000341589/principal-digital-genai-product-manager-in-cab-experience",
+        location_hint="Remote - United States",
+        posted_date_hint="2026-03-19",
+        is_remote_hint=True,
+        salary_text_hint="$147,760.00 - $240,110.00",
+        base_salary_min_usd_hint=147760,
+        base_salary_max_usd_hint=240110,
+        evidence_notes="Built In source disclosed fully remote and salary information for this principal GenAI PM role.",
+        source_quality_score_hint=19,
+    )
+    candidate = JobPosting(
+        company_name="Caterpillar",
+        role_title="Principal Digital GenAI Product Manager; In-Cab Experience",
+        direct_job_url=lead.direct_job_url,
+        resolved_job_url=lead.direct_job_url,
+        ats_platform="careers.caterpillar.com",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-19",
+        posted_date_iso="2026-03-19",
+        base_salary_min_usd=147760,
+        base_salary_max_usd=240110,
+        salary_text="$147,760.00 - $240,110.00",
+        evidence_notes=lead.evidence_notes,
+        validation_evidence=[],
+    )
+
+    assert _should_accept_trusted_source_fallback_on_fetch_failure(lead, candidate, settings)
+
+
+def test_seed_lead_from_failure_only_replays_fixable_failures() -> None:
+    replayable = SearchFailure(
+        stage="validation",
+        reason_code="missing_salary",
+        detail="No salary",
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/tiny-ai",
+        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        posted_date_text="2026-03-28",
+        is_remote=True,
+    )
+    terminal = SearchFailure(
+        stage="validation",
+        reason_code="stale_posting",
+        detail="Too old",
+        company_name="OldCo",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/oldco",
+        direct_job_url="https://jobs.ashbyhq.com/oldco/123",
+        posted_date_text="2026-03-01",
+        is_remote=True,
+    )
+
+    assert _seed_lead_from_failure(replayable) is not None
+    assert _seed_lead_from_failure(terminal) is None
+
+
+def test_failed_lead_history_skip_reason_suppresses_repeat_failures() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/tiny-ai",
+        source_type="builtin",
+        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        is_remote_hint=None,
+        posted_date_hint=None,
+        evidence_notes="Repeated stale role without new override hints.",
+    )
+    history = {
+        "url:ashby:tinyai:123": {
+            "watch_count": 3,
+            "recent_rejection_reasons": {"stale_posting": 3},
+        }
+    }
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "stale_posting"
 
 
 def test_persist_validated_jobs_checkpoint_writes_current_jobs(tmp_path: Path) -> None:
@@ -2279,7 +2493,7 @@ def test_local_query_rounds_rotate_to_new_variants_across_attempts() -> None:
     flat_one = [query for query_round in attempt_one for query in query_round]
     flat_two = [query for query_round in attempt_two for query in query_round]
     assert len(flat_one) == settings.max_search_rounds * settings.search_round_query_limit
-    assert len(flat_two) == settings.max_search_rounds * settings.search_round_query_limit
+    assert 0 < len(flat_two) <= settings.max_search_rounds * settings.search_round_query_limit
     assert len(set(flat_one).intersection(flat_two)) <= settings.search_round_query_limit
 
 
@@ -2453,6 +2667,41 @@ def test_small_company_scout_queries_bias_toward_direct_ats_hosts() -> None:
     assert any("\"early stage\"" in query for query in queries)
 
 
+def test_watchlist_board_focus_queries_use_known_board_identifiers(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    (settings.data_dir / "company-watchlist.json").write_text(
+        json.dumps(
+            {
+                "tinyai": {
+                    "company_name": "Tiny AI",
+                    "watch_count": 2,
+                    "priority_score": 20,
+                    "last_reason_code": "missing_salary",
+                    "recent_rejection_reasons": {"missing_salary": 2},
+                    "board_identifiers": ["ashby:tinyai"],
+                    "source_hosts": ["jobs.ashbyhq.com"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    queries = _build_watchlist_board_focus_queries(
+        settings,
+        SearchTuning(
+            attempt_number=2,
+            prioritize_recency=True,
+            prioritize_salary=True,
+            focus_companies=["Tiny AI"],
+            focus_roles=["principal product manager AI"],
+        ),
+    )
+
+    assert queries
+    assert any("site:jobs.ashbyhq.com/tinyai" in query for query in queries)
+
+
 def test_portfolio_company_scout_queries_target_startup_network_boards() -> None:
     settings = build_settings()
     queries = _build_portfolio_company_scout_queries(
@@ -2460,8 +2709,20 @@ def test_portfolio_company_scout_queries_target_startup_network_boards() -> None
         SearchTuning(attempt_number=1, prioritize_recency=True, prioritize_remote=True),
     )
     assert queries
-    assert any("workatastartup.com/jobs" in query or "getro.com/companies" in query for query in queries)
+    assert any("workatastartup.com/jobs" in query or "ycombinator.com/companies" in query for query in queries)
+    assert not any("getro.com/companies" in query for query in queries)
     assert any("startup" in query or "\"portfolio company\"" in query for query in queries)
+
+
+def test_portfolio_company_scout_queries_promote_yc_before_getro_on_second_attempt() -> None:
+    settings = build_settings()
+    queries = _build_portfolio_company_scout_queries(
+        settings,
+        SearchTuning(attempt_number=2, prioritize_recency=True, prioritize_remote=True),
+    )
+
+    assert any("ycombinator.com/companies" in query for query in queries[:6])
+    assert not any("getro.com/companies" in query for query in queries[:6])
 
 
 def test_local_query_rounds_prioritize_focus_companies_without_compound_site_queries() -> None:
@@ -2481,6 +2742,43 @@ def test_local_query_rounds_prioritize_focus_companies_without_compound_site_que
     assert flat_queries
     assert any("Tiny AI" in query for query in flat_queries[:12])
     assert all(query.count("site:") <= 1 for query in flat_queries)
+
+
+def test_local_query_rounds_use_site_scoped_focus_queries_on_late_attempts() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    (settings.data_dir / "company-watchlist.json").parent.mkdir(parents=True, exist_ok=True)
+    (settings.data_dir / "company-watchlist.json").write_text(
+        json.dumps(
+            {
+                "tinyai": {
+                    "company_name": "Tiny AI",
+                    "watch_count": 2,
+                    "priority_score": 20,
+                    "last_reason_code": "missing_salary",
+                    "recent_rejection_reasons": {"missing_salary": 2},
+                    "board_identifiers": ["ashby:tinyai"],
+                    "source_hosts": ["jobs.ashbyhq.com"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    rounds = _build_local_query_rounds(
+        settings,
+        SearchTuning(
+            attempt_number=2,
+            prioritize_recency=True,
+            prioritize_salary=True,
+            focus_companies=["Tiny AI"],
+            focus_roles=["principal product manager AI"],
+        ),
+    )
+
+    flat_queries = [query for query_round in rounds for query in query_round]
+    assert flat_queries
+    assert any('"Tiny AI"' in query and "site:" in query for query in flat_queries)
+    assert not any(query == "AI product manager remote" for query in flat_queries)
 
 
 def test_lead_priority_prefers_small_company_hosts_over_enterprise_ats() -> None:
@@ -2546,3 +2844,210 @@ def test_refine_local_leads_with_ollama_merges_cleaned_candidates(monkeypatch) -
     )
     assert refined[0].direct_job_url == "https://jobs.lever.co/acme/123"
     assert any(lead.direct_job_url == "https://jobs.lever.co/acme/123" for lead in refined)
+
+
+def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/tinyai/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Direct ATS role.",
+    )
+    lead_two = JobLead(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/456",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=230000,
+        evidence_notes="Direct ATS role.",
+    )
+    lead_map = {
+        "https://jobs.ashbyhq.com/tinyai/123": lead_one,
+        "https://jobs.lever.co/acme/456": lead_two,
+    }
+    forced_calls: list[tuple[int, str | None]] = []
+
+    async def fake_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_local_search(_query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+        return [
+            ("https://jobs.ashbyhq.com/tinyai/123", "Tiny AI - Senior Product Manager, AI", ""),
+            ("https://jobs.lever.co/acme/456", "Acme AI - Staff Product Manager, AI", ""),
+        ]
+
+    async def fake_refine(
+        _settings: Settings,
+        _query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
+    monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
+    monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
+    monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    monkeypatch.setattr("job_agent.job_search.record_ollama_event", lambda *args, **kwargs: None)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_REFINEMENT_ATTEMPTS.clear()
+
+    asyncio.run(
+        _search_single_query_local(
+            settings,
+            'site:ycombinator.com/companies "product manager" "applied intelligence" remote startup',
+            attempt_number=2,
+            run_id="run-1",
+        )
+    )
+    asyncio.run(
+        _search_single_query_local(
+            settings,
+            'site:ycombinator.com/companies "senior product manager" "applied intelligence" remote',
+            attempt_number=2,
+            run_id="run-1",
+        )
+    )
+
+    assert forced_calls == [(2, "forced_sample")]
+
+
+def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/tinyai/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Direct ATS role.",
+    )
+    lead_two = JobLead(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/456",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=230000,
+        evidence_notes="Direct ATS role.",
+    )
+    forced_calls: list[tuple[int, str | None, str]] = []
+
+    async def fake_refine(
+        _settings: Settings,
+        query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode, query))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_ROUND_REFINEMENT_ATTEMPTS.clear()
+
+    first = asyncio.run(
+        _maybe_force_round_lead_refinement_with_ollama(
+            settings,
+            [lead_one, lead_two],
+            attempt_number=2,
+            round_number=1,
+            run_id="run-1",
+        )
+    )
+    second = asyncio.run(
+        _maybe_force_round_lead_refinement_with_ollama(
+            settings,
+            [lead_one, lead_two],
+            attempt_number=2,
+            round_number=2,
+            run_id="run-1",
+        )
+    )
+
+    assert first == [lead_one, lead_two]
+    assert second == [lead_one, lead_two]
+    assert forced_calls == [(2, "forced_round_sample", "attempt 2 round 1 aggregate cleanup")]
+
+
+def test_ensure_lazy_ollama_prewarm_only_runs_once_per_run(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    prewarm_calls: list[str | None] = []
+
+    async def fake_prewarm(_settings: Settings, *, run_id: str | None = None):
+        prewarm_calls.append(run_id)
+        return True, None, 1.0
+
+    monkeypatch.setattr("job_agent.job_search.prewarm_ollama_model", fake_prewarm)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.LAZY_OLLAMA_PREWARM_RUNS.clear()
+
+    first = asyncio.run(_ensure_lazy_ollama_prewarm(settings, run_id="run-lazy"))
+    second = asyncio.run(_ensure_lazy_ollama_prewarm(settings, run_id="run-lazy"))
+
+    assert first is True
+    assert second is True
+    assert prewarm_calls == ["run-lazy"]
+
+
+def test_dead_attempt_helpers_stop_timeout_heavy_zero_yield_passes() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(stage="discovery", reason_code="query_timeout", detail="timed out", attempt_number=2, round_number=1),
+            SearchFailure(stage="discovery", reason_code="query_timeout", detail="timed out", attempt_number=2, round_number=1),
+            SearchFailure(stage="discovery", reason_code="query_skipped_timeout_budget", detail="skip", attempt_number=2, round_number=2),
+            SearchFailure(stage="discovery", reason_code="query_skipped_timeout_budget", detail="skip", attempt_number=2, round_number=2),
+        ],
+    )
+
+    assert _should_abort_dead_attempt_round(
+        diagnostics,
+        attempt_number=2,
+        consecutive_zero_yield_rounds=2,
+        attempt_discovery_gain=0,
+    )
+    assert _should_stop_after_dead_attempt(
+        diagnostics,
+        attempt_number=2,
+        attempt_discovery_gain=0,
+        resolved_leads_this_attempt=0,
+    )

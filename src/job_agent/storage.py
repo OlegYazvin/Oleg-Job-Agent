@@ -6,6 +6,7 @@ import json
 
 from .history import record_successful_run
 from .models import JobOutreachBundle, RunManifest, SearchDiagnostics
+from .scorecard import build_run_scorecard, save_run_scorecard
 
 
 def save_json_snapshot(path: Path, payload: dict) -> None:
@@ -44,6 +45,17 @@ def save_run_artifacts(
             {"items": search_diagnostics.model_dump(mode="json").get("false_negative_audit", [])},
         )
     save_json_snapshot(data_dir / f"run-{timestamp}.json", payload)
+    scorecard = build_run_scorecard(
+        run_id=manifest.run_id,
+        status="completed",
+        manifest=manifest,
+        search_diagnostics=search_diagnostics,
+        near_miss_payload=near_miss_payload,
+        ollama_summary_payload=ollama_summary_payload,
+        status_payload=status_payload,
+        generated_at=manifest.generated_at,
+    )
+    save_run_scorecard(data_dir, scorecard)
     record_successful_run(
         data_dir,
         run_id=manifest.run_id,
