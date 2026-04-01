@@ -3861,6 +3861,8 @@ def _should_force_ollama_refinement_sample(
 ) -> bool:
     if settings.llm_provider != "ollama" or sample_size < 2:
         return False
+    if cleanup_signal_count <= 0:
+        return False
     if cleanup_signal_count > 0 or low_trust_source_count > 0:
         return True
     if trustworthy_direct_url_count < sample_size:

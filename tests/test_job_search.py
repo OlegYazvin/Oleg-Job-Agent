@@ -81,6 +81,7 @@ from job_agent.job_search import (
     _seed_lead_from_failure,
     _select_watchlist_focus_companies,
     _select_focus_roles,
+    _should_force_ollama_refinement_sample,
     _should_abort_dead_attempt_round,
     _should_refine_local_leads_with_ollama,
     _should_stop_after_dead_attempt,
@@ -1915,6 +1916,20 @@ def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -
         cleanup_signal_count=1,
         low_trust_source_count=1,
         trustworthy_direct_url_count=4,
+    )
+
+
+def test_should_force_ollama_refinement_sample_requires_actual_cleanup_signals() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+
+    assert not _should_force_ollama_refinement_sample(
+        settings,
+        sample_size=5,
+        average_confidence=0.86,
+        cleanup_signal_count=0,
+        low_trust_source_count=0,
+        trustworthy_direct_url_count=3,
     )
 
 
