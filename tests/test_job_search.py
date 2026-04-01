@@ -1773,6 +1773,48 @@ def test_query_timeout_skip_reason_opens_startup_board_family_circuit_breaker() 
     assert "startup-board timeout circuit breaker" in skip_reason.lower()
 
 
+def test_query_timeout_skip_reason_opens_company_focused_circuit_breaker() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Chartahealth" "AI Product Manager" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Chartahealth" careers "AI Product Manager" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Chartahealth" "Senior Product Manager, AI" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Chartahealth" "AI Product Manager" remote "$200,000"',
+        attempt_number=1,
+    )
+
+    assert skip_reason is not None
+    assert "company-specific timeout circuit breaker" in skip_reason.lower()
+    assert "chartahealth" in skip_reason.lower()
+
+
 def test_query_timeout_skip_reason_suppresses_late_pass_getro_and_voice_ai_queries() -> None:
     diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
 

@@ -276,6 +276,7 @@ FOCUSABLE_REASON_CODES = {
     "remote_unclear",
 }
 BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD = 6
+COMPANY_FOCUSED_QUERY_TIMEOUT_SKIP_THRESHOLD = 3
 TIMEOUT_SENSITIVE_QUERY_MARKERS = (
     "site:workatastartup.com/jobs",
     "site:getro.com/companies",
@@ -3158,6 +3159,52 @@ def _timeout_sensitive_query_timeout_count(
     )
 
 
+def _company_focused_query_marker(query: str) -> str | None:
+    phrases = [" ".join(match.lower().split()) for match in re.findall(r'"([^"]+)"', query)]
+    for phrase in phrases:
+        if len(phrase) < 3:
+            continue
+        if len(phrase.split()) > 4:
+            continue
+        if any(
+            token in phrase
+            for token in (
+                "product manager",
+                "program manager",
+                "group product",
+                "staff product",
+                "senior product",
+                "principal product",
+                "technical product",
+                "careers",
+                "jobs",
+                "remote",
+                "posted this week",
+            )
+        ):
+            continue
+        if phrase in {"ai", "genai", "voice ai", "artificial intelligence"}:
+            continue
+        return phrase
+    return None
+
+
+def _company_focused_query_timeout_count(
+    diagnostics: SearchDiagnostics,
+    *,
+    attempt_number: int,
+    marker: str,
+) -> int:
+    return sum(
+        1
+        for failure in diagnostics.failures
+        if failure.reason_code == "query_timeout"
+        and failure.attempt_number == attempt_number
+        and failure.source_query
+        and _company_focused_query_marker(failure.source_query) == marker
+    )
+
+
 def _query_timeout_skip_reason(
     diagnostics: SearchDiagnostics,
     query: str,
@@ -3176,6 +3223,18 @@ def _query_timeout_skip_reason(
         return family_cooldown_reason
     if normalized_query in _timed_out_queries(diagnostics):
         return "The same discovery query already timed out earlier in this run."
+    company_marker = _company_focused_query_marker(normalized_query)
+    if company_marker is not None:
+        company_timeout_count = _company_focused_query_timeout_count(
+            diagnostics,
+            attempt_number=attempt_number,
+            marker=company_marker,
+        )
+        if company_timeout_count >= COMPANY_FOCUSED_QUERY_TIMEOUT_SKIP_THRESHOLD:
+            return (
+                "The company-specific timeout circuit breaker is open for "
+                f"{company_marker} after {company_timeout_count} timeouts in this pass."
+            )
     lowered_query = normalized_query.lower()
     if attempt_number >= 3 and "site:getro.com/companies" in lowered_query:
         return "Late-pass Getro company-board queries are being suppressed after repeated low-yield timeout behavior."
