@@ -5796,6 +5796,24 @@ async def _refine_local_leads_with_ollama(
 ) -> list[JobLead]:
     if not candidate_pool or settings.llm_provider != "ollama" or settings.ollama_degraded_for_run:
         return candidate_pool
+    forced_refinement_mode = refinement_mode in {"forced_sample", "forced_round_sample", "forced_seed_triage"}
+    if forced_refinement_mode and (pre_refinement_cleanup_signal_count or 0) <= 0:
+        record_ollama_event(
+            settings,
+            "lead_refinement_skip",
+            run_id=run_id,
+            caller="lead_refinement",
+            prompt_category="lead_cleanup",
+            query=query,
+            refinement_mode=refinement_mode,
+            candidate_pool_count=len(candidate_pool),
+            normalized_lead_count=len(candidate_pool),
+            average_confidence=round(pre_refinement_average_confidence or 0.0, 3),
+            cleanup_signal_count=pre_refinement_cleanup_signal_count or 0,
+            trustworthy_direct_url_count=pre_refinement_trustworthy_direct_url_count or 0,
+            skip_reason="forced_refinement_without_cleanup_signals",
+        )
+        return candidate_pool
 
     cleanup_candidates = _deterministic_trim_local_leads(
         settings,

@@ -2985,6 +2985,49 @@ def test_refine_local_leads_with_ollama_merges_cleaned_candidates(monkeypatch) -
     assert any(lead.direct_job_url == "https://jobs.lever.co/acme/123" for lead in refined)
 
 
+def test_refine_local_leads_with_ollama_skips_forced_modes_without_cleanup_signals(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Acme",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/123",
+        evidence_notes="Direct ATS role.",
+    )
+    lead_two = JobLead(
+        company_name="Beta",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/beta/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/beta/456",
+        evidence_notes="Direct ATS role.",
+    )
+
+    async def fail_cleanup(*args, **kwargs):
+        raise AssertionError("Ollama cleanup should not run when forced refinement has no cleanup signals.")
+
+    monkeypatch.setattr("job_agent.job_search._cleanup_local_leads_with_ollama", fail_cleanup)
+    monkeypatch.setattr("job_agent.job_search.record_ollama_event", lambda *args, **kwargs: None)
+
+    refined = asyncio.run(
+        _refine_local_leads_with_ollama(
+            settings,
+            "seed replay triage",
+            [lead_one, lead_two],
+            cleanup_limit=2,
+            refinement_mode="forced_seed_triage",
+            pre_refinement_average_confidence=0.967,
+            pre_refinement_cleanup_signal_count=0,
+            pre_refinement_trustworthy_direct_url_count=2,
+            run_id="run-guard",
+        )
+    )
+
+    assert refined == [lead_one, lead_two]
+
+
 def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
