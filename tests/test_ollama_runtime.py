@@ -13,6 +13,10 @@ from job_agent.ollama_runtime import (
 )
 
 
+async def _run_blocking_inline(func, /, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 def build_settings(tmp_path: Path) -> Settings:
     return Settings(
         project_root=tmp_path,
@@ -313,6 +317,7 @@ def test_prewarm_ollama_model_restarts_once_and_records_success(
 
     monkeypatch.setattr("job_agent.ollama_runtime._probe_ollama_profile_sync", fake_probe)
     monkeypatch.setattr("job_agent.ollama_runtime.ensure_ollama_server", fake_ensure)
+    monkeypatch.setattr("job_agent.ollama_runtime.asyncio.to_thread", _run_blocking_inline)
 
     success, error_message, total_duration = asyncio.run(prewarm_ollama_model(settings, run_id="run-prewarm"))
 

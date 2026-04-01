@@ -11,6 +11,14 @@ from job_agent.linkedin_extension_bridge import (
 )
 
 
+async def _run_blocking_inline(func, /, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
+async def _sleep_immediately(_delay: float) -> None:
+    return None
+
+
 def test_build_extension_capture_urls_include_session_metadata() -> None:
     urls = build_extension_capture_urls("Acme AI", "session-123", "Senior Product Manager, AI")
     assert len(urls["1st"]) >= 3
@@ -215,6 +223,8 @@ def test_open_search_tabs_uses_dedicated_host_when_configured_profile_is_missing
         company_name="Acme AI",
         search_urls={"1st": ["https://example.com/1st"], "2nd": ["https://example.com/2nd"]},
     )
+    monkeypatch.setattr(bridge_module.asyncio, "to_thread", _run_blocking_inline)
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", _sleep_immediately)
     monkeypatch.setattr(
         bridge_module,
         "inspect_configured_firefox_extension_profile",
@@ -266,6 +276,8 @@ def test_open_search_tabs_still_fails_when_dedicated_host_is_not_authenticated(
         company_name="Acme AI",
         search_urls={"1st": ["https://example.com/1st"], "2nd": ["https://example.com/2nd"]},
     )
+    monkeypatch.setattr(bridge_module.asyncio, "to_thread", _run_blocking_inline)
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", _sleep_immediately)
     monkeypatch.setattr(
         bridge_module,
         "inspect_configured_firefox_extension_profile",
@@ -316,6 +328,8 @@ def test_open_search_tabs_primes_feed_before_people_search(monkeypatch, tmp_path
         company_name="Acme AI",
         search_urls={"1st": ["https://example.com/1st"], "2nd": ["https://example.com/2nd"]},
     )
+    monkeypatch.setattr(bridge_module.asyncio, "to_thread", _run_blocking_inline)
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", _sleep_immediately)
     monkeypatch.setattr(
         bridge_module,
         "inspect_configured_firefox_extension_profile",

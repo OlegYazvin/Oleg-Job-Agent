@@ -68,6 +68,7 @@ from job_agent.job_search import (
     _normalize_role_title_to_focus_queries,
     _normalize_direct_job_url,
     _precheck_lead_hints,
+    _query_family_key,
     _query_timeout_seconds_for_query,
     _query_timeout_skip_reason,
     _repair_direct_job_url,
@@ -1383,6 +1384,30 @@ def test_local_query_rounds_prefer_focus_roles_before_company_drilldown() -> Non
     focus_company_queries = [query for query in flattened[:12] if "Alt" in query or "Coinbase" in query]
     assert any("Alt" in query for query in focus_company_queries)
     assert any("Coinbase" in query for query in focus_company_queries)
+
+
+def test_local_query_rounds_prune_cross_run_timeout_cooldown_families_before_execution() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    history = {
+        "structured_ats": {"consecutive_timeout_heavy_runs": 2},
+        "startup_workatastartup": {"consecutive_timeout_heavy_runs": 2},
+        "startup_generic": {"consecutive_timeout_heavy_runs": 2},
+    }
+
+    rounds = _build_query_rounds(
+        settings,
+        SearchTuning(attempt_number=1),
+        query_family_history=history,
+    )
+    flattened = [query for query_round in rounds for query in query_round]
+
+    assert flattened
+    assert all(
+        _query_family_key(query) not in {"structured_ats", "startup_workatastartup", "startup_generic"}
+        for query in flattened
+    )
+    assert len(flattened) < settings.max_search_rounds * settings.search_round_query_limit
 
 
 def test_builtin_search_terms_expand_brittle_queries() -> None:

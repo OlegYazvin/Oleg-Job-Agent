@@ -2750,14 +2750,37 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
     return _dedupe_queries(queries)
 
 
-def _build_query_rounds(settings: Settings, tuning: SearchTuning | None = None) -> list[list[str]]:
+def _filter_query_bank_for_cross_run_cooldowns(
+    queries: list[str],
+    *,
+    query_family_history: dict[str, dict[str, object]] | None = None,
+) -> list[str]:
+    if not query_family_history:
+        return queries
+    return [
+        query
+        for query in queries
+        if _query_family_cooldown_reason(query, query_family_history=query_family_history) is None
+    ]
+
+
+def _build_query_rounds(
+    settings: Settings,
+    tuning: SearchTuning | None = None,
+    *,
+    query_family_history: dict[str, dict[str, object]] | None = None,
+) -> list[list[str]]:
     if settings.llm_provider == "ollama":
-        return _build_local_query_rounds(settings, tuning=tuning)
+        return _build_local_query_rounds(settings, tuning=tuning, query_family_history=query_family_history)
 
     tuning = tuning or SearchTuning(attempt_number=1)
     targeted_queries = _build_targeted_attempt_queries(settings, tuning)
     fallback_queries = _build_search_query_bank(settings, tuning=tuning)
     query_bank = _dedupe_queries([*targeted_queries, *fallback_queries])
+    query_bank = _filter_query_bank_for_cross_run_cooldowns(
+        query_bank,
+        query_family_history=query_family_history,
+    )
     max_queries = settings.max_search_rounds * settings.search_round_query_limit
     limited_bank = query_bank[:max_queries]
     return [
@@ -2766,7 +2789,12 @@ def _build_query_rounds(settings: Settings, tuning: SearchTuning | None = None) 
     ]
 
 
-def _build_local_query_rounds(settings: Settings, tuning: SearchTuning | None = None) -> list[list[str]]:
+def _build_local_query_rounds(
+    settings: Settings,
+    tuning: SearchTuning | None = None,
+    *,
+    query_family_history: dict[str, dict[str, object]] | None = None,
+) -> list[list[str]]:
     tuning = tuning or SearchTuning(attempt_number=1)
     local_role_queries = _build_local_role_queries()
     scout_queries = _build_local_small_company_scout_queries(settings, tuning)
@@ -2804,6 +2832,10 @@ def _build_local_query_rounds(settings: Settings, tuning: SearchTuning | None = 
         *_interleave_query_groups(query_groups),
     ]
     query_bank = _dedupe_queries(query_bank)
+    query_bank = _filter_query_bank_for_cross_run_cooldowns(
+        query_bank,
+        query_family_history=query_family_history,
+    )
     limited_bank = query_bank[:per_attempt_budget]
     return [
         limited_bank[index : index + settings.search_round_query_limit]
@@ -7562,7 +7594,11 @@ async def find_matching_jobs(
             )
 
         discovery_agent = build_job_discovery_agent(settings, tuning) if openai_agents_enabled else None
-        query_rounds = _build_query_rounds(settings, tuning=tuning)
+        query_rounds = _build_query_rounds(
+            settings,
+            tuning=tuning,
+            query_family_history=query_family_history,
+        )
         attempt_start_leads = total_unique_leads
         resolved_leads_this_attempt = 0
         lead_timeout_seconds = settings.per_lead_timeout_seconds
