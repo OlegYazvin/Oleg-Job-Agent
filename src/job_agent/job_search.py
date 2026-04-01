@@ -7297,13 +7297,22 @@ def _trusted_source_fallback_direct_url(
 ) -> str | None:
     if not _lead_has_trusted_source_fallback_evidence(lead, settings, candidate):
         return None
-    if _trusted_source_fallback_quality_score(lead, candidate, settings) < 16:
-        return None
-    for direct_url in (
+    candidate_direct_urls = [
         str(candidate.direct_job_url or ""),
         str(candidate.resolved_job_url or ""),
         str(lead.direct_job_url or ""),
+    ]
+    required_quality_score = 16
+    if any(
+        direct_url
+        and _url_has_strong_expected_company_hint(direct_url, lead.company_name)
+        and _looks_like_company_job_page(direct_url)
+        for direct_url in candidate_direct_urls
     ):
+        required_quality_score = 8
+    if _trusted_source_fallback_quality_score(lead, candidate, settings) < required_quality_score:
+        return None
+    for direct_url in candidate_direct_urls:
         if not direct_url:
             continue
         if not _url_has_strong_expected_company_hint(direct_url, lead.company_name):

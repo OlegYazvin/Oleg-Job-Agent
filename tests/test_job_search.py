@@ -2007,6 +2007,47 @@ def test_should_accept_trusted_source_fallback_on_fetch_failure_uses_candidate_e
     assert _should_accept_trusted_source_fallback_on_fetch_failure(lead, candidate, settings)
 
 
+def test_should_accept_trusted_source_fallback_on_fetch_failure_accepts_medium_quality_company_hosted_role(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+    settings.posted_within_days = 14
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 30))
+    lead = JobLead(
+        company_name="Caterpillar",
+        role_title="Principal Digital GenAI Product Manager; In-Cab Experience",
+        source_url="https://builtin.com/job/principal-digital-genai-product-manager-cab-experience/8233588",
+        source_type="company_site",
+        direct_job_url="https://careers.caterpillar.com/en/jobs/r0000341589/principal-digital-genai-product-manager-in-cab-experience",
+        location_hint="Remote - United States",
+        posted_date_hint="2026-03-19",
+        is_remote_hint=True,
+        salary_text_hint="$147,760.00 - $240,110.00",
+        base_salary_min_usd_hint=147760,
+        base_salary_max_usd_hint=240110,
+        evidence_notes="Built In source disclosed fully remote and salary information for this principal GenAI PM role.",
+        source_quality_score_hint=9,
+    )
+    candidate = JobPosting(
+        company_name="Caterpillar",
+        role_title="Principal Digital GenAI Product Manager; In-Cab Experience",
+        direct_job_url=lead.direct_job_url,
+        resolved_job_url=lead.direct_job_url,
+        ats_platform="careers.caterpillar.com",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-19",
+        posted_date_iso="2026-03-19",
+        base_salary_min_usd=147760,
+        base_salary_max_usd=240110,
+        salary_text="$147,760.00 - $240,110.00",
+        evidence_notes=lead.evidence_notes,
+        validation_evidence=[],
+    )
+
+    assert _should_accept_trusted_source_fallback_on_fetch_failure(lead, candidate, settings)
+
+
 def test_seed_lead_from_failure_only_replays_fixable_failures() -> None:
     replayable = SearchFailure(
         stage="validation",
