@@ -63,6 +63,7 @@ from job_agent.job_search import (
     _is_weak_company_hint,
     _merge_candidate_with_snapshot,
     _maybe_force_round_lead_refinement_with_ollama,
+    _maybe_force_seed_lead_refinement_with_ollama,
     _normalize_and_filter_discovery_leads,
     _normalize_company_key,
     _normalize_role_title_to_focus_queries,
@@ -2898,6 +2899,95 @@ def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypa
     lead_one = JobLead(
         company_name="Tiny AI",
         role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/123",
+        source_type="builtin",
+        direct_job_url=None,
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Mirror board result that still needs cleanup.",
+    )
+    lead_two = JobLead(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/456",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=230000,
+        evidence_notes="Direct ATS role.",
+    )
+    lead_map = {
+        "https://builtin.com/job/123": lead_one,
+        "https://jobs.lever.co/acme/456": lead_two,
+    }
+    forced_calls: list[tuple[int, str | None]] = []
+
+    async def fake_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_local_search(_query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+        return [
+            ("https://builtin.com/job/123", "Tiny AI - Senior Product Manager, AI", ""),
+            ("https://jobs.lever.co/acme/456", "Acme AI - Staff Product Manager, AI", ""),
+        ]
+
+    async def fake_refine(
+        _settings: Settings,
+        _query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
+    monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
+    monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
+    monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    monkeypatch.setattr("job_agent.job_search.record_ollama_event", lambda *args, **kwargs: None)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_REFINEMENT_ATTEMPTS.clear()
+
+    asyncio.run(
+        _search_single_query_local(
+            settings,
+            'site:ycombinator.com/companies "product manager" "applied intelligence" remote startup',
+            attempt_number=2,
+            run_id="run-1",
+        )
+    )
+    asyncio.run(
+        _search_single_query_local(
+            settings,
+            'site:ycombinator.com/companies "senior product manager" "applied intelligence" remote',
+            attempt_number=2,
+            run_id="run-1",
+        )
+    )
+
+    assert forced_calls == [(2, "forced_sample")]
+
+
+def test_search_single_query_local_skips_forced_ollama_sample_for_clean_direct_ats_bundle(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
         source_url="https://jobs.ashbyhq.com/tinyai/123",
         source_type="direct_ats",
         direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
@@ -2969,16 +3059,8 @@ def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypa
             run_id="run-1",
         )
     )
-    asyncio.run(
-        _search_single_query_local(
-            settings,
-            'site:ycombinator.com/companies "senior product manager" "applied intelligence" remote',
-            attempt_number=2,
-            run_id="run-1",
-        )
-    )
 
-    assert forced_calls == [(2, "forced_sample")]
+    assert forced_calls == []
 
 
 def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(monkeypatch) -> None:
@@ -2987,13 +3069,13 @@ def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(mon
     lead_one = JobLead(
         company_name="Tiny AI",
         role_title="Senior Product Manager, AI",
-        source_url="https://jobs.ashbyhq.com/tinyai/123",
-        source_type="direct_ats",
-        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        source_url="https://builtin.com/job/123",
+        source_type="builtin",
+        direct_job_url=None,
         is_remote_hint=True,
         posted_date_hint="today",
         base_salary_min_usd_hint=220000,
-        evidence_notes="Direct ATS role.",
+        evidence_notes="Mirror board result that still needs cleanup.",
     )
     lead_two = JobLead(
         company_name="Acme AI",
@@ -3050,6 +3132,65 @@ def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(mon
     assert first == [lead_one, lead_two]
     assert second == [lead_one, lead_two]
     assert forced_calls == [(2, "forced_round_sample", "attempt 2 round 1 aggregate cleanup")]
+
+
+def test_maybe_force_seed_lead_refinement_with_ollama_skips_clean_seed_bundle(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/tinyai/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/tinyai/123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Direct ATS role.",
+    )
+    lead_two = JobLead(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/456",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=230000,
+        evidence_notes="Direct ATS role.",
+    )
+    forced_calls: list[tuple[int, str | None, str]] = []
+
+    async def fake_refine(
+        _settings: Settings,
+        query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode, query))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_SEED_REFINEMENT_RUNS.clear()
+
+    refined = asyncio.run(
+        _maybe_force_seed_lead_refinement_with_ollama(
+            settings,
+            [lead_one, lead_two],
+            run_id="run-1",
+        )
+    )
+
+    assert refined == [lead_one, lead_two]
+    assert forced_calls == []
 
 
 def test_ensure_lazy_ollama_prewarm_only_runs_once_per_run(monkeypatch) -> None:
