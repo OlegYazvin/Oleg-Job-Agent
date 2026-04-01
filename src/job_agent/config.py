@@ -147,7 +147,9 @@ class Settings:
 
 def load_settings(project_root: Path | None = None, *, require_openai: bool = True) -> Settings:
     root = project_root or Path.cwd()
-    load_dotenv(root / ".env")
+    # Project-local .env values should take precedence over inherited shell values
+    # so one machine-wide export does not leak into another repo or test fixture.
+    load_dotenv(root / ".env", override=True)
 
     def resolve_config_path(raw_value: str) -> Path:
         candidate = Path(raw_value).expanduser()

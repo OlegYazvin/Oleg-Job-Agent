@@ -83,3 +83,28 @@ def test_load_settings_resolves_firefox_extension_profile_dir(tmp_path: Path, mo
     settings = load_settings(tmp_path)
 
     assert settings.firefox_extension_profile_dir == tmp_path / "profiles/default-release"
+
+
+def test_load_settings_prefers_project_env_over_inherited_firefox_profile_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("USE_OPENAI_FALLBACK", "false")
+    monkeypatch.setenv("FIREFOX_EXTENSION_PROFILE_DIR", "/tmp/inherited-profile")
+    _write_env(
+        tmp_path,
+        "\n".join(
+            [
+                "OPENAI_API_KEY=",
+                "LLM_PROVIDER=ollama",
+                "USE_OPENAI_FALLBACK=false",
+                "FIREFOX_EXTENSION_PROFILE_DIR=profiles/default-release",
+            ]
+        ),
+    )
+
+    settings = load_settings(tmp_path)
+
+    assert settings.firefox_extension_profile_dir == tmp_path / "profiles/default-release"

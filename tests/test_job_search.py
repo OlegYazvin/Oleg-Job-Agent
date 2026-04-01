@@ -1787,6 +1787,27 @@ def test_query_timeout_skip_reason_respects_cross_run_family_cooldown() -> None:
     assert "cooling down" in reason.lower()
 
 
+def test_query_timeout_skip_reason_respects_structured_ats_family_cooldown() -> None:
+    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
+    history = {
+        "structured_ats": {
+            "consecutive_timeout_heavy_runs": 2,
+            "consecutive_zero_yield_runs": 2,
+        }
+    }
+
+    reason = _query_timeout_skip_reason(
+        diagnostics,
+        'site:jobs.lever.co "staff product manager" "AI" remote',
+        attempt_number=1,
+        query_family_history=history,
+    )
+
+    assert reason is not None
+    assert "structured ats" in reason.lower()
+    assert "cooling down" in reason.lower()
+
+
 def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
@@ -2014,7 +2035,7 @@ def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_witho
         source_url="https://builtin.com/job/repeatco-ai-pm/123",
         source_type="builtin",
         direct_job_url="https://jobs.lever.co/repeatco/abc123",
-        posted_date_hint="2026-03-24",
+        posted_date_hint="today",
         is_remote_hint=True,
         salary_text_hint="$210,000 - $240,000",
         evidence_notes="Remote AI product manager role with published salary.",
@@ -2077,7 +2098,7 @@ def test_dedupe_round_leads_keeps_best_source_for_same_role() -> None:
         source_type="direct_ats",
         direct_job_url="https://jobs.ashbyhq.com/hopper/123",
         is_remote_hint=True,
-        posted_date_hint="2026-03-24",
+        posted_date_hint="today",
         evidence_notes="Direct ATS result.",
     )
 

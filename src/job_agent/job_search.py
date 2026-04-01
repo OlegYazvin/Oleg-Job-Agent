@@ -388,6 +388,7 @@ LOW_TRUST_REPLAY_SOURCE_HOST_FRAGMENTS = (
 QUERY_FAMILY_COOLDOWN_ELIGIBLE = {
     "broad_generic",
     "generic_discovery",
+    "structured_ats",
     "startup_getro",
     "startup_generic",
     "startup_wellfound",
