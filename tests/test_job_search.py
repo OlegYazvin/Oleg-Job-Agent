@@ -1915,6 +1915,41 @@ def test_should_accept_trusted_source_fallback_on_fetch_failure_for_strong_compa
     assert _should_accept_trusted_source_fallback_on_fetch_failure(lead, candidate, settings)
 
 
+def test_should_accept_trusted_source_fallback_on_fetch_failure_uses_candidate_evidence_when_lead_hints_are_sparse(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+    settings.posted_within_days = 14
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 30))
+    lead = JobLead(
+        company_name="Caterpillar",
+        role_title="Principal Digital GenAI Product Manager; In-Cab Experience",
+        source_url="https://builtin.com/job/principal-digital-genai-product-manager-cab-experience/8233588",
+        source_type="company_site",
+        direct_job_url="https://careers.caterpillar.com/en/jobs/r0000341589/principal-digital-genai-product-manager-in-cab-experience",
+        evidence_notes="Built In source surfaced the role, but hint hydration was sparse.",
+    )
+    candidate = JobPosting(
+        company_name="Caterpillar",
+        role_title="Principal Digital GenAI Product Manager; In-Cab Experience",
+        direct_job_url=lead.direct_job_url,
+        resolved_job_url=lead.direct_job_url,
+        ats_platform="careers.caterpillar.com",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-19",
+        posted_date_iso="2026-03-19",
+        base_salary_min_usd=147760,
+        base_salary_max_usd=240110,
+        salary_text="$147,760.00 - $240,110.00",
+        evidence_notes="Built In source disclosed fully remote and salary information for this principal GenAI PM role.",
+        validation_evidence=[],
+        source_quality_score=19,
+    )
+
+    assert _should_accept_trusted_source_fallback_on_fetch_failure(lead, candidate, settings)
+
+
 def test_seed_lead_from_failure_only_replays_fixable_failures() -> None:
     replayable = SearchFailure(
         stage="validation",

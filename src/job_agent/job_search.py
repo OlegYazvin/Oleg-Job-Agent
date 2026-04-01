@@ -7154,27 +7154,56 @@ def _snapshot_is_non_specific_company_page(
     return False
 
 
-def _lead_has_trusted_source_fallback_evidence(lead: JobLead, settings: Settings) -> bool:
+def _trusted_source_fallback_quality_score(
+    lead: JobLead,
+    candidate: JobPosting | None,
+    settings: Settings,
+) -> int:
+    scores = [
+        lead.source_quality_score_hint,
+        candidate.source_quality_score if candidate is not None else None,
+        _lead_source_quality_score(lead, settings),
+    ]
+    return max(int(score) for score in scores if score is not None)
+
+
+def _lead_has_trusted_source_fallback_evidence(
+    lead: JobLead,
+    settings: Settings,
+    candidate: JobPosting | None = None,
+) -> bool:
     if lead.source_type not in {"builtin", "company_site", "direct_ats"}:
         return False
     salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
-        lead.base_salary_min_usd_hint,
-        lead.base_salary_max_usd_hint,
-        lead.salary_text_hint,
-        lead.evidence_notes,
+        lead.base_salary_min_usd_hint if lead.base_salary_min_usd_hint is not None else (candidate.base_salary_min_usd if candidate else None),
+        lead.base_salary_max_usd_hint if lead.base_salary_max_usd_hint is not None else (candidate.base_salary_max_usd if candidate else None),
+        lead.salary_text_hint or (candidate.salary_text if candidate else None),
+        " ".join(part for part in (lead.evidence_notes, candidate.evidence_notes if candidate else "") if part),
     )
     salary_values = [value for value in (salary_min, salary_max) if value is not None]
     if not salary_values or max(salary_values) < settings.min_base_salary_usd:
         return False
-    if lead.is_remote_hint is not True:
+    remote_hint = lead.is_remote_hint if lead.is_remote_hint is not None else (candidate.is_fully_remote if candidate else None)
+    if remote_hint is not True:
         return False
-    if _extract_geo_limited_remote_region(" ".join(part for part in (lead.location_hint, lead.evidence_notes) if part)):
+    geo_hint_text = " ".join(
+        part
+        for part in (
+            lead.location_hint,
+            candidate.location_text if candidate else "",
+            lead.evidence_notes,
+            candidate.evidence_notes if candidate else "",
+        )
+        if part
+    )
+    if _extract_geo_limited_remote_region(geo_hint_text):
         return False
-    if not _lead_is_ai_related_product_manager(lead):
+    if not _lead_is_ai_related_product_manager(lead) and not (candidate and _is_ai_related_product_manager(candidate)):
         return False
+    posted_date_hint = lead.posted_date_hint or (candidate.posted_date_iso if candidate else None) or (candidate.posted_date_text if candidate else "")
     return _is_recent_enough(
         None,
-        lead.posted_date_hint or "",
+        posted_date_hint or "",
         settings.posted_within_days,
         timezone_name=settings.timezone,
     )
@@ -7185,9 +7214,9 @@ def _trusted_source_fallback_direct_url(
     candidate: JobPosting,
     settings: Settings,
 ) -> str | None:
-    if not _lead_has_trusted_source_fallback_evidence(lead, settings):
+    if not _lead_has_trusted_source_fallback_evidence(lead, settings, candidate):
         return None
-    if (lead.source_quality_score_hint or _lead_source_quality_score(lead, settings)) < 16:
+    if _trusted_source_fallback_quality_score(lead, candidate, settings) < 16:
         return None
     for direct_url in (
         str(candidate.direct_job_url or ""),
@@ -7218,7 +7247,7 @@ def _build_trusted_source_fallback_job(
     *,
     status_code: int,
 ) -> JobPosting:
-    source_quality_score = lead.source_quality_score_hint or _lead_source_quality_score(lead, settings)
+    source_quality_score = _trusted_source_fallback_quality_score(lead, candidate, settings)
     direct_url = _trusted_source_fallback_direct_url(lead, candidate, settings) or str(candidate.direct_job_url)
     evidence_note = (
         f"Accepted via trusted source fallback after the direct page returned HTTP {status_code}; "
