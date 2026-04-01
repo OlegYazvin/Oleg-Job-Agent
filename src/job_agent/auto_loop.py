@@ -29,6 +29,7 @@ from .workflow import run_daily_workflow
 
 AUTO_LOOP_STATUS_EVENT_LIMIT = 30
 AUTO_LOOP_STATE_FILENAME = "auto-loop-state.json"
+AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION = 3
 VALIDATION_COMMANDS = [
     "PYTHONPATH=src .venv/bin/pytest -q",
 ]
@@ -284,22 +285,20 @@ def invoke_codex_iteration(
     paths["prompt"].write_text(prompt, encoding="utf-8")
     before_ids = set(_read_codex_session_ids(settings))
     command = _codex_command_parts(settings)
-    command.extend(["exec"])
-    if session_id:
-        command.extend(["resume", session_id, "-"])
-    else:
-        command.append("-")
     command.extend(
         [
+            "exec",
             "--full-auto",
             "--skip-git-repo-check",
             "--json",
             "-o",
             str(paths["codex_last_message"]),
-            "-C",
-            str(settings.project_root),
         ]
     )
+    if session_id:
+        command.extend(["resume", session_id, "-"])
+    else:
+        command.extend(["-C", str(settings.project_root), "-"])
     with paths["codex_log"].open("w", encoding="utf-8") as handle:
         completed = subprocess.run(
             command,
@@ -341,6 +340,60 @@ def invoke_codex_iteration(
         summary=last_message[:4000] or None,
         validation_commands=_validation_commands(),
     )
+
+
+def _render_codex_retry_prompt(
+    base_prompt: str,
+    *,
+    attempt_number: int,
+    codex_result: CodexIterationResult,
+    validation_results: list[ValidationCommandResult] | None = None,
+) -> str:
+    validation_lines: list[str] = []
+    for item in validation_results or []:
+        status = "passed" if item.passed else "failed"
+        rendered = f"- `{item.command}`: {status} (exit_code={item.exit_code})"
+        if item.output_path:
+            rendered += f" -> `{item.output_path}`"
+        validation_lines.append(rendered)
+    return "\n".join(
+        [
+            base_prompt.rstrip(),
+            "",
+            f"Retry context for autonomous repair attempt {attempt_number}:",
+            f"- Previous Codex status: `{codex_result.status}`",
+            f"- Previous exit code: `{codex_result.exit_code}`",
+            f"- Previous summary: {codex_result.summary or 'No summary was captured.'}",
+            "- Fix the failure from the previous attempt and rerun the required validation checks.",
+            "- Preserve useful in-progress code changes unless they directly caused the failure.",
+            "- Do not run the workflow again.",
+            "- Do not commit, push, or sync.",
+            "",
+            "Previous validation results:",
+            *(validation_lines or ["- No validation results were captured."]),
+        ]
+    ).strip() + "\n"
+
+
+def _record_failed_iteration(
+    settings: Settings,
+    *,
+    state: AutoLoopState,
+    iteration: AutoLoopIteration,
+    paths: dict[str, Path],
+    codex_result: CodexIterationResult,
+    failure_status: str,
+    failure_summary: str,
+) -> None:
+    state.latest_validation_result = failure_status
+    state.last_failure_summary = failure_summary
+    codex_result.status = failure_status  # type: ignore[assignment]
+    codex_result.summary = failure_summary
+    save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
+    iteration.result_path = str(paths["result"])
+    iteration.completed_at = _utc_now()
+    state.iterations.append(iteration)
+    save_auto_loop_state(settings, state)
 
 
 def _find_run_artifact_path(settings: Settings, run_id: str | None) -> str | None:
@@ -766,152 +819,265 @@ async def run_autonomous_loop(
         iteration.prompt_path = str(paths["prompt"])
         iteration.selected_theme = analysis.selected_theme
 
-        state.status = "waiting_for_codex"
-        save_auto_loop_state(settings, state)
-        write_auto_loop_status(
-            settings,
-            state,
-            stage="codex",
-            message=f"Running Codex improvement pass for iteration {iteration_number}: {analysis.selected_theme}.",
-            extra_metrics={"selected_theme": analysis.selected_theme},
-        )
-        head_before_codex = _git_head(settings)
-        codex_result = invoke_codex_iteration(
-            settings,
-            iteration_number=iteration_number,
-            prompt=prompt,
-            selected_theme=analysis.selected_theme,
-            session_id=state.codex_session_id,
-        )
-        if codex_result.session_id:
-            state.codex_session_id = codex_result.session_id
-        iteration.codex_log_path = codex_result.log_path
-        iteration.codex_last_message_path = codex_result.last_message_path
-        if codex_result.status not in {"succeeded"}:
-            state.status = "failed"
-            state.latest_validation_result = codex_result.status
-            state.last_failure_summary = codex_result.summary or "Codex iteration failed."
-            codex_result.validation_results = []
-            save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
-            iteration.result_path = str(paths["result"])
-            iteration.completed_at = _utc_now()
-            state.iterations.append(iteration)
+        base_prompt = prompt
+        retry_prompt = prompt
+        codex_succeeded = False
+        codex_result: CodexIterationResult | None = None
+        for codex_attempt in range(1, AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION + 1):
+            state.status = "waiting_for_codex"
             save_auto_loop_state(settings, state)
             write_auto_loop_status(
                 settings,
                 state,
-                stage="failed",
-                message=state.last_failure_summary,
-                done=True,
-                failed=True,
+                stage="codex",
+                message=(
+                    f"Running Codex improvement pass for iteration {iteration_number}: "
+                    f"{analysis.selected_theme} (attempt {codex_attempt}/{AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION})."
+                ),
+                extra_metrics={
+                    "selected_theme": analysis.selected_theme,
+                    "codex_attempt": codex_attempt,
+                    "codex_attempt_limit": AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION,
+                },
             )
-            return state
-        if _git_head(settings) != head_before_codex:
-            state.status = "failed"
-            state.latest_validation_result = "session_failed"
-            state.last_failure_summary = "Codex changed Git history unexpectedly; the controller owns commit sequencing."
-            codex_result.status = "session_failed"
-            codex_result.summary = state.last_failure_summary
-            save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
-            iteration.result_path = str(paths["result"])
-            iteration.completed_at = _utc_now()
-            state.iterations.append(iteration)
-            save_auto_loop_state(settings, state)
-            write_auto_loop_status(
+            head_before_codex = _git_head(settings)
+            codex_result = invoke_codex_iteration(
                 settings,
-                state,
-                stage="failed",
-                message=state.last_failure_summary,
-                done=True,
-                failed=True,
+                iteration_number=iteration_number,
+                prompt=retry_prompt,
+                selected_theme=analysis.selected_theme,
+                session_id=state.codex_session_id,
             )
-            return state
+            if codex_result.session_id:
+                state.codex_session_id = codex_result.session_id
+            iteration.codex_log_path = codex_result.log_path
+            iteration.codex_last_message_path = codex_result.last_message_path
+            if codex_result.status not in {"succeeded"}:
+                failure_summary = codex_result.summary or "Codex iteration failed."
+                if codex_attempt < AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION:
+                    retry_prompt = _render_codex_retry_prompt(
+                        base_prompt,
+                        attempt_number=codex_attempt + 1,
+                        codex_result=codex_result,
+                    )
+                    state.last_failure_summary = failure_summary
+                    save_auto_loop_state(settings, state)
+                    write_auto_loop_status(
+                        settings,
+                        state,
+                        stage="codex",
+                        message=(
+                            f"Codex attempt {codex_attempt} failed: {failure_summary} "
+                            f"Retrying repair attempt {codex_attempt + 1}/{AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION}."
+                        ),
+                        extra_metrics={"selected_theme": analysis.selected_theme},
+                    )
+                    continue
+                _record_failed_iteration(
+                    settings,
+                    state=state,
+                    iteration=iteration,
+                    paths=paths,
+                    codex_result=codex_result,
+                    failure_status=codex_result.status,
+                    failure_summary=failure_summary,
+                )
+                write_auto_loop_status(
+                    settings,
+                    state,
+                    stage="codex",
+                    message=(
+                        f"Iteration {iteration_number} exhausted Codex repair attempts after status "
+                        f"`{codex_result.status}`. Continuing to the next workflow attempt."
+                    ),
+                    done=False,
+                    failed=False,
+                    extra_metrics={"selected_theme": analysis.selected_theme},
+                )
+                break
+            if _git_head(settings) != head_before_codex:
+                failure_summary = "Codex changed Git history unexpectedly; the controller owns commit sequencing."
+                codex_result.status = "session_failed"
+                if codex_attempt < AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION:
+                    retry_prompt = _render_codex_retry_prompt(
+                        base_prompt,
+                        attempt_number=codex_attempt + 1,
+                        codex_result=codex_result,
+                    )
+                    state.last_failure_summary = failure_summary
+                    save_auto_loop_state(settings, state)
+                    write_auto_loop_status(
+                        settings,
+                        state,
+                        stage="codex",
+                        message=(
+                            f"Codex changed Git history unexpectedly on attempt {codex_attempt}. "
+                            f"Retrying repair attempt {codex_attempt + 1}/{AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION}."
+                        ),
+                    )
+                    continue
+                _record_failed_iteration(
+                    settings,
+                    state=state,
+                    iteration=iteration,
+                    paths=paths,
+                    codex_result=codex_result,
+                    failure_status="session_failed",
+                    failure_summary=failure_summary,
+                )
+                write_auto_loop_status(
+                    settings,
+                    state,
+                    stage="codex",
+                    message=f"Iteration {iteration_number} exhausted repair attempts after unexpected Git-history changes.",
+                    done=False,
+                    failed=False,
+                )
+                break
 
-        state.status = "validating"
-        save_auto_loop_state(settings, state)
-        write_auto_loop_status(
-            settings,
-            state,
-            stage="validation",
-            message=f"Running validation for iteration {iteration_number}.",
-        )
-        validation_results = run_validation_commands(settings, iteration_number=iteration_number)
-        codex_result.validation_results = validation_results
-        validation_passed = all(item.passed for item in validation_results)
-        iteration.validation_passed = validation_passed
-        if not validation_passed:
-            codex_result.status = "validation_failed"
-            state.status = "failed"
-            state.latest_validation_result = "validation_failed"
-            state.last_failure_summary = "Validation failed after the Codex improvement pass."
-            save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
-            iteration.result_path = str(paths["result"])
-            iteration.completed_at = _utc_now()
-            state.iterations.append(iteration)
+            state.status = "validating"
             save_auto_loop_state(settings, state)
             write_auto_loop_status(
                 settings,
                 state,
-                stage="failed",
-                message=state.last_failure_summary,
-                done=True,
-                failed=True,
+                stage="validation",
+                message=f"Running validation for iteration {iteration_number}.",
             )
-            return state
+            validation_results = run_validation_commands(settings, iteration_number=iteration_number)
+            codex_result.validation_results = validation_results
+            validation_passed = all(item.passed for item in validation_results)
+            iteration.validation_passed = validation_passed
+            if not validation_passed:
+                failure_summary = "Validation failed after the Codex improvement pass."
+                codex_result.status = "validation_failed"
+                if codex_attempt < AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION:
+                    retry_prompt = _render_codex_retry_prompt(
+                        base_prompt,
+                        attempt_number=codex_attempt + 1,
+                        codex_result=codex_result,
+                        validation_results=validation_results,
+                    )
+                    state.last_failure_summary = failure_summary
+                    save_auto_loop_state(settings, state)
+                    write_auto_loop_status(
+                        settings,
+                        state,
+                        stage="validation",
+                        message=(
+                            f"Validation failed for Codex attempt {codex_attempt}. "
+                            f"Retrying repair attempt {codex_attempt + 1}/{AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION}."
+                        ),
+                    )
+                    continue
+                _record_failed_iteration(
+                    settings,
+                    state=state,
+                    iteration=iteration,
+                    paths=paths,
+                    codex_result=codex_result,
+                    failure_status="validation_failed",
+                    failure_summary=failure_summary,
+                )
+                write_auto_loop_status(
+                    settings,
+                    state,
+                    stage="validation",
+                    message=(
+                        f"Iteration {iteration_number} exhausted validation repair attempts. "
+                        "Continuing to the next workflow attempt."
+                    ),
+                    done=False,
+                    failed=False,
+                )
+                break
 
-        if not _working_tree_dirty(settings):
-            codex_result.status = "no_changes"
-            state.status = "failed"
-            state.latest_validation_result = "no_changes"
-            state.last_failure_summary = "Codex reported success but left no changes to commit."
+            if not _working_tree_dirty(settings):
+                failure_summary = "Codex reported success but left no changes to commit."
+                codex_result.status = "no_changes"
+                if codex_attempt < AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION:
+                    retry_prompt = _render_codex_retry_prompt(
+                        base_prompt,
+                        attempt_number=codex_attempt + 1,
+                        codex_result=codex_result,
+                        validation_results=validation_results,
+                    )
+                    state.last_failure_summary = failure_summary
+                    save_auto_loop_state(settings, state)
+                    write_auto_loop_status(
+                        settings,
+                        state,
+                        stage="codex",
+                        message=(
+                            f"Codex left no committable changes on attempt {codex_attempt}. "
+                            f"Retrying repair attempt {codex_attempt + 1}/{AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION}."
+                        ),
+                    )
+                    continue
+                _record_failed_iteration(
+                    settings,
+                    state=state,
+                    iteration=iteration,
+                    paths=paths,
+                    codex_result=codex_result,
+                    failure_status="no_changes",
+                    failure_summary=failure_summary,
+                )
+                write_auto_loop_status(
+                    settings,
+                    state,
+                    stage="codex",
+                    message=f"Iteration {iteration_number} produced no committable changes after all repair attempts.",
+                    done=False,
+                    failed=False,
+                )
+                break
+
+            try:
+                commit_hash = _commit_all_changes(settings, _commit_message(iteration_number, analysis.selected_theme))
+            except Exception as exc:
+                failure_summary = f"Commit failed after validation: {exc}"
+                codex_result.status = "commit_failed"
+                codex_result.summary = str(exc)
+                _record_failed_iteration(
+                    settings,
+                    state=state,
+                    iteration=iteration,
+                    paths=paths,
+                    codex_result=codex_result,
+                    failure_status="commit_failed",
+                    failure_summary=failure_summary,
+                )
+                write_auto_loop_status(
+                    settings,
+                    state,
+                    stage="validation",
+                    message=(
+                        f"Iteration {iteration_number} could not commit validated changes: {exc}. "
+                        "Continuing to the next workflow attempt."
+                    ),
+                    done=False,
+                    failed=False,
+                )
+                break
+
+            codex_result.commit_hash = commit_hash
+            codex_result.commit_message = _commit_message(iteration_number, analysis.selected_theme)
+            state.latest_commit_hash = commit_hash
+            state.latest_validation_result = "passed"
+            state.last_failure_summary = None
             save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
             iteration.result_path = str(paths["result"])
+            iteration.commit_hash = commit_hash
             iteration.completed_at = _utc_now()
             state.iterations.append(iteration)
             save_auto_loop_state(settings, state)
-            write_auto_loop_status(
-                settings,
-                state,
-                stage="failed",
-                message=state.last_failure_summary,
-                done=True,
-                failed=True,
-            )
-            return state
+            codex_succeeded = True
+            break
 
-        try:
-            commit_hash = _commit_all_changes(settings, _commit_message(iteration_number, analysis.selected_theme))
-        except Exception as exc:
-            codex_result.status = "commit_failed"
-            codex_result.summary = str(exc)
-            state.status = "failed"
-            state.latest_validation_result = "commit_failed"
-            state.last_failure_summary = f"Commit failed after validation: {exc}"
-            save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
-            iteration.result_path = str(paths["result"])
-            iteration.completed_at = _utc_now()
-            state.iterations.append(iteration)
+        if not codex_succeeded:
+            state.status = "running"
             save_auto_loop_state(settings, state)
-            write_auto_loop_status(
-                settings,
-                state,
-                stage="failed",
-                message=state.last_failure_summary,
-                done=True,
-                failed=True,
-            )
-            return state
-
-        codex_result.commit_hash = commit_hash
-        codex_result.commit_message = _commit_message(iteration_number, analysis.selected_theme)
-        state.latest_commit_hash = commit_hash
-        state.latest_validation_result = "passed"
-        save_json_snapshot(paths["result"], codex_result.model_dump(mode="json"))
-        iteration.result_path = str(paths["result"])
-        iteration.commit_hash = commit_hash
-        iteration.completed_at = _utc_now()
-        state.iterations.append(iteration)
-        save_auto_loop_state(settings, state)
+            continue
 
     state.status = "stopped"
     save_auto_loop_state(settings, state)

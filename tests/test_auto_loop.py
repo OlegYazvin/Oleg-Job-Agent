@@ -264,7 +264,10 @@ def test_invoke_codex_iteration_captures_new_session_id(tmp_path: Path, monkeypa
     monkeypatch.setattr("job_agent.auto_loop._read_codex_session_ids", lambda _settings: session_reads.pop(0))
     monkeypatch.setattr("job_agent.auto_loop._codex_command_parts", lambda _settings: ["codex"])
 
+    captured: dict[str, list[str]] = {}
+
     def fake_run(command, **kwargs):
+        captured["command"] = list(command)
         last_message_path = Path(command[command.index("-o") + 1])
         last_message_path.parent.mkdir(parents=True, exist_ok=True)
         last_message_path.write_text("Updated timeout suppression logic.", encoding="utf-8")
@@ -283,23 +286,73 @@ def test_invoke_codex_iteration_captures_new_session_id(tmp_path: Path, monkeypa
     assert result.status == "succeeded"
     assert result.session_id == "session-1"
     assert result.summary == "Updated timeout suppression logic."
+    assert captured["command"][:6] == ["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json", "-o"]
+    assert captured["command"][-3:] == ["-C", str(settings.project_root), "-"]
 
 
-def test_run_autonomous_loop_stops_on_validation_failure_after_failed_run(tmp_path: Path, monkeypatch) -> None:
+def test_invoke_codex_iteration_resume_places_exec_options_before_subcommand(tmp_path: Path, monkeypatch) -> None:
     settings = build_settings(tmp_path)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
-    current = _make_scorecard(
+    monkeypatch.setattr("job_agent.auto_loop._read_codex_session_ids", lambda _settings: ["session-1"])
+    monkeypatch.setattr("job_agent.auto_loop._codex_command_parts", lambda _settings: ["codex"])
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        last_message_path = Path(command[command.index("-o") + 1])
+        last_message_path.parent.mkdir(parents=True, exist_ok=True)
+        last_message_path.write_text("Retried timeout suppression logic.", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = invoke_codex_iteration(
+        settings,
+        iteration_number=2,
+        prompt="Retry the bounded fix.",
+        selected_theme="query_timeout_burden",
+        session_id="session-1",
+    )
+
+    assert result.status == "succeeded"
+    assert captured["command"][:6] == ["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json", "-o"]
+    assert "resume" in captured["command"]
+    assert captured["command"][captured["command"].index("resume") + 1 : captured["command"].index("resume") + 3] == ["session-1", "-"]
+    assert "-C" not in captured["command"][captured["command"].index("resume") :]
+
+
+def test_run_autonomous_loop_continues_after_validation_failure(tmp_path: Path, monkeypatch) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    first = _make_scorecard(
         run_id="run-1",
         status="failed",
         generated_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
         fresh_new_leads_count=2,
         query_timeout_count=5,
     )
-    save_run_scorecard(settings.data_dir, current)
+    second = _make_scorecard(
+        run_id="run-2",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 13, 0, tzinfo=UTC),
+        fresh_new_leads_count=6,
+        query_timeout_count=2,
+    )
+    save_run_scorecard(settings.data_dir, first)
+    save_run_scorecard(settings.data_dir, second)
+
+    workflow_results = iter(
+        [
+            ("run-1", "failed", "Workflow failed: mock failure"),
+            ("run-2", "completed", None),
+        ]
+    )
 
     async def fake_run_workflow_attempt(_settings: Settings, *, timeout_seconds: int | None = None):
-        return "run-1", "failed", "Workflow failed: mock failure"
+        return next(workflow_results)
 
     monkeypatch.setattr("job_agent.auto_loop._ensure_main_branch", lambda _settings: None)
     monkeypatch.setattr("job_agent.auto_loop.ensure_baseline_commit", lambda _settings, iteration_number=1: "baseline123")
@@ -315,18 +368,50 @@ def test_run_autonomous_loop_stops_on_validation_failure_after_failed_run(tmp_pa
             summary="Applied a repair.",
         ),
     )
+    validation_results = iter(
+        [
+            [
+                ValidationCommandResult(
+                    command="PYTHONPATH=src .venv/bin/pytest -q",
+                    passed=False,
+                    exit_code=1,
+                    output_path=str(settings.auto_loop_dir / "iteration-01" / "validation-1.log"),
+                )
+            ],
+            [
+                ValidationCommandResult(
+                    command="PYTHONPATH=src .venv/bin/pytest -q",
+                    passed=False,
+                    exit_code=1,
+                    output_path=str(settings.auto_loop_dir / "iteration-01" / "validation-2.log"),
+                )
+            ],
+            [
+                ValidationCommandResult(
+                    command="PYTHONPATH=src .venv/bin/pytest -q",
+                    passed=False,
+                    exit_code=1,
+                    output_path=str(settings.auto_loop_dir / "iteration-01" / "validation-3.log"),
+                )
+            ],
+            [
+                ValidationCommandResult(
+                    command="PYTHONPATH=src .venv/bin/pytest -q",
+                    passed=True,
+                    exit_code=0,
+                    output_path=str(settings.auto_loop_dir / "iteration-02" / "validation-1.log"),
+                )
+            ],
+        ]
+    )
     monkeypatch.setattr(
         "job_agent.auto_loop.run_validation_commands",
-        lambda _settings, *, iteration_number: [
-            ValidationCommandResult(
-                command="PYTHONPATH=src .venv/bin/pytest -q",
-                passed=False,
-                exit_code=1,
-                output_path=str(_settings.auto_loop_dir / f"iteration-{iteration_number:02d}" / "validation-1.log"),
-            )
-        ],
+        lambda _settings, *, iteration_number: next(validation_results),
     )
     monkeypatch.setattr("job_agent.auto_loop._git_head", lambda _settings: "head123")
+    dirty_results = iter([True])
+    monkeypatch.setattr("job_agent.auto_loop._working_tree_dirty", lambda _settings: next(dirty_results))
+    monkeypatch.setattr("job_agent.auto_loop._commit_all_changes", lambda _settings, _message: "commit-2")
 
     state = asyncio.run(
         run_autonomous_loop(
@@ -338,10 +423,13 @@ def test_run_autonomous_loop_stops_on_validation_failure_after_failed_run(tmp_pa
     )
 
     assert isinstance(state, AutoLoopState)
-    assert state.status == "failed"
-    assert state.completed_attempts == 1
+    assert state.status == "stopped"
+    assert state.completed_attempts == 2
     assert state.codex_session_id == "session-1"
-    assert state.latest_validation_result == "validation_failed"
-    assert len(state.iterations) == 1
+    assert state.latest_validation_result == "passed"
+    assert len(state.iterations) == 2
     assert state.iterations[0].run_status == "failed"
     assert state.iterations[0].validation_passed is False
+    assert state.iterations[1].run_status == "completed"
+    assert state.iterations[1].validation_passed is True
+    assert state.latest_commit_hash == "commit-2"
