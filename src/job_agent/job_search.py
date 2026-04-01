@@ -5956,6 +5956,8 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
     confidences = [_lead_confidence(lead) for lead in seed_window]
     average_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0
     cleanup_signal_count = sum(1 for lead in seed_window if _lead_needs_local_cleanup(lead))
+    if cleanup_signal_count <= 0:
+        return seed_leads
     low_trust_source_count = sum(1 for lead in seed_window if lead.source_type in {"linkedin", "builtin", "other"})
     trustworthy_direct_url_count = sum(
         1
