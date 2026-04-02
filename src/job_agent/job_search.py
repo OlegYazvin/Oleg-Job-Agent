@@ -5915,6 +5915,14 @@ async def _maybe_force_round_lead_refinement_with_ollama(
         for lead in cleanup_window
         if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
     )
+    # Skip forced round cleanup for already-clean bundles with only a single cleanup signal.
+    # This keeps the aggregate sample path focused on noisier rounds.
+    if (
+        cleanup_signal_count <= 1
+        and average_confidence >= 0.9
+        and trustworthy_direct_url_count >= max(1, len(cleanup_window) - 1)
+    ):
+        return round_leads
     if not _should_force_ollama_refinement_sample(
         settings,
         sample_size=len(cleanup_window),

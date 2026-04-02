@@ -3351,6 +3351,52 @@ def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(mon
     assert forced_calls == [(2, "forced_round_sample", "attempt 2 round 1 aggregate cleanup")]
 
 
+def test_maybe_force_round_lead_refinement_with_ollama_skips_clean_high_confidence_bundle(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Tiny AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/123",
+        source_type="builtin",
+        direct_job_url=None,
+        evidence_notes="Mirror board result that still needs cleanup.",
+    )
+    lead_two = JobLead(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/456",
+        evidence_notes="Direct ATS role.",
+    )
+    forced_calls: list[str] = []
+
+    async def fake_refine(*args, **kwargs):
+        forced_calls.append("called")
+        return [lead_one, lead_two]
+
+    monkeypatch.setattr("job_agent.job_search._should_force_ollama_refinement_sample", lambda *args, **kwargs: True)
+    monkeypatch.setattr("job_agent.job_search._lead_confidence", lambda lead: 0.9)
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_ROUND_REFINEMENT_ATTEMPTS.clear()
+
+    refined = asyncio.run(
+        _maybe_force_round_lead_refinement_with_ollama(
+            settings,
+            [lead_one, lead_two],
+            attempt_number=1,
+            round_number=1,
+            run_id="run-clean-round-guard",
+        )
+    )
+
+    assert refined == [lead_one, lead_two]
+    assert forced_calls == []
+
+
 def test_maybe_force_seed_lead_refinement_with_ollama_skips_clean_seed_bundle(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
