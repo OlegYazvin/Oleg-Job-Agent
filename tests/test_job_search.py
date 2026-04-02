@@ -3571,6 +3571,59 @@ def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(mon
     assert forced_calls == [(2, "forced_round_sample", "attempt 2 round 1 aggregate cleanup")]
 
 
+def test_maybe_force_round_lead_refinement_with_ollama_samples_large_clean_trusted_bundle(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    round_leads = [
+        JobLead(
+            company_name=f"Acme AI {index}",
+            role_title="Senior Product Manager, AI",
+            source_url=f"https://jobs.lever.co/acme/{index}",
+            source_type="direct_ats",
+            direct_job_url=f"https://jobs.lever.co/acme/{index}",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=220000 + index,
+            evidence_notes="Direct ATS role.",
+        )
+        for index in range(5)
+    ]
+    forced_calls: list[tuple[int, str | None, str]] = []
+
+    async def fake_refine(
+        _settings: Settings,
+        query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode, query))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_ROUND_REFINEMENT_ATTEMPTS.clear()
+
+    result = asyncio.run(
+        _maybe_force_round_lead_refinement_with_ollama(
+            settings,
+            round_leads,
+            attempt_number=2,
+            round_number=1,
+            run_id="run-1",
+        )
+    )
+
+    assert result == round_leads
+    assert forced_calls == [(2, "forced_round_sample", "attempt 2 round 1 aggregate cleanup")]
+
+
 def test_maybe_force_round_lead_refinement_with_ollama_skips_clean_high_confidence_bundle(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
