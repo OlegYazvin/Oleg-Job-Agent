@@ -1101,6 +1101,58 @@ def test_merge_candidate_with_snapshot_keeps_high_quality_remote_candidate_when_
     assert reason_code is None, detail
 
 
+def test_merge_candidate_with_snapshot_keeps_strong_structured_remote_candidate_without_conflicting_page_signal(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    candidate = JobPosting(
+        company_name="ServiceNow",
+        role_title="Senior Staff Outbound Product Manager - Telecom",
+        direct_job_url="https://careers.servicenow.com/jobs/744000112256777/senior-staff-outbound-product-manager-telecom/",
+        resolved_job_url="https://careers.servicenow.com/jobs/744000112256777/senior-staff-outbound-product-manager-telecom/",
+        ats_platform="ServiceNow",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-04-01",
+        posted_date_iso="2026-04-01",
+        base_salary_min_usd=190900,
+        base_salary_max_usd=334100,
+        salary_text="$190,900 - $334,100",
+        evidence_notes="Built In marked the role as remote. Own the roadmap for AI-driven telecom automation and agent workflows.",
+        validation_evidence=[],
+        source_quality_score=9,
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=candidate.direct_job_url,
+        resolved_url=candidate.direct_job_url,
+        ats_platform="ServiceNow",
+        status_code=200,
+        company_name="ServiceNow",
+        role_title="Senior Staff Outbound Product Manager - Telecom",
+        page_title="Senior Staff Outbound Product Manager - Telecom",
+        location_text="United States",
+        is_fully_remote=False,
+        posted_date_text="2026-04-01",
+        posted_date_iso="2026-04-01",
+        base_salary_min_usd=190900,
+        base_salary_max_usd=334100,
+        salary_text="$190,900 - $334,100",
+        text_excerpt="Senior Staff Outbound Product Manager - Telecom. Join our distributed product organization across the United States. Own the roadmap for AI-driven telecom automation and agent workflows.",
+        evidence_snippets=["Distributed product organization across the United States.", "AI-driven telecom automation and agent workflows."],
+    )
+
+    merged = _merge_candidate_with_snapshot(candidate, snapshot)
+
+    assert merged.is_fully_remote is True
+    reason_code, detail = _evaluate_merged_job(
+        merged,
+        snapshot,
+        settings,
+        expected_company_name="ServiceNow",
+        expected_role_title="Senior Staff Outbound Product Manager - Telecom",
+    )
+    assert reason_code is None, detail
+
+
 def test_evaluate_merged_job_rejects_icims_location_conflict_without_strong_remote_evidence(monkeypatch) -> None:
     settings = build_settings()
     monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))

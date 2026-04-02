@@ -7387,6 +7387,26 @@ def _job_has_geo_limited_remote_restriction(
     return _extract_geo_limited_remote_region(combined_text) is not None
 
 
+def _candidate_has_strong_structured_remote_hints(candidate: JobPosting) -> bool:
+    salary_values = _salary_values(candidate)
+    remote_hint_text = " ".join(
+        part
+        for part in (
+            candidate.location_text,
+            candidate.evidence_notes,
+            " ".join(candidate.validation_evidence[:4]),
+        )
+        if part
+    ).lower()
+    return (
+        candidate.is_fully_remote is True
+        and (candidate.source_quality_score or 0) >= 8
+        and bool(candidate.posted_date_text or candidate.posted_date_iso)
+        and bool(salary_values)
+        and "remote" in remote_hint_text
+    )
+
+
 def _snapshot_supports_expected_role(expected_role_title: str | None, snapshot: JobPageSnapshot) -> bool:
     expected = " ".join(str(expected_role_title or "").split())
     if not expected:
@@ -7436,9 +7456,11 @@ def _merge_candidate_with_snapshot(candidate: JobPosting, snapshot: JobPageSnaps
         remote_value = True
     if (
         snapshot.is_fully_remote is False
-        and candidate.is_fully_remote is True
-        and (candidate.source_quality_score or 0) >= 8
-        and _snapshot_has_strong_remote_evidence(snapshot)
+        and _candidate_has_strong_structured_remote_hints(candidate)
+        and (
+            _snapshot_has_strong_remote_evidence(snapshot)
+            or not _snapshot_location_is_specific_non_remote(snapshot.location_text)
+        )
         and not _snapshot_location_is_specific_non_remote(snapshot.location_text)
         and not _job_has_geo_limited_remote_restriction(candidate, snapshot)
         and not _snapshot_has_host_specific_remote_conflict(str(snapshot.resolved_url or candidate.direct_job_url), snapshot)
