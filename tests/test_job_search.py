@@ -1816,6 +1816,32 @@ def test_query_timeout_skip_reason_opens_company_focused_circuit_breaker() -> No
     assert "chartahealth" in skip_reason.lower()
 
 
+def test_query_timeout_skip_reason_skips_company_careers_variant_after_single_timeout() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Vercel" "AI Product Manager" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Vercel" careers "AI Product Manager" remote',
+        attempt_number=1,
+    )
+
+    assert skip_reason is not None
+    assert "careers query variant" in skip_reason.lower()
+    assert "vercel" in skip_reason.lower()
+
+
 def test_query_timeout_skip_reason_suppresses_late_pass_getro_and_voice_ai_queries() -> None:
     diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
 

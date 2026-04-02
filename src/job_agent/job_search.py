@@ -3223,6 +3223,7 @@ def _query_timeout_skip_reason(
         return family_cooldown_reason
     if normalized_query in _timed_out_queries(diagnostics):
         return "The same discovery query already timed out earlier in this run."
+    lowered_query = normalized_query.lower()
     company_marker = _company_focused_query_marker(normalized_query)
     if company_marker is not None:
         company_timeout_count = _company_focused_query_timeout_count(
@@ -3230,12 +3231,16 @@ def _query_timeout_skip_reason(
             attempt_number=attempt_number,
             marker=company_marker,
         )
+        if company_timeout_count >= 1 and " careers " in lowered_query:
+            return (
+                "The company careers query variant is being skipped for "
+                f"{company_marker} after an earlier timeout in this pass."
+            )
         if company_timeout_count >= COMPANY_FOCUSED_QUERY_TIMEOUT_SKIP_THRESHOLD:
             return (
                 "The company-specific timeout circuit breaker is open for "
                 f"{company_marker} after {company_timeout_count} timeouts in this pass."
             )
-    lowered_query = normalized_query.lower()
     if attempt_number >= 3 and "site:getro.com/companies" in lowered_query:
         return "Late-pass Getro company-board queries are being suppressed after repeated low-yield timeout behavior."
     if attempt_number >= 3 and '"voice ai"' in lowered_query:
