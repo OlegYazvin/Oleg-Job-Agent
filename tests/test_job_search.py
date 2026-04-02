@@ -2005,6 +2005,15 @@ def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -
 
     assert _should_refine_local_leads_with_ollama(
         settings,
+        query='"product manager" "AI" remote "company careers"',
+        candidate_pool_count=12,
+        average_confidence=0.92,
+        cleanup_signal_count=0,
+        low_trust_source_count=0,
+        trustworthy_direct_url_count=5,
+    )
+    assert _should_refine_local_leads_with_ollama(
+        settings,
         query="principal product manager AI",
         candidate_pool_count=12,
         average_confidence=0.93,

@@ -3899,6 +3899,15 @@ def _ollama_refinement_mode_for_local_leads(
         and average_confidence < 0.99
     ):
         return "startup_board_bundle"
+    if (
+        candidate_pool_count >= 10
+        and cleanup_signal_count == 0
+        and low_trust_source_count == 0
+        and trustworthy_direct_url_count >= 4
+        and average_confidence >= 0.9
+        and (_query_is_broad_generic(query) or "company careers" in query.lower())
+    ):
+        return "trusted_direct_bundle"
     if cleanup_signal_count >= 2 or low_trust_source_count >= 3:
         return "high_noise"
     if (
@@ -6148,6 +6157,9 @@ async def _search_single_query_local(
         cleanup_limit = (
             2
             if refinement_mode == "forced_sample"
+            else
+            3
+            if refinement_mode == "trusted_direct_bundle"
             else
             4
             if refinement_mode == "startup_board_bundle"
