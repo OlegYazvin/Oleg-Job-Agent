@@ -3098,6 +3098,8 @@ def _query_is_broad_generic(query: str) -> bool:
     lowered = query.lower()
     if _query_uses_structured_source_hint(query):
         return False
+    if "company careers" in lowered:
+        return True
     if any(token in lowered for token in ("series a", "series b", "seed stage", "portfolio company", "venture backed", "vertical ai", "early stage")):
         return False
     quoted_phrases = re.findall(r'"[^"]+"', query)

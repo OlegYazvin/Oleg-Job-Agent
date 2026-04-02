@@ -70,6 +70,7 @@ from job_agent.job_search import (
     _normalize_direct_job_url,
     _precheck_lead_hints,
     _query_family_key,
+    _query_is_broad_generic,
     _query_timeout_seconds_for_query,
     _query_timeout_skip_reason,
     _repair_direct_job_url,
@@ -2057,6 +2058,11 @@ def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -
         low_trust_source_count=1,
         trustworthy_direct_url_count=4,
     )
+
+
+def test_query_is_broad_generic_treats_company_careers_variant_as_broad() -> None:
+    assert _query_is_broad_generic('"product manager" "AI" remote "company careers"')
+    assert not _query_is_broad_generic('"senior product manager" "AI" remote "series a"')
 
 
 def test_should_force_ollama_refinement_sample_requires_actual_cleanup_signals() -> None:
