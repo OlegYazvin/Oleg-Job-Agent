@@ -405,6 +405,7 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
         recent_events = []
     available_models = _available_ollama_model_names(settings)
     update_reason: str | None = None
+    recovered_via_probe = False
     single_model_mode = settings.ollama_degraded_model == settings.ollama_model
 
     if single_model_mode and (
@@ -442,6 +443,8 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
             if success:
                 profile = candidate
                 update_reason = f"Recovered Ollama via readiness probe using {candidate.model}."
+                recovered_via_probe = True
+                recent_events = []
                 break
 
     request_event_count = len(recent_events)
