@@ -2071,6 +2071,15 @@ def test_should_force_ollama_refinement_sample_requires_actual_cleanup_signals()
         low_trust_source_count=0,
         trustworthy_direct_url_count=3,
     )
+    assert _should_force_ollama_refinement_sample(
+        settings,
+        sample_size=5,
+        average_confidence=0.92,
+        cleanup_signal_count=0,
+        low_trust_source_count=0,
+        trustworthy_direct_url_count=5,
+        query='"product manager" "AI" remote "company careers"',
+    )
 
 
 def test_should_accept_trusted_source_fallback_on_fetch_failure_for_strong_company_hosted_role(monkeypatch) -> None:

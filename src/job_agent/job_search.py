@@ -3863,11 +3863,19 @@ def _should_force_ollama_refinement_sample(
     cleanup_signal_count: int,
     low_trust_source_count: int,
     trustworthy_direct_url_count: int,
+    query: str | None = None,
 ) -> bool:
     if settings.llm_provider != "ollama" or sample_size < 2:
         return False
     if cleanup_signal_count <= 0:
-        return False
+        return (
+            query is not None
+            and sample_size >= 5
+            and low_trust_source_count == 0
+            and trustworthy_direct_url_count >= 5
+            and average_confidence >= 0.9
+            and "company careers" in query.lower()
+        )
     if cleanup_signal_count > 0 or low_trust_source_count > 0:
         return True
     if trustworthy_direct_url_count < sample_size:
@@ -6140,6 +6148,7 @@ async def _search_single_query_local(
         cleanup_signal_count=cleanup_signal_count,
         low_trust_source_count=low_trust_source_count,
         trustworthy_direct_url_count=trustworthy_direct_url_count,
+        query=query,
     )
 
     refinement_mode = _ollama_refinement_mode_for_local_leads(
