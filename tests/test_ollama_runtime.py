@@ -244,6 +244,13 @@ def test_auto_tune_ollama_settings_does_not_redegrade_immediately_after_successf
     assert profile.model == settings.ollama_degraded_model
     assert profile.degraded is False
     assert profile.degraded_reason is None
+    entries = [
+        json.loads(line)
+        for line in settings.output_dir.joinpath("ollama-events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    auto_tune_entries = [entry for entry in entries if entry["event"] == "auto_tune_update"]
+    assert auto_tune_entries
+    assert auto_tune_entries[-1]["degraded"] is False
 
 
 def test_auto_tune_ollama_settings_ignores_stale_failure_history(

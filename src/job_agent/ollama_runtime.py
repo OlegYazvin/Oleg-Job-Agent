@@ -447,6 +447,40 @@ def auto_tune_ollama_settings(settings: Settings, *, run_id: str | None = None) 
                 recent_events = []
                 break
 
+    if recovered_via_probe:
+        if update_reason:
+            record_ollama_event(
+                settings,
+                "auto_tune_update",
+                run_id=run_id,
+                model=profile.model,
+                num_ctx=profile.num_ctx,
+                num_batch=profile.num_batch,
+                num_predict=profile.num_predict,
+                keep_alive=profile.keep_alive,
+                degraded=profile.degraded,
+                degraded_reason=profile.degraded_reason,
+                reason=update_reason,
+            )
+        profile = profile.model_copy(
+            update={
+                "last_updated_at": datetime.now(UTC),
+                "based_on_event_count": len(_read_ollama_events(settings)),
+            }
+        )
+        save_ollama_tuning_profile(settings, profile)
+        tuned_settings = replace(
+            settings,
+            ollama_model=profile.model,
+            ollama_keep_alive=profile.keep_alive,
+            ollama_num_ctx=profile.num_ctx,
+            ollama_num_batch=profile.num_batch,
+            ollama_num_predict=profile.num_predict,
+            ollama_degraded_for_run=profile.degraded,
+            ollama_degraded_reason=profile.degraded_reason,
+        )
+        return tuned_settings, profile
+
     request_event_count = len(recent_events)
     if request_event_count:
         failure_count = sum(1 for entry in recent_events if entry.get("event") in {"request_failure", "request_outer_timeout"})
