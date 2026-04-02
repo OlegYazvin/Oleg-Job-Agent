@@ -3910,6 +3910,25 @@ def _is_trusted_company_careers_bundle(
     )
 
 
+def _is_clean_high_confidence_direct_bundle(
+    *,
+    candidate_pool_count: int,
+    average_confidence: float,
+    cleanup_signal_count: int,
+    low_trust_source_count: int,
+    trustworthy_direct_url_count: int,
+    min_candidate_pool_count: int = 10,
+    min_trustworthy_direct_url_count: int = 5,
+) -> bool:
+    return (
+        candidate_pool_count >= min_candidate_pool_count
+        and cleanup_signal_count == 0
+        and low_trust_source_count == 0
+        and trustworthy_direct_url_count >= min_trustworthy_direct_url_count
+        and average_confidence >= 0.9
+    )
+
+
 def _ollama_refinement_mode_for_local_leads(
     settings: Settings,
     *,
@@ -6198,8 +6217,7 @@ async def _search_single_query_local(
     )
     if (
         settings.llm_provider == "ollama"
-        and _is_trusted_company_careers_bundle(
-            query=query,
+        and _is_clean_high_confidence_direct_bundle(
             candidate_pool_count=len(candidate_pool),
             average_confidence=average_confidence,
             cleanup_signal_count=cleanup_signal_count,
