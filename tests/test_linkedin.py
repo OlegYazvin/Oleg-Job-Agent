@@ -1,11 +1,13 @@
 import json
 import sqlite3
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 from job_agent.linkedin import (
     LinkedInClient,
+    LinkedInDiscovery,
     _company_matches,
     _default_firefox_profile_dir,
     _load_firefox_linkedin_cookies,
@@ -53,6 +55,60 @@ def test_manual_review_links_are_company_focused_and_include_degrees() -> None:
     assert any("network=%5B%22F%22%5D" in link.url for link in links)
     assert any("network=%5B%22S%22%5D" in link.url for link in links)
     assert any("Acme%20AI" in link.url for link in links)
+
+
+def test_discover_company_contacts_falls_back_to_direct_browser_when_extension_capture_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    storage_state_path = tmp_path / "linkedin-state.json"
+    storage_state_path.write_text("{}", encoding="utf-8")
+    client = LinkedInClient(
+        SimpleNamespace(
+            linkedin_capture_mode="firefox_extension",
+            linkedin_storage_state=storage_state_path,
+            linkedin_email=None,
+            linkedin_password=None,
+            google_email=None,
+            google_password=None,
+            linkedin_li_at=None,
+            linkedin_jsessionid=None,
+        )
+    )
+    expected = LinkedInDiscovery(first_order_contacts=[], second_order_contacts=[])
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_extension(extension_bridge, company_name: str, *, role_title: str | None = None):
+        calls.append(("extension", extension_bridge, company_name, role_title))
+        raise RuntimeError("extension unavailable")
+
+    async def fake_in_context(context, company_name: str, *, role_title: str | None = None):
+        calls.append(("browser", context, company_name, role_title))
+        return expected
+
+    @asynccontextmanager
+    async def fake_context(*, headless=None):
+        calls.append(("context", headless))
+        yield "browser-context"
+
+    monkeypatch.setattr(client, "_discover_company_contacts_via_extension", fake_extension)
+    monkeypatch.setattr(client, "_discover_company_contacts_in_context", fake_in_context)
+    monkeypatch.setattr(client, "context", fake_context)
+
+    discovery = asyncio.run(
+        client.discover_company_contacts(
+            "Acme AI",
+            role_title="Senior Product Manager, AI",
+            extension_bridge="bridge",
+        )
+    )
+
+    assert discovery is expected
+    assert calls == [
+        ("extension", "bridge", "Acme AI", "Senior Product Manager, AI"),
+        ("context", None),
+        ("browser", "browser-context", "Acme AI", "Senior Product Manager, AI"),
+    ]
 
 
 def test_default_firefox_profile_dir_prefers_install_default(tmp_path: Path) -> None:

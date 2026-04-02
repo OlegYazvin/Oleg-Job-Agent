@@ -109,11 +109,26 @@ class LinkedInClient:
         if self.settings.linkedin_capture_mode == "firefox_extension":
             if extension_bridge is None:
                 raise RuntimeError("Firefox extension capture mode requires an active LinkedInExtensionBridge.")
-            return await self._discover_company_contacts_via_extension(
-                extension_bridge,
-                company_name,
-                role_title=role_title,
-            )
+            try:
+                return await self._discover_company_contacts_via_extension(
+                    extension_bridge,
+                    company_name,
+                    role_title=role_title,
+                )
+            except Exception:
+                if not self._can_fallback_to_direct_browser_capture():
+                    raise
+                async with self.context() as owned_context:
+                    try:
+                        return await self._discover_company_contacts_in_context(
+                            owned_context,
+                            company_name,
+                            role_title=role_title,
+                        )
+                    except Exception as fallback_exc:
+                        raise RuntimeError(
+                            "LinkedIn extension capture failed, and the direct-browser fallback also failed."
+                        ) from fallback_exc
         if context is None:
             async with self.context() as owned_context:
                 return await self._discover_company_contacts_in_context(
@@ -125,6 +140,23 @@ class LinkedInClient:
             context,
             company_name,
             role_title=role_title,
+        )
+
+    def _can_fallback_to_direct_browser_capture(self) -> bool:
+        storage_state_path = getattr(self.settings, "linkedin_storage_state", None)
+        storage_state_available = isinstance(storage_state_path, Path) and storage_state_path.exists()
+        return bool(
+            storage_state_available
+            or (
+                getattr(self.settings, "linkedin_email", None)
+                and getattr(self.settings, "linkedin_password", None)
+            )
+            or (
+                getattr(self.settings, "google_email", None)
+                and getattr(self.settings, "google_password", None)
+            )
+            or getattr(self.settings, "linkedin_li_at", None)
+            or getattr(self.settings, "linkedin_jsessionid", None)
         )
 
     async def _discover_company_contacts_via_extension(
