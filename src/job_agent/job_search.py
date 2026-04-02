@@ -3903,9 +3903,19 @@ def _ollama_refinement_mode_for_local_leads(
         candidate_pool_count >= 10
         and cleanup_signal_count == 0
         and low_trust_source_count == 0
-        and trustworthy_direct_url_count >= 4
-        and average_confidence >= 0.9
-        and (_query_is_broad_generic(query) or "company careers" in query.lower())
+        and (
+            (
+                trustworthy_direct_url_count >= 4
+                and average_confidence >= 0.9
+                and (_query_is_broad_generic(query) or "company careers" in query.lower())
+            )
+            or (
+                trustworthy_direct_url_count >= 5
+                and average_confidence >= 0.86
+                and _query_targets_startup_ecosystem(query)
+                and _query_uses_structured_source_hint(query)
+            )
+        )
     ):
         return "trusted_direct_bundle"
     if cleanup_signal_count >= 2 or low_trust_source_count >= 3:
