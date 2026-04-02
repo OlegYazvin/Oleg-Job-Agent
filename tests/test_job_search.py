@@ -1794,14 +1794,6 @@ def test_query_timeout_skip_reason_opens_company_focused_circuit_breaker() -> No
                 attempt_number=1,
                 round_number=1,
             ),
-            SearchFailure(
-                stage="discovery",
-                reason_code="query_timeout",
-                detail="timed out",
-                source_query='"Chartahealth" "Senior Product Manager, AI" remote',
-                attempt_number=1,
-                round_number=1,
-            ),
         ],
     )
 
