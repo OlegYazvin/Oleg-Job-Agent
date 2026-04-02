@@ -3871,16 +3871,41 @@ def _should_force_ollama_refinement_sample(
         return (
             query is not None
             and sample_size >= 5
-            and low_trust_source_count == 0
-            and trustworthy_direct_url_count >= 5
-            and average_confidence >= 0.9
-            and "company careers" in query.lower()
+            and _is_trusted_company_careers_bundle(
+                query=query,
+                candidate_pool_count=sample_size,
+                average_confidence=average_confidence,
+                cleanup_signal_count=cleanup_signal_count,
+                low_trust_source_count=low_trust_source_count,
+                trustworthy_direct_url_count=trustworthy_direct_url_count,
+                min_candidate_pool_count=5,
+            )
         )
     if cleanup_signal_count > 0 or low_trust_source_count > 0:
         return True
     if trustworthy_direct_url_count < sample_size:
         return True
     return average_confidence < min(settings.local_confidence_threshold + 0.1, 0.9)
+
+
+def _is_trusted_company_careers_bundle(
+    *,
+    query: str,
+    candidate_pool_count: int,
+    average_confidence: float,
+    cleanup_signal_count: int,
+    low_trust_source_count: int,
+    trustworthy_direct_url_count: int,
+    min_candidate_pool_count: int = 10,
+) -> bool:
+    return (
+        candidate_pool_count >= min_candidate_pool_count
+        and cleanup_signal_count == 0
+        and low_trust_source_count == 0
+        and trustworthy_direct_url_count >= 5
+        and average_confidence >= 0.9
+        and "company careers" in query.lower()
+    )
 
 
 def _ollama_refinement_mode_for_local_leads(
@@ -3915,7 +3940,18 @@ def _ollama_refinement_mode_for_local_leads(
             (
                 trustworthy_direct_url_count >= 4
                 and average_confidence >= 0.9
-                and (_query_is_broad_generic(query) or "company careers" in query.lower())
+                and (
+                    _query_is_broad_generic(query)
+                    or _is_trusted_company_careers_bundle(
+                        query=query,
+                        candidate_pool_count=candidate_pool_count,
+                        average_confidence=average_confidence,
+                        cleanup_signal_count=cleanup_signal_count,
+                        low_trust_source_count=low_trust_source_count,
+                        trustworthy_direct_url_count=trustworthy_direct_url_count,
+                        min_candidate_pool_count=10,
+                    )
+                )
             )
             or (
                 trustworthy_direct_url_count >= 5
@@ -6163,12 +6199,14 @@ async def _search_single_query_local(
     if (
         refinement_mode is None
         and settings.llm_provider == "ollama"
-        and len(candidate_pool) >= 10
-        and cleanup_signal_count == 0
-        and low_trust_source_count == 0
-        and trustworthy_direct_url_count >= 5
-        and average_confidence >= 0.9
-        and "company careers" in query.lower()
+        and _is_trusted_company_careers_bundle(
+            query=query,
+            candidate_pool_count=len(candidate_pool),
+            average_confidence=average_confidence,
+            cleanup_signal_count=cleanup_signal_count,
+            low_trust_source_count=low_trust_source_count,
+            trustworthy_direct_url_count=trustworthy_direct_url_count,
+        )
     ):
         refinement_mode = "trusted_direct_bundle"
     if (
@@ -6212,21 +6250,46 @@ async def _search_single_query_local(
         normalized_confidences = [_lead_confidence(lead) for lead in normalized]
         average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
     elif settings.llm_provider == "ollama" and run_id is not None:
-        record_ollama_event(
-            settings,
-            "lead_refinement_skip",
-            run_id=run_id,
-            caller="lead_refinement",
-            prompt_category="lead_cleanup",
+        if _is_trusted_company_careers_bundle(
             query=query,
-            refinement_mode="skipped",
             candidate_pool_count=len(candidate_pool),
-            normalized_lead_count=len(normalized),
-            average_confidence=round(average_confidence, 3),
+            average_confidence=average_confidence,
             cleanup_signal_count=cleanup_signal_count,
             low_trust_source_count=low_trust_source_count,
             trustworthy_direct_url_count=trustworthy_direct_url_count,
-        )
+        ):
+            refined_pool = await _refine_local_leads_with_ollama(
+                settings,
+                query,
+                candidate_pool,
+                cleanup_limit=3,
+                refinement_mode="trusted_direct_bundle",
+                pre_refinement_average_confidence=average_confidence,
+                pre_refinement_cleanup_signal_count=cleanup_signal_count,
+                pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
+                run_id=run_id,
+            )
+            normalized = _deterministic_trim_local_leads(settings, query, refined_pool)
+            normalized_confidences = [_lead_confidence(lead) for lead in normalized]
+            average_confidence = (
+                (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
+            )
+        else:
+            record_ollama_event(
+                settings,
+                "lead_refinement_skip",
+                run_id=run_id,
+                caller="lead_refinement",
+                prompt_category="lead_cleanup",
+                query=query,
+                refinement_mode="skipped",
+                candidate_pool_count=len(candidate_pool),
+                normalized_lead_count=len(normalized),
+                average_confidence=round(average_confidence, 3),
+                cleanup_signal_count=cleanup_signal_count,
+                low_trust_source_count=low_trust_source_count,
+                trustworthy_direct_url_count=trustworthy_direct_url_count,
+            )
     await asyncio.sleep(0.5)
     return normalized, average_confidence
 
