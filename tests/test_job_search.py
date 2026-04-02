@@ -1049,6 +1049,58 @@ def test_merge_candidate_with_snapshot_keeps_host_specific_non_remote_signal(mon
     assert merged.is_fully_remote is False
 
 
+def test_merge_candidate_with_snapshot_keeps_high_quality_remote_candidate_when_snapshot_text_is_strongly_remote(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    candidate = JobPosting(
+        company_name="Vercel",
+        role_title="Product Manager - Agent Platform",
+        direct_job_url="https://job-boards.greenhouse.io/vercel/jobs/5808590004",
+        resolved_job_url="https://job-boards.greenhouse.io/vercel/jobs/5808590004",
+        ats_platform="Greenhouse",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-03-28",
+        posted_date_iso="2026-03-28",
+        base_salary_min_usd=196000,
+        base_salary_max_usd=294000,
+        salary_text="$196,000-$294,000",
+        evidence_notes="Built In marked the role as remote. Own the roadmap for AI agents and LLM platform experiences.",
+        validation_evidence=[],
+        source_quality_score=18,
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=candidate.direct_job_url,
+        resolved_url=candidate.direct_job_url,
+        ats_platform="Greenhouse",
+        status_code=200,
+        company_name="Vercel",
+        role_title="Product Manager - Agent Platform",
+        page_title="Product Manager - Agent Platform at Vercel",
+        location_text="Remote - United States",
+        is_fully_remote=False,
+        posted_date_text="2026-03-28",
+        posted_date_iso="2026-03-28",
+        base_salary_min_usd=196000,
+        base_salary_max_usd=294000,
+        salary_text="$196,000-$294,000",
+        text_excerpt="Product Manager - Agent Platform. Remote - United States. Work from anywhere across the U.S. Own the roadmap for AI agents and LLM platform experiences.",
+        evidence_snippets=["Remote - United States", "Work from anywhere across the U.S.", "AI agents and LLM platform experiences."],
+    )
+
+    merged = _merge_candidate_with_snapshot(candidate, snapshot)
+
+    assert merged.is_fully_remote is True
+    reason_code, detail = _evaluate_merged_job(
+        merged,
+        snapshot,
+        settings,
+        expected_company_name="Vercel",
+        expected_role_title="Product Manager - Agent Platform",
+    )
+    assert reason_code is None, detail
+
+
 def test_evaluate_merged_job_rejects_icims_location_conflict_without_strong_remote_evidence(monkeypatch) -> None:
     settings = build_settings()
     monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))

@@ -7434,6 +7434,16 @@ def _merge_candidate_with_snapshot(candidate: JobPosting, snapshot: JobPageSnaps
         and not _snapshot_has_host_specific_remote_conflict(str(snapshot.resolved_url or candidate.direct_job_url), snapshot)
     ):
         remote_value = True
+    if (
+        snapshot.is_fully_remote is False
+        and candidate.is_fully_remote is True
+        and (candidate.source_quality_score or 0) >= 8
+        and _snapshot_has_strong_remote_evidence(snapshot)
+        and not _snapshot_location_is_specific_non_remote(snapshot.location_text)
+        and not _job_has_geo_limited_remote_restriction(candidate, snapshot)
+        and not _snapshot_has_host_specific_remote_conflict(str(snapshot.resolved_url or candidate.direct_job_url), snapshot)
+    ):
+        remote_value = True
 
     merged = candidate.model_copy(
         update={
