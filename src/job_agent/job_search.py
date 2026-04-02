@@ -6177,6 +6177,33 @@ async def _search_single_query_local(
         for lead in cleanup_window
         if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
     )
+    if (
+        settings.llm_provider == "ollama"
+        and _is_trusted_company_careers_bundle(
+            query=query,
+            candidate_pool_count=len(candidate_pool),
+            average_confidence=average_confidence,
+            cleanup_signal_count=cleanup_signal_count,
+            low_trust_source_count=low_trust_source_count,
+            trustworthy_direct_url_count=trustworthy_direct_url_count,
+        )
+    ):
+        refined_pool = await _refine_local_leads_with_ollama(
+            settings,
+            query,
+            candidate_pool,
+            cleanup_limit=3,
+            refinement_mode="trusted_direct_bundle",
+            pre_refinement_average_confidence=average_confidence,
+            pre_refinement_cleanup_signal_count=cleanup_signal_count,
+            pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
+            run_id=run_id,
+        )
+        normalized = _deterministic_trim_local_leads(settings, query, refined_pool)
+        normalized_confidences = [_lead_confidence(lead) for lead in normalized]
+        average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
+        await asyncio.sleep(0.5)
+        return normalized, average_confidence
     should_force_sample = _should_force_ollama_refinement_sample(
         settings,
         sample_size=len(cleanup_window),

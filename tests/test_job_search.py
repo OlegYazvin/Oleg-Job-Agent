@@ -3429,7 +3429,7 @@ def test_search_single_query_local_skips_forced_ollama_sample_for_clean_direct_a
     assert forced_calls == []
 
 
-def test_search_single_query_local_uses_company_careers_trusted_bundle_fallback(monkeypatch) -> None:
+def test_search_single_query_local_uses_company_careers_trusted_bundle_early_refinement(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
     lead_map: dict[str, JobLead] = {}
@@ -3481,6 +3481,10 @@ def test_search_single_query_local_uses_company_careers_trusted_bundle_fallback(
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
     monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "job_agent.job_search._should_force_ollama_refinement_sample",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("early refinement should bypass force-sample gating")),
+    )
     monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
     monkeypatch.setattr("job_agent.job_search.record_ollama_event", lambda *args, **kwargs: None)
 
