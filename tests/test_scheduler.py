@@ -48,7 +48,7 @@ def test_render_cron_line_contains_marker_and_hour() -> None:
     )
     line = render_cron_line(settings)
     assert line.startswith("15 8 ")
-    assert "job-agent run" in line
+    assert "PYTHONPATH=src .venv/bin/python -m job_agent.cli run" in line
 
 
 def test_render_cron_line_uses_configured_ollama_command() -> None:

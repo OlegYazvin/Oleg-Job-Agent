@@ -32,7 +32,7 @@ def render_cron_line(settings: Settings) -> str:
         )
     command = (
         f"cd {project_root} && {export_path} && . .venv/bin/activate && "
-        f"{ollama_preamble}job-agent run >> output/cron.log 2>&1"
+        f"{ollama_preamble}PYTHONPATH=src .venv/bin/python -m job_agent.cli run >> output/cron.log 2>&1"
     )
     return f"{settings.daily_run_minute} {settings.daily_run_hour} * * * {command} {CRON_MARKER}"
 

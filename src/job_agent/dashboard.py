@@ -311,6 +311,9 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
             return
         env = os.environ.copy()
         env["ENABLE_PROGRESS_GUI"] = "false"
+        source_path = str(settings.project_root / "src")
+        existing_pythonpath = env.get("PYTHONPATH", "").strip()
+        env["PYTHONPATH"] = source_path if not existing_pythonpath else f"{source_path}{os.pathsep}{existing_pythonpath}"
         subprocess.Popen(
             [sys.executable, "-m", "job_agent.cli", "run", "--no-gui"],
             cwd=str(settings.project_root),

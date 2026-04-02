@@ -11,4 +11,4 @@ fi
 
 # shellcheck disable=SC1091
 source .venv/bin/activate
-exec job-agent run
+exec env PYTHONPATH=src .venv/bin/python -m job_agent.cli run
