@@ -6154,6 +6154,17 @@ async def _search_single_query_local(
     if (
         refinement_mode is None
         and settings.llm_provider == "ollama"
+        and len(candidate_pool) >= 10
+        and cleanup_signal_count == 0
+        and low_trust_source_count == 0
+        and trustworthy_direct_url_count >= 5
+        and average_confidence >= 0.9
+        and "company careers" in query.lower()
+    ):
+        refinement_mode = "trusted_direct_bundle"
+    if (
+        refinement_mode is None
+        and settings.llm_provider == "ollama"
         and run_id is not None
         and attempt_number is not None
         and len(candidate_pool) >= 2

@@ -3420,6 +3420,73 @@ def test_search_single_query_local_skips_forced_ollama_sample_for_clean_direct_a
     assert forced_calls == []
 
 
+def test_search_single_query_local_uses_company_careers_trusted_bundle_fallback(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_map: dict[str, JobLead] = {}
+    search_results: list[tuple[str, str, str]] = []
+    for index in range(10):
+        url = f"https://jobs.lever.co/acme/{index}"
+        lead = JobLead(
+            company_name=f"Acme AI {index}",
+            role_title="Senior Product Manager, AI",
+            source_url=url,
+            source_type="direct_ats",
+            direct_job_url=url,
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=220000 + index,
+            evidence_notes="Direct ATS role.",
+        )
+        lead_map[url] = lead
+        search_results.append((url, f"Acme AI {index} - Senior Product Manager, AI", ""))
+
+    refine_calls: list[tuple[int, str | None]] = []
+
+    async def fake_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_local_search(_query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+        return search_results
+
+    async def fake_refine(
+        _settings: Settings,
+        _query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        refine_calls.append((cleanup_limit, refinement_mode))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
+    monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
+    monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
+    monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    monkeypatch.setattr("job_agent.job_search.record_ollama_event", lambda *args, **kwargs: None)
+
+    asyncio.run(
+        _search_single_query_local(
+            settings,
+            '"product manager" "AI" remote "company careers"',
+            attempt_number=1,
+            run_id="run-1",
+        )
+    )
+
+    assert refine_calls == [(3, "trusted_direct_bundle")]
+
+
 def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
