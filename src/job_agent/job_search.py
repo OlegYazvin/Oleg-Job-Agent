@@ -6373,6 +6373,41 @@ async def _search_single_query(
             attempt_number=attempt_number,
             run_id=run_id,
         )
+        if local_leads and not any(lead.refined_by_ollama for lead in local_leads):
+            local_confidences = [_lead_confidence(lead) for lead in local_leads]
+            local_average_confidence = (
+                (sum(local_confidences) / len(local_confidences)) if local_confidences else 0.0
+            )
+            cleanup_window = local_leads[:5]
+            local_cleanup_signal_count = sum(1 for lead in cleanup_window if _lead_needs_local_cleanup(lead))
+            local_low_trust_source_count = sum(
+                1 for lead in cleanup_window if lead.source_type in {"linkedin", "builtin", "other"}
+            )
+            local_trustworthy_direct_url_count = sum(
+                1
+                for lead in cleanup_window
+                if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
+            )
+            if _is_clean_high_confidence_direct_bundle(
+                candidate_pool_count=len(local_leads),
+                average_confidence=local_average_confidence,
+                cleanup_signal_count=local_cleanup_signal_count,
+                low_trust_source_count=local_low_trust_source_count,
+                trustworthy_direct_url_count=local_trustworthy_direct_url_count,
+            ):
+                local_leads = await _refine_local_leads_with_ollama(
+                    settings,
+                    query,
+                    local_leads,
+                    cleanup_limit=3,
+                    refinement_mode="trusted_direct_bundle",
+                    pre_refinement_average_confidence=local_average_confidence,
+                    pre_refinement_cleanup_signal_count=local_cleanup_signal_count,
+                    pre_refinement_trustworthy_direct_url_count=local_trustworthy_direct_url_count,
+                    run_id=run_id,
+                )
+                local_confidences = [_lead_confidence(lead) for lead in local_leads]
+                confidence = (sum(local_confidences) / len(local_confidences)) if local_confidences else 0.0
         should_fallback = (
             settings.use_openai_fallback
             and agent is not None

@@ -78,6 +78,7 @@ from job_agent.job_search import (
     _resolve_greenhouse_board_job_url_from_lead,
     _resolve_lead_via_company_careers_pages,
     _salary_is_base_salary,
+    _search_single_query,
     _search_single_query_local,
     _seed_lead_from_failure,
     _select_watchlist_focus_companies,
@@ -3574,6 +3575,67 @@ def test_search_single_query_local_uses_generic_clean_direct_bundle_early_refine
         )
     )
 
+    assert refine_calls == [(3, "trusted_direct_bundle")]
+
+
+def test_search_single_query_applies_post_local_trusted_bundle_refinement(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    settings.use_openai_fallback = False
+    local_leads = [
+        JobLead(
+            company_name=f"Acme AI {index}",
+            role_title="Senior Product Manager, AI",
+            source_url=f"https://jobs.lever.co/acme/{index}",
+            source_type="direct_ats",
+            direct_job_url=f"https://jobs.lever.co/acme/{index}",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=220000 + index,
+            evidence_notes="Direct ATS role.",
+        )
+        for index in range(10)
+    ]
+    refine_calls: list[tuple[int, str | None]] = []
+
+    async def fake_local_search(
+        _settings: Settings,
+        _query: str,
+        *,
+        attempt_number: int | None = None,
+        run_id: str | None = None,
+    ) -> tuple[list[JobLead], float]:
+        return local_leads, 0.92
+
+    async def fake_refine(
+        _settings: Settings,
+        _query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        refine_calls.append((cleanup_limit, refinement_mode))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._search_single_query_local", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+
+    result = asyncio.run(
+        _search_single_query(
+            None,
+            settings,
+            '"product manager" "AI" remote "company careers"',
+            attempt_number=1,
+            run_id="run-1",
+        )
+    )
+
+    assert result == local_leads
     assert refine_calls == [(3, "trusted_direct_bundle")]
 
 
