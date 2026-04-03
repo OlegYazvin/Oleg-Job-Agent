@@ -5488,6 +5488,12 @@ async def _replay_seed_leads(
         min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
         limit=seed_replay_cap,
     )
+    if 0 < len(fresh_seed_leads) < len(replay_seed_leads):
+        fresh_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
+            settings,
+            fresh_seed_leads,
+            run_id=run_id,
+        )
     diagnostics.seed_replayed_lead_count = len(fresh_seed_leads)
     if status:
         status.emit(
