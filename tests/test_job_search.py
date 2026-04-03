@@ -2086,6 +2086,14 @@ def test_replay_seed_leads_routes_previously_validated_job_into_reacquired_lane(
     assert reacquired_job.last_reported_at == "2026-03-25T10:00:00+00:00"
     assert reacquired_job.report_count == 3
     assert diagnostics.reacquisition_attempt_count == 1
+    entries = load_company_discovery_entries(settings.data_dir)
+    assert any(
+        entry["company_name"] == "Acme AI"
+        and "greenhouse:acme" in entry["board_identifiers"]
+        and entry["official_board_lead_count"] >= 1
+        and entry["ai_pm_candidate_count"] >= 1
+        for entry in entries.values()
+    )
 
 
 def test_replay_seed_leads_runs_seed_refinement_before_failed_history_suppression(monkeypatch, tmp_path: Path) -> None:

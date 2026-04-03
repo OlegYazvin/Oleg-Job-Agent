@@ -5074,6 +5074,32 @@ def _upsert_company_discovery_from_lead(
     )
 
 
+def _upsert_company_discovery_from_validated_job(
+    entries: dict[str, dict[str, object]],
+    job: JobPosting,
+    *,
+    run_id: str | None,
+) -> tuple[bool, int]:
+    job_url = str(job.resolved_job_url or job.direct_job_url or "").strip()
+    if not job_url:
+        return False, 0
+    board_identifier = _extract_company_board_identifier(job_url)
+    board_urls = [job_url] if board_identifier else []
+    return upsert_company_discovery_entry(
+        entries,
+        company_name=job.company_name,
+        source_url=job_url,
+        careers_root=infer_careers_root(job_url),
+        board_urls=board_urls,
+        board_identifiers=[board_identifier] if board_identifier else [],
+        ats_types=[value for value in (board_url_ats_type(job_url), job.ats_platform) if value],
+        source_trust=10 if board_identifier else 8,
+        run_id=run_id,
+        ai_pm_candidate_delta=1 if _is_ai_related_product_manager(job) else 0,
+        official_board_lead_delta=1 if board_identifier else 0,
+    )
+
+
 async def _fetch_page_html(url: str) -> str | None:
     try:
         async with httpx.AsyncClient(
@@ -5979,10 +6005,13 @@ async def _replay_seed_leads(
     status: StatusReporter | None,
     run_id: str | None = None,
     track_as_seed_replay: bool = True,
+    company_discovery_entries: dict[str, dict[str, object]] | None = None,
     status_label: str | None = None,
 ) -> tuple[int, int]:
     if not seed_leads:
         return total_unique_leads, resolved_leads_this_attempt
+    if settings.company_discovery_enabled and company_discovery_entries is None:
+        company_discovery_entries = load_company_discovery_entries(settings.data_dir)
 
     replay_seed_leads = _dedupe_round_leads(seed_leads, settings)
     replay_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
@@ -6297,6 +6326,13 @@ async def _replay_seed_leads(
             reacquired_jobs_by_url.setdefault(validated_key, validated)
         else:
             jobs_by_url.setdefault(validated_key, validated)
+        if settings.company_discovery_enabled and company_discovery_entries is not None:
+            _upsert_company_discovery_from_validated_job(
+                company_discovery_entries,
+                validated,
+                run_id=run_id,
+            )
+            save_company_discovery_entries(settings.data_dir, company_discovery_entries)
         diagnostics.unique_leads_discovered = total_unique_leads
         _persist_search_diagnostics(settings, diagnostics)
         _persist_validated_jobs_checkpoint(
@@ -8919,6 +8955,7 @@ async def find_matching_jobs(
                         status=status,
                         run_id=run_id,
                         track_as_seed_replay=False,
+                        company_discovery_entries=company_discovery_entries,
                         status_label=(
                             f"Pass {attempt_number}, company discovery surfaced "
                             f"{len(company_discovery_seed_leads)} official ATS candidates."
@@ -8950,6 +8987,7 @@ async def find_matching_jobs(
                 attempt_number=attempt_number,
                 status=status,
                 run_id=run_id,
+                company_discovery_entries=company_discovery_entries,
             )
             if len(jobs_by_url) >= stop_goal:
                 diagnostics.unique_leads_discovered = total_unique_leads
@@ -9570,6 +9608,13 @@ async def find_matching_jobs(
                         count_execution=False,
                         validated_jobs=1,
                     )
+                if settings.company_discovery_enabled:
+                    _upsert_company_discovery_from_validated_job(
+                        company_discovery_entries,
+                        validated,
+                        run_id=run_id,
+                    )
+                    save_company_discovery_entries(settings.data_dir, company_discovery_entries)
                 diagnostics.unique_leads_discovered = total_unique_leads
                 _persist_search_diagnostics(settings, diagnostics)
                 _persist_validated_jobs_checkpoint(
