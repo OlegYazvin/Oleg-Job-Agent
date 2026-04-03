@@ -7746,6 +7746,26 @@ def _salary_is_base_salary(job: JobPosting, snapshot: JobPageSnapshot) -> bool:
     return True
 
 
+def _should_accept_company_hosted_missing_posted_date(
+    job: JobPosting,
+    settings: Settings,
+    *,
+    expected_company_name: str | None = None,
+) -> bool:
+    job_url = str(job.resolved_job_url or job.direct_job_url or "")
+    host = (urlparse(job_url).netloc or "").lower()
+    return (
+        bool(job_url)
+        and not any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS)
+        and _looks_like_company_job_page(job_url)
+        and _url_has_strong_expected_company_hint(job_url, expected_company_name or job.company_name)
+        and (job.source_quality_score or 0) >= 4
+        and job.is_fully_remote is True
+        and _salary_meets_minimum(job, settings)
+        and _is_ai_related_product_manager(job)
+    )
+
+
 def _evaluate_merged_job(
     job: JobPosting,
     snapshot: JobPageSnapshot,
@@ -7809,6 +7829,12 @@ def _evaluate_merged_job(
         return "remote_unclear", "Remote evidence was ambiguous rather than clearly fully remote."
 
     if not job.posted_date_iso and not job.posted_date_text:
+        if _should_accept_company_hosted_missing_posted_date(
+            job,
+            settings,
+            expected_company_name=expected_company_name,
+        ):
+            return None, None
         return "missing_posted_date", "No posted date was available from the direct page or trusted hints."
 
     if not _is_recent_enough(
