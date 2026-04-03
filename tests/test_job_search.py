@@ -26,6 +26,7 @@ from job_agent.job_search import (
     _build_query_rounds,
     _build_search_query_bank,
     _chunk_queries,
+    _candidate_direct_job_url_is_trustworthy,
     _company_names_match,
     _company_hint_from_url,
     _collect_replay_seed_leads,
@@ -243,6 +244,7 @@ def test_company_hint_from_workday_url_uses_company_slug_or_host() -> None:
 def test_company_hint_from_company_hosted_jobs_subdomain_uses_host_company_name() -> None:
     assert _company_hint_from_url("https://jobs.dominos.com/us/jobs/supply-chain") == "Dominos"
     assert _company_hint_from_url("https://careers.caterpillar.com/en/jobs/123") == "Caterpillar"
+    assert _company_hint_from_url("https://ats.rippling.com/vendr/jobs/8f3edee4-bf55-44cf-a467-ea36dcc23605") == "Vendr"
 
 
 def test_strong_expected_company_hint_rejects_company_hosted_mismatch() -> None:
@@ -308,6 +310,7 @@ def test_generic_job_url_detection_catches_board_indexes() -> None:
     assert not _looks_like_generic_job_url("https://boards.greenhouse.io/acme/jobs/123")
     assert not _looks_like_generic_job_url("https://jobs.lever.co/acme/12345678-1111-2222-3333-123456789abc")
     assert not _looks_like_generic_job_url("https://jobs.ashbyhq.com/acme/12345678-1111-2222-3333-123456789abc")
+    assert not _looks_like_generic_job_url("https://ats.rippling.com/vendr/jobs/8f3edee4-bf55-44cf-a467-ea36dcc23605")
     assert not _looks_like_generic_job_url("https://jobs.smartrecruiters.com/Acme/744000123456789-principal-product-manager-ai")
     assert _looks_like_generic_job_url("https://job-boards.greenhouse.io/acme?error=true")
 
@@ -1318,6 +1321,24 @@ def test_seed_lead_from_failure_parses_salary_text_into_numeric_hints() -> None:
     assert lead is not None
     assert lead.base_salary_min_usd_hint == 176720
     assert lead.base_salary_max_usd_hint == 265080
+
+
+def test_rippling_direct_job_url_is_trustworthy() -> None:
+    url = "https://ats.rippling.com/vendr/jobs/8f3edee4-bf55-44cf-a467-ea36dcc23605"
+    lead = JobLead(
+        company_name="Vendr",
+        role_title="Sr. Product Manager - AI Negotiation Platform",
+        source_url=url,
+        source_type="company_site",
+        direct_job_url=url,
+        is_remote_hint=True,
+        posted_date_hint="2026-03-18",
+        salary_text_hint="$145,000 to $220,000",
+        evidence_notes="Direct Rippling ATS role.",
+    )
+
+    assert _is_allowed_direct_job_url(url)
+    assert _candidate_direct_job_url_is_trustworthy(url, lead)
 
 
 def test_build_candidate_job_hydrates_numeric_salary_from_hint() -> None:

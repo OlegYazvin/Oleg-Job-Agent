@@ -64,6 +64,7 @@ ALLOWED_JOB_HOST_FRAGMENTS = (
     "paylocity.com",
     "ultipro.com",
     "portal.dynamicsats.com",
+    "ats.rippling.com",
 )
 
 BLOCKED_JOB_HOST_FRAGMENTS = (
@@ -1060,6 +1061,9 @@ def _looks_like_direct_ats_job_path(host: str, path: str) -> bool:
             return False
         posting_slug = segments[1]
         return bool(re.search(r"\d{6,}", posting_slug))
+
+    if "ats.rippling.com" in host:
+        return len(segments) >= 3 and segments[1] == "jobs"
 
     if "recruitee.com" in host or "careers.tellent.com" in host:
         return len(segments) >= 2 and segments[0] == "o"
@@ -3743,6 +3747,10 @@ def _company_hint_from_url(url: str) -> str:
         host_prefix = host.split(".wd", 1)[0]
         if host_prefix:
             return host_prefix.replace("-", " ").title()
+    if "ats.rippling.com" in host and path_segments:
+        candidate = path_segments[0].replace("_", " ").replace("-", " ").title()
+        if not _is_weak_company_hint(candidate):
+            return candidate
     if "jobs.lever.co" in host and path_segments:
         return path_segments[0].replace("-", " ").title()
     if "ashbyhq.com" in host and path_segments:
