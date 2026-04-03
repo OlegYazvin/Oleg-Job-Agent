@@ -1989,6 +1989,70 @@ def test_replay_seed_leads_routes_previously_validated_job_into_reacquired_lane(
     assert diagnostics.reacquisition_attempt_count == 1
 
 
+def test_replay_seed_leads_runs_seed_refinement_before_failed_history_suppression(monkeypatch, tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    lead = JobLead(
+        company_name="Quorum Software",
+        role_title="Senior Product Manager - AI Strategy (USA - Remote)",
+        source_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        source_type="direct_ats",
+        direct_job_url=None,
+        is_remote_hint=True,
+        posted_date_hint=(date.today() - timedelta(days=1)).isoformat(),
+        salary_text_hint="$165,000 - $220,000",
+        evidence_notes="Replay seed.",
+    )
+    refinement_calls: list[list[str | None]] = []
+
+    async def fake_seed_refinement(settings_arg, leads, *, run_id=None):
+        refinement_calls.append([candidate.source_url for candidate in leads])
+        return leads
+
+    monkeypatch.setattr("job_agent.job_search._maybe_force_seed_lead_refinement_with_ollama", fake_seed_refinement)
+
+    diagnostics = SearchDiagnostics(run_id="run-seed-refine-order", minimum_qualifying_jobs=5)
+
+    total_unique_leads, resolved_leads = asyncio.run(
+        _replay_seed_leads(
+            [lead],
+            settings=settings,
+            diagnostics=diagnostics,
+            company_watchlist={},
+            failed_lead_history={
+                "url:https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04": {
+                    "watch_count": 1,
+                    "recent_rejection_reasons": {"company_mismatch": 1},
+                }
+            },
+            jobs_by_url={},
+            reacquired_jobs_by_url={},
+            previously_reported_company_keys=set(),
+            validated_job_history_index={},
+            reacquisition_attempted_keys=set(),
+            reacquisition_suppressed_keys=set(),
+            seen_lead_keys=set(),
+            total_unique_leads=0,
+            resolved_leads_this_attempt=0,
+            stop_goal=5,
+            lead_timeout_seconds=10,
+            resolution_agent=None,
+            attempt_number=1,
+            status=None,
+            run_id="run-seed-refine-order",
+        )
+    )
+
+    assert refinement_calls == [[lead.source_url]]
+    assert total_unique_leads == 1
+    assert resolved_leads == 0
+
+
 def test_query_timeout_seconds_for_query_keeps_broad_queries_tighter_than_targeted_queries() -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

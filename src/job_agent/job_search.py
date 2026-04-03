@@ -5443,8 +5443,15 @@ async def _replay_seed_leads(
     if not seed_leads:
         return total_unique_leads, resolved_leads_this_attempt
 
+    replay_seed_leads = _dedupe_round_leads(seed_leads, settings)
+    replay_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
+        settings,
+        replay_seed_leads,
+        run_id=run_id,
+    )
+
     fresh_seed_leads: list[JobLead] = []
-    for lead in seed_leads:
+    for lead in replay_seed_leads:
         failed_history_skip = _failed_lead_history_skip_reason(lead, settings, failed_lead_history)
         if failed_history_skip is not None:
             reason_code, detail = failed_history_skip
@@ -5480,11 +5487,6 @@ async def _replay_seed_leads(
         previously_reported_company_keys,
         min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
         limit=seed_replay_cap,
-    )
-    fresh_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
-        settings,
-        fresh_seed_leads,
-        run_id=run_id,
     )
     diagnostics.seed_replayed_lead_count = len(fresh_seed_leads)
     if status:
