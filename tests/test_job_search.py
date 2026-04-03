@@ -3266,6 +3266,50 @@ def test_refine_local_leads_with_ollama_skips_forced_modes_without_cleanup_signa
     assert refined == [lead_one, lead_two]
 
 
+def test_refine_local_leads_with_ollama_allows_clean_forced_round_samples(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead_one = JobLead(
+        company_name="Acme",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/123",
+        evidence_notes="Direct ATS role.",
+    )
+    lead_two = JobLead(
+        company_name="Beta",
+        role_title="Staff Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/beta/456",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/beta/456",
+        evidence_notes="Direct ATS role.",
+    )
+    cleanup_calls: list[str] = []
+
+    async def fake_cleanup(_settings: Settings, _query: str, leads: list[JobLead]) -> list[JobLead]:
+        cleanup_calls.append("called")
+        return leads
+
+    monkeypatch.setattr("job_agent.job_search._cleanup_local_leads_with_ollama", fake_cleanup)
+
+    refined = asyncio.run(
+        _refine_local_leads_with_ollama(
+            settings,
+            "attempt 1 round 1 aggregate cleanup",
+            [lead_one, lead_two],
+            cleanup_limit=2,
+            refinement_mode="forced_round_sample",
+            pre_refinement_average_confidence=0.967,
+            pre_refinement_cleanup_signal_count=0,
+            pre_refinement_trustworthy_direct_url_count=2,
+        )
+    )
+
+    assert cleanup_calls == ["called"]
+    assert [lead.direct_job_url for lead in refined] == [lead_one.direct_job_url, lead_two.direct_job_url]
+
+
 def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

@@ -5885,7 +5885,7 @@ async def _refine_local_leads_with_ollama(
 ) -> list[JobLead]:
     if not candidate_pool or settings.llm_provider != "ollama" or settings.ollama_degraded_for_run:
         return candidate_pool
-    forced_refinement_mode = refinement_mode in {"forced_sample", "forced_round_sample", "forced_seed_triage"}
+    forced_refinement_mode = refinement_mode in {"forced_sample", "forced_seed_triage"}
     if forced_refinement_mode and (pre_refinement_cleanup_signal_count or 0) <= 0:
         record_ollama_event(
             settings,
