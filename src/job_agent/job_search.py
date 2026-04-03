@@ -8569,12 +8569,29 @@ def _salary_is_base_salary(job: JobPosting, snapshot: JobPageSnapshot) -> bool:
 
 def _should_accept_company_hosted_missing_posted_date(
     job: JobPosting,
+    snapshot: JobPageSnapshot,
     settings: Settings,
     *,
     expected_company_name: str | None = None,
 ) -> bool:
     job_url = str(job.resolved_job_url or job.direct_job_url or "")
     host = (urlparse(job_url).netloc or "").lower()
+    title_context = " ".join(
+        part
+        for part in (
+            job.role_title,
+            job.job_page_title or "",
+            snapshot.role_title or "",
+            snapshot.page_title or "",
+        )
+        if part
+    )
+    supports_high_salary_presumption = (
+        _has_senior_title_signal(title_context)
+        and _job_looks_us_remote_without_geo_limit(job, snapshot)
+        and _is_ai_related_product_manager(job)
+        and (job.source_quality_score or 0) >= 4
+    )
     return (
         bool(job_url)
         and not any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS)
@@ -8582,7 +8599,7 @@ def _should_accept_company_hosted_missing_posted_date(
         and _url_has_strong_expected_company_hint(job_url, expected_company_name or job.company_name)
         and (job.source_quality_score or 0) >= 4
         and job.is_fully_remote is True
-        and _salary_meets_minimum(job, settings)
+        and (_salary_meets_minimum(job, settings) or supports_high_salary_presumption)
         and _is_ai_related_product_manager(job)
     )
 
@@ -8652,6 +8669,7 @@ def _evaluate_merged_job(
     if not job.posted_date_iso and not job.posted_date_text:
         if _should_accept_company_hosted_missing_posted_date(
             job,
+            snapshot,
             settings,
             expected_company_name=expected_company_name,
         ):

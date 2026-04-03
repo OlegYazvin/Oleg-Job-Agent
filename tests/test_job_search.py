@@ -1372,6 +1372,108 @@ def test_evaluate_merged_job_allows_company_hosted_direct_page_without_posted_da
     assert reason_code is None, detail
 
 
+def test_evaluate_merged_job_allows_company_hosted_direct_page_without_posted_date_when_senior_ai_pm_context_implies_salary() -> None:
+    settings = build_settings()
+    job = JobPosting(
+        company_name="Krisp",
+        role_title="Senior Product Manager, Voice AI SDK",
+        direct_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        resolved_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        ats_platform="Company Site",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="",
+        posted_date_iso=None,
+        base_salary_min_usd=None,
+        base_salary_max_usd=None,
+        salary_text=None,
+        source_query="\"senior product manager\" \"voice AI\" remote \"growth stage\"",
+        job_page_title="Senior Product Manager, Voice AI SDK",
+        evidence_notes="Own product strategy for Voice AI SDK capabilities.",
+        validation_evidence=["Remote role on the live company job page."],
+        source_quality_score=4,
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Company Site",
+        status_code=200,
+        company_name="Krisp",
+        role_title=job.role_title,
+        page_title=job.job_page_title,
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="",
+        posted_date_iso=None,
+        base_salary_min_usd=None,
+        base_salary_max_usd=None,
+        salary_text=None,
+        text_excerpt="Senior Product Manager for Voice AI SDK. Remote role owning AI product strategy.",
+        evidence_snippets=["Voice AI SDK roadmap ownership.", "Remote role."],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Krisp",
+        expected_role_title=job.role_title,
+    )
+
+    assert reason_code is None, detail
+
+
+def test_evaluate_merged_job_keeps_missing_posted_date_rejection_for_generic_company_hosted_role_without_salary() -> None:
+    settings = build_settings()
+    job = JobPosting(
+        company_name="Krisp",
+        role_title="Product Manager, Voice AI SDK",
+        direct_job_url="https://krisp.ai/jobs/product-manager-voice-ai-sdk/",
+        resolved_job_url="https://krisp.ai/jobs/product-manager-voice-ai-sdk/",
+        ats_platform="Company Site",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="",
+        posted_date_iso=None,
+        base_salary_min_usd=None,
+        base_salary_max_usd=None,
+        salary_text=None,
+        source_query="\"product manager\" \"voice AI\" remote",
+        job_page_title="Product Manager, Voice AI SDK",
+        evidence_notes="Own product strategy for Voice AI SDK capabilities.",
+        validation_evidence=["Remote role on the live company job page."],
+        source_quality_score=4,
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Company Site",
+        status_code=200,
+        company_name="Krisp",
+        role_title=job.role_title,
+        page_title=job.job_page_title,
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="",
+        posted_date_iso=None,
+        base_salary_min_usd=None,
+        base_salary_max_usd=None,
+        salary_text=None,
+        text_excerpt="Product Manager for Voice AI SDK. Remote role owning AI product strategy.",
+        evidence_snippets=["Voice AI SDK roadmap ownership.", "Remote role."],
+    )
+
+    reason_code, _detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Krisp",
+        expected_role_title=job.role_title,
+    )
+
+    assert reason_code == "missing_posted_date"
+
+
 def test_seed_lead_from_failure_parses_salary_text_into_numeric_hints() -> None:
     failure = SearchFailure(
         stage="validation",
