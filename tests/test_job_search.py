@@ -2348,6 +2348,29 @@ def test_failed_lead_history_skip_reason_suppresses_repeat_failures() -> None:
     assert skip_reason[0] == "stale_posting"
 
 
+def test_failed_lead_history_skip_reason_does_not_persist_already_reported() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Hopper",
+        role_title="Principal Product Manager - AI Travel (100% Remote - USA)",
+        source_url="https://jobs.ashbyhq.com/hopper/9a3d0809-326b-4ca5-ae60-bae9a835234c",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/hopper/9a3d0809-326b-4ca5-ae60-bae9a835234c",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-20",
+        salary_text_hint="$150,000 - $350,000",
+        evidence_notes="Replayed seeded direct URL.",
+    )
+    history = {
+        "url:ashby:hopper:9a3d0809-326b-4ca5-ae60-bae9a835234c": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"already_reported": 1},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, history) is None
+
+
 def test_persist_validated_jobs_checkpoint_writes_current_jobs(tmp_path: Path) -> None:
     settings = build_settings()
     settings.data_dir = tmp_path

@@ -243,7 +243,6 @@ FAILED_LEAD_IMMEDIATE_SUPPRESS_REASON_CODES = {
     "company_mismatch",
     "direct_url_not_allowed",
     "not_specific_job_page",
-    "already_reported",
 }
 FAILED_LEAD_REPEAT_SUPPRESS_THRESHOLDS = {
     "stale_posting": 2,
