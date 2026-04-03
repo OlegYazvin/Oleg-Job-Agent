@@ -316,6 +316,11 @@ FOCUSABLE_REASON_CODES = {
     "missing_salary",
     "remote_unclear",
 }
+TRUSTED_DIRECT_LEAD_SUPPRESS_REASON_CODES = {
+    "stale_posting",
+    "not_remote",
+    "salary_below_min",
+}
 BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD = 6
 COMPANY_FOCUSED_QUERY_TIMEOUT_SKIP_THRESHOLD = 2
 TIMEOUT_SENSITIVE_QUERY_MARKERS = (
@@ -5306,18 +5311,28 @@ def _greenhouse_board_job_to_lead(
     posted_date_hint = str(job.get("updated_at") or job.get("created_at") or "").strip()[:10]
     is_remote_hint = "remote" in location_text.lower()
     compensation_text = str(job.get("salary") or "").strip() or None
+    location_hint = _lead_location_hint_with_remote_restriction(location_text, title)
+    remote_restriction_note = _remote_restriction_note(title, location_text)
+    evidence_notes = " ".join(
+        part
+        for part in (
+            "Discovered via official Greenhouse board enumeration.",
+            remote_restriction_note,
+        )
+        if part
+    )
     return JobLead(
         company_name=company_name,
         role_title=title,
         source_url=f"https://job-boards.greenhouse.io/{board_token}",
         source_type="direct_ats",
         direct_job_url=absolute_url,
-        location_hint=location_text,
+        location_hint=location_hint,
         posted_date_hint=posted_date_hint or None,
         is_remote_hint=is_remote_hint or None,
         salary_text_hint=compensation_text,
         source_query=f"company_discovery:greenhouse:{board_token}",
-        evidence_notes="Discovered via official Greenhouse board enumeration.",
+        evidence_notes=evidence_notes,
         source_quality_score_hint=10,
     )
 
@@ -5339,18 +5354,28 @@ def _ashby_board_job_to_lead(
     is_remote = job.get("isRemote")
     is_remote_hint = True if is_remote is True else ("remote" in location_text.lower() if location_text else None)
     published_at = str(job.get("publishedAt") or "").strip()
+    location_hint = _lead_location_hint_with_remote_restriction(location_text, title, description_text)
+    remote_restriction_note = _remote_restriction_note(title, location_text, description_text)
+    evidence_notes = " ".join(
+        part
+        for part in (
+            "Discovered via official Ashby board enumeration.",
+            remote_restriction_note,
+        )
+        if part
+    )
     return JobLead(
         company_name=company_name,
         role_title=title,
         source_url=f"https://jobs.ashbyhq.com/{board_token}",
         source_type="direct_ats",
         direct_job_url=direct_job_url,
-        location_hint=location_text,
+        location_hint=location_hint,
         posted_date_hint=published_at[:10] or None,
         is_remote_hint=is_remote_hint,
         salary_text_hint=salary_text_hint,
         source_query=f"company_discovery:ashby:{board_token}",
-        evidence_notes="Discovered via official Ashby board enumeration.",
+        evidence_notes=evidence_notes,
         source_quality_score_hint=10,
     )
 
@@ -5416,18 +5441,28 @@ def _lever_board_job_to_lead(
             salary_text = f"{currency} {int(min_salary):,} - {int(max_salary):,} {interval}".strip()
     is_remote_hint = "remote" in " ".join([location_text, workplace_type]).lower()
     created_at = str(job.get("createdAt") or "").strip()
+    location_hint = _lead_location_hint_with_remote_restriction(location_text, title, description_text, workplace_type)
+    remote_restriction_note = _remote_restriction_note(title, location_text, description_text, workplace_type)
+    evidence_notes = " ".join(
+        part
+        for part in (
+            "Discovered via official Lever board enumeration.",
+            remote_restriction_note,
+        )
+        if part
+    )
     return JobLead(
         company_name=company_name,
         role_title=title,
         source_url=f"https://jobs.lever.co/{board_token}",
         source_type="direct_ats",
         direct_job_url=direct_job_url,
-        location_hint=location_text,
+        location_hint=location_hint,
         posted_date_hint=created_at[:10] or None,
         is_remote_hint=is_remote_hint or None,
         salary_text_hint=salary_text,
         source_query=f"company_discovery:lever:{board_token}",
-        evidence_notes="Discovered via official Lever board enumeration.",
+        evidence_notes=evidence_notes,
         source_quality_score_hint=10,
     )
 
@@ -5954,6 +5989,29 @@ async def _collect_company_discovery_seed_leads(
                 official_roles_missed_count += 1
                 continue
 
+            filtered_leads_for_task: list[JobLead] = []
+            for lead in leads_for_task:
+                suppression_failure = _trusted_direct_lead_precheck_failure(lead, settings)
+                if suppression_failure is not None:
+                    append_company_discovery_audit_entry(
+                        audit_entries,
+                        {
+                            "run_id": run_id,
+                            "phase": phase_label,
+                            "status": "suppressed_out_of_scope",
+                            "company_name": lead.company_name,
+                            "role_title": lead.role_title,
+                            "board_identifier": board_identifier,
+                            "board_url": task_url,
+                            "direct_job_url": lead.direct_job_url,
+                            "reason_code": suppression_failure.reason_code,
+                            "detail": suppression_failure.detail,
+                        },
+                    )
+                    continue
+                filtered_leads_for_task.append(lead)
+            leads_for_task = filtered_leads_for_task
+
             official_board_crawl_success_count += 1
             record_crawl_result(
                 crawl_history,
@@ -6440,6 +6498,35 @@ def _remote_restriction_note(*texts: str | None) -> str | None:
     if not region:
         return None
     return f"Remote restriction: {region.title()} only."
+
+
+def _lead_location_hint_with_remote_restriction(location_text: str | None, *texts: str | None) -> str | None:
+    normalized_location = str(location_text or "").strip()
+    remote_restriction_note = _remote_restriction_note(normalized_location, *texts)
+    if not remote_restriction_note:
+        return normalized_location or None
+    restriction_suffix = remote_restriction_note.split(": ", 1)[1].rstrip(".")
+    if not normalized_location:
+        return f"Remote - {restriction_suffix}"
+    if restriction_suffix.lower() in normalized_location.lower():
+        return normalized_location
+    if "remote" in normalized_location.lower():
+        return f"{normalized_location} - {restriction_suffix}"
+    return f"{normalized_location}. {remote_restriction_note}"
+
+
+def _trusted_direct_lead_precheck_failure(lead: JobLead, settings: Settings) -> SearchFailure | None:
+    if lead.source_type not in {"direct_ats", "company_site"}:
+        return None
+    precheck_failure = _precheck_lead_hints(
+        lead,
+        settings,
+        attempt_number=0,
+        round_number=0,
+    )
+    if precheck_failure is None or precheck_failure.reason_code not in TRUSTED_DIRECT_LEAD_SUPPRESS_REASON_CODES:
+        return None
+    return precheck_failure
 
 
 def _stable_text_index(text: str, modulo: int) -> int:
@@ -6955,20 +7042,40 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
             and (" remote" in f" {lowered_query}" or "work from home" in lowered_query)
         ):
             is_remote_hint = True
+    remote_restriction_note = _remote_restriction_note(
+        failure.role_title,
+        failure.detail,
+        source_url,
+        direct_job_url,
+    )
+    location_hint: str | None = None
+    if is_remote_hint:
+        location_hint = "Remote"
+        if remote_restriction_note:
+            location_hint = f"Remote - {remote_restriction_note.split(': ', 1)[1].rstrip('.')}"
     lead = JobLead(
         company_name=failure.company_name,
         role_title=failure.role_title,
         source_url=source_url,
         source_type=source_type,
         direct_job_url=direct_job_url,
-        location_hint="Remote" if is_remote_hint else None,
+        location_hint=location_hint,
         posted_date_hint=failure.posted_date_text,
         is_remote_hint=is_remote_hint,
         base_salary_min_usd_hint=salary_min,
         base_salary_max_usd_hint=salary_max,
         salary_text_hint=salary_text,
         source_query=failure.source_query,
-        evidence_notes=(failure.detail or "Historical lead from prior diagnostics.")[:400],
+        evidence_notes=(
+            " ".join(
+                part
+                for part in (
+                    (failure.detail or "Historical lead from prior diagnostics.")[:400],
+                    remote_restriction_note,
+                )
+                if part
+            )
+        )[:400],
     )
     if not _lead_is_ai_related_product_manager(lead):
         return None
@@ -6991,14 +7098,28 @@ def _seed_lead_from_job_payload(payload: dict[str, object]) -> JobLead | None:
         source_url=direct_job_url,
         source_type=_normalize_source_type(direct_job_url),
         direct_job_url=direct_job_url,
-        location_hint=job.location_text or ("Remote" if job.is_fully_remote else None),
+        location_hint=_lead_location_hint_with_remote_restriction(
+            job.location_text or ("Remote" if job.is_fully_remote else None),
+            job.role_title,
+            job.job_page_title,
+            job.evidence_notes,
+        ),
         posted_date_hint=job.posted_date_iso or job.posted_date_text,
         is_remote_hint=job.is_fully_remote,
         base_salary_min_usd_hint=job.base_salary_min_usd,
         base_salary_max_usd_hint=job.base_salary_max_usd,
         salary_text_hint=job.salary_text,
         source_query=job.source_query,
-        evidence_notes=(job.evidence_notes or "Historical accepted candidate.")[:400],
+        evidence_notes=(
+            " ".join(
+                part
+                for part in (
+                    (job.evidence_notes or "Historical accepted candidate.")[:400],
+                    _remote_restriction_note(job.role_title, job.job_page_title, job.evidence_notes),
+                )
+                if part
+            )
+        )[:400],
     )
     if not _lead_is_ai_related_product_manager(lead):
         return None
@@ -7045,6 +7166,8 @@ def _collect_replay_seed_leads(settings: Settings) -> list[JobLead]:
     deduped: dict[str, JobLead] = {}
     for lead in [*file_seed_leads, *_load_historical_seed_leads(settings)]:
         if not _lead_is_replay_source_trustworthy(lead):
+            continue
+        if _trusted_direct_lead_precheck_failure(lead, settings) is not None:
             continue
         key = _lead_dedupe_key(lead)
         existing = deduped.get(key)

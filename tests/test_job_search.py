@@ -511,7 +511,7 @@ def test_collect_replay_seed_leads_prioritizes_curated_file_seeds(tmp_path: Path
                         "source_type": "direct_ats",
                         "direct_job_url": "https://uscareers-yelp.icims.com/jobs/13442/principal-product-manager---applied-ml/job",
                         "location_hint": "Remote - United States",
-                        "posted_date_hint": "2026-03-14",
+                        "posted_date_hint": "2026-04-02",
                         "is_remote_hint": True,
                         "evidence_notes": "Curated direct ATS seed.",
                     }
@@ -531,8 +531,8 @@ def test_collect_replay_seed_leads_prioritizes_curated_file_seeds(tmp_path: Path
                             "ats_platform": "jobs.lever.co",
                             "location_text": "Remote",
                             "is_fully_remote": True,
-                            "posted_date_text": "2026-03-20",
-                            "posted_date_iso": "2026-03-20",
+                            "posted_date_text": "2026-04-01",
+                            "posted_date_iso": "2026-04-01",
                             "base_salary_min_usd": 200000,
                             "base_salary_max_usd": 250000,
                             "salary_text": "$200,000 - $250,000",
@@ -1596,6 +1596,36 @@ def test_seed_lead_from_failure_does_not_override_explicit_hybrid_signal_with_re
     assert lead.location_hint is None
 
 
+def test_collect_replay_seed_leads_suppresses_geo_limited_trusted_direct_leads(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "leads": [
+            {
+                "company_name": "Hopper",
+                "role_title": "Principal Product Manager - AI Travel (100% Remote - Ireland)",
+                "source_url": "https://jobs.ashbyhq.com/hopper",
+                "source_type": "direct_ats",
+                "direct_job_url": "https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377",
+                "location_hint": "Remote - Ireland only",
+                "posted_date_hint": "2026-04-02",
+                "is_remote_hint": True,
+                "evidence_notes": "Historical trusted lead with a country-limited remote title.",
+            }
+        ]
+    }
+    (settings.data_dir / "seed-leads.json").write_text(json.dumps(payload))
+
+    replay_leads = _collect_replay_seed_leads(settings)
+
+    assert replay_leads == []
+
+
 def test_rippling_direct_job_url_is_trustworthy() -> None:
     url = "https://ats.rippling.com/vendr/jobs/8f3edee4-bf55-44cf-a467-ea36dcc23605"
     lead = JobLead(
@@ -1690,6 +1720,26 @@ def test_ashby_board_job_to_lead_reads_alternate_compensation_summary() -> None:
     assert lead.salary_text_hint == "$200K - $300K"
     assert lead.is_remote_hint is True
     assert lead.posted_date_hint == "2026-03-20"
+
+
+def test_ashby_board_job_to_lead_preserves_title_only_remote_restriction_hint() -> None:
+    lead = _ashby_board_job_to_lead(
+        "hopper",
+        "Hopper",
+        {
+            "title": "Principal Product Manager - AI Travel (100% Remote - Ireland)",
+            "jobUrl": "https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377",
+            "descriptionPlain": "Lead AI product strategy across Hopper's travel platform.",
+            "location": "",
+            "isRemote": True,
+            "publishedAt": "2026-03-20T19:07:17.783Z",
+            "compensation": {"compensationTierSummary": None},
+        },
+    )
+
+    assert lead is not None
+    assert lead.location_hint == "Remote - Ireland only"
+    assert "Remote restriction: Ireland only." in lead.evidence_notes
 
 
 def test_is_ai_related_product_manager_ignores_discovery_snippet_noise() -> None:
@@ -5766,6 +5816,74 @@ def test_collect_company_discovery_seed_leads_discovers_embedded_ashby_board(mon
     assert (settings.data_dir / "company-discovery-frontier.json").exists()
     assert (settings.data_dir / "company-discovery-crawl-history.json").exists()
     assert (settings.data_dir / "company-discovery-audit.json").exists()
+
+
+def test_collect_company_discovery_seed_leads_suppresses_geo_limited_official_board_leads(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_search_query_with_context(*_args, **_kwargs):
+        return (
+            "company discovery query",
+            [
+                JobLead(
+                    company_name="Hopper",
+                    role_title="Principal Product Manager, AI",
+                    source_url="https://hopper.com/careers",
+                    source_type="company_site",
+                    direct_job_url=None,
+                    location_hint="Remote",
+                    posted_date_hint="2026-04-02",
+                    is_remote_hint=True,
+                    evidence_notes="Official company careers page mentions the AI PM role.",
+                )
+            ],
+        )
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return '<html><body><a href="https://jobs.ashbyhq.com/hopper">Jobs</a></body></html>'
+
+    async def fake_fetch_ashby_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Principal Product Manager - AI Travel (100% Remote - Ireland)",
+                "jobUrl": "https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377",
+                "publishedAt": "2026-04-02T12:00:00+00:00",
+                "isRemote": True,
+                "workplaceType": "Remote",
+                "location": "",
+                "descriptionPlain": "Lead AI product strategy for Hopper's travel platform.",
+                "compensation": {"scrapeableCompensationSalarySummary": None},
+            }
+        ]
+
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: ["q"])
+    monkeypatch.setattr("job_agent.job_search._search_query_with_context", fake_search_query_with_context)
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+    monkeypatch.setattr("job_agent.job_search._fetch_ashby_board_jobs", fake_fetch_ashby_board_jobs)
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+        )
+    )
+
+    assert not any(
+        lead.direct_job_url == "https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377"
+        for lead in leads
+    )
+    assert metrics["official_board_leads_count"] == 0
+    audit_entries = json.loads((settings.data_dir / "company-discovery-audit.json").read_text())
+    assert any(entry.get("status") == "suppressed_out_of_scope" for entry in audit_entries)
 
 
 def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandard_careers_links(
