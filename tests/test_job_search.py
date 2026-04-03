@@ -3413,6 +3413,46 @@ def test_refine_local_leads_with_ollama_allows_single_forced_seed_without_cleanu
     assert refined[0].direct_job_url == "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk"
 
 
+def test_refine_local_leads_with_ollama_allows_single_replay_trustworthy_seed_without_direct_url_trust(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead = JobLead(
+        company_name="Quorum Software",
+        role_title="Senior Product Manager - AI Strategy (USA - Remote)",
+        source_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        source_type="direct_ats",
+        direct_job_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        evidence_notes="Direct ATS replay seed.",
+    )
+    cleanup_calls: list[str] = []
+
+    async def fake_cleanup(_settings: Settings, _query: str, leads: list[JobLead], **_kwargs) -> list[JobLead]:
+        cleanup_calls.append("called")
+        return leads
+
+    monkeypatch.setattr("job_agent.job_search._cleanup_local_leads_with_ollama", fake_cleanup)
+
+    refined = asyncio.run(
+        _refine_local_leads_with_ollama(
+            settings,
+            "seed replay triage",
+            [lead],
+            cleanup_limit=1,
+            refinement_mode="forced_seed_triage",
+            pre_refinement_average_confidence=0.95,
+            pre_refinement_cleanup_signal_count=0,
+            pre_refinement_trustworthy_direct_url_count=0,
+            run_id="run-single-replay-seed-guard",
+        )
+    )
+
+    assert cleanup_calls == ["called"]
+    assert len(refined) == 1
+    assert refined[0].company_name == "Quorum Software"
+
+
 def test_refine_local_leads_with_ollama_allows_clean_forced_round_samples(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
@@ -4255,6 +4295,54 @@ def test_maybe_force_seed_lead_refinement_with_ollama_allows_single_trusted_seed
             settings,
             [lead],
             run_id="run-single-seed",
+        )
+    )
+
+    assert refined == [lead]
+    assert forced_calls == [(1, "forced_seed_triage", "seed replay triage")]
+
+
+def test_maybe_force_seed_lead_refinement_with_ollama_allows_single_replay_trustworthy_seed(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead = JobLead(
+        company_name="Quorum Software",
+        role_title="Senior Product Manager - AI Strategy (USA - Remote)",
+        source_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        source_type="direct_ats",
+        direct_job_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=200000,
+        evidence_notes="Replay-trustworthy ATS lead.",
+    )
+    forced_calls: list[tuple[int, str | None, str]] = []
+
+    async def fake_refine(
+        _settings: Settings,
+        query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode, query))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_SEED_REFINEMENT_RUNS.clear()
+
+    refined = asyncio.run(
+        _maybe_force_seed_lead_refinement_with_ollama(
+            settings,
+            [lead],
+            run_id="run-single-replay-trust-seed",
         )
     )
 

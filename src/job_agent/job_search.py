@@ -5913,6 +5913,13 @@ async def _refine_local_leads_with_ollama(
         and (pre_refinement_average_confidence or 0.0) >= 0.9
         and (pre_refinement_trustworthy_direct_url_count or 0) >= 1
     )
+    allow_single_replay_source_seed_triage_without_cleanup = (
+        refinement_mode == "forced_seed_triage"
+        and len(candidate_pool) == 1
+        and (pre_refinement_average_confidence or 0.0) >= 0.9
+        and bool(candidate_pool[0].direct_job_url)
+        and _lead_is_replay_source_trustworthy(candidate_pool[0])
+    )
     allow_clean_seed_bundle_triage_without_cleanup = (
         refinement_mode == "forced_seed_triage"
         and len(candidate_pool) >= 5
@@ -5923,6 +5930,7 @@ async def _refine_local_leads_with_ollama(
         forced_refinement_mode
         and (pre_refinement_cleanup_signal_count or 0) <= 0
         and not allow_single_seed_triage_without_cleanup
+        and not allow_single_replay_source_seed_triage_without_cleanup
         and not allow_clean_seed_bundle_triage_without_cleanup
     ):
         record_ollama_event(
@@ -6117,7 +6125,13 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         len(seed_window) == 1
         and average_confidence >= 0.9
         and low_trust_source_count == 0
-        and trustworthy_direct_url_count >= 1
+        and (
+            trustworthy_direct_url_count >= 1
+            or (
+                bool(seed_window[0].direct_job_url)
+                and _lead_is_replay_source_trustworthy(seed_window[0])
+            )
+        )
     ):
         FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
         return await _refine_local_leads_with_ollama(
