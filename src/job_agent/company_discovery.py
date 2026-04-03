@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .models import CompanyDiscoveryEntry
+from .models import CompanyDiscoveryCrawlRecord, CompanyDiscoveryEntry, CompanyDiscoveryFrontierTask
 
 
 COMPANY_DISCOVERY_INDEX_FILENAME = "company-discovery-index.json"
+COMPANY_DISCOVERY_FRONTIER_FILENAME = "company-discovery-frontier.json"
+COMPANY_DISCOVERY_CRAWL_HISTORY_FILENAME = "company-discovery-crawl-history.json"
+COMPANY_DISCOVERY_AUDIT_FILENAME = "company-discovery-audit.json"
+
 KNOWN_BOARD_HOST_FRAGMENTS = (
     "jobs.ashbyhq.com",
     "boards.greenhouse.io",
@@ -31,6 +35,33 @@ KNOWN_BOARD_HOST_FRAGMENTS = (
     "jobs.icims.com",
     "ats.rippling.com",
 )
+
+COMMON_CAREERS_PATHS = (
+    "/careers",
+    "/jobs",
+    "/join-us",
+    "/company/careers",
+    "/about/careers",
+    "/work-with-us",
+)
+
+DIRECTORY_SOURCE_URLS = (
+    "https://www.ycombinator.com/companies",
+    "https://www.workatastartup.com/companies",
+    "https://wellfound.com/jobs",
+    "https://www.builtin.com/jobs",
+)
+
+LOW_TRUST_SCOUT_HOST_FRAGMENTS = (
+    "mediabistro.com",
+    "remotejobshive.com",
+    "thatstartupjob.com",
+    "remoterocketship.com",
+    "jobgether.com",
+    "tracxn.com",
+)
+
+DEFAULT_FRONTIER_RETRY_DELAY = timedelta(hours=6)
 
 
 def _utc_now_iso() -> str:
@@ -55,8 +86,47 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _dedupe_strings(values: list[str], *, limit: int) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+        if len(ordered) >= limit:
+            break
+    return ordered
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def company_discovery_index_path(data_dir: Path) -> Path:
     return data_dir / COMPANY_DISCOVERY_INDEX_FILENAME
+
+
+def company_discovery_frontier_path(data_dir: Path) -> Path:
+    return data_dir / COMPANY_DISCOVERY_FRONTIER_FILENAME
+
+
+def company_discovery_crawl_history_path(data_dir: Path) -> Path:
+    return data_dir / COMPANY_DISCOVERY_CRAWL_HISTORY_FILENAME
+
+
+def company_discovery_audit_path(data_dir: Path) -> Path:
+    return data_dir / COMPANY_DISCOVERY_AUDIT_FILENAME
 
 
 def load_company_discovery_entries(data_dir: Path) -> dict[str, dict[str, Any]]:
@@ -83,18 +153,60 @@ def save_company_discovery_entries(data_dir: Path, entries: Mapping[str, Mapping
     _write_json(company_discovery_index_path(data_dir), rendered)
 
 
-def _dedupe_strings(values: list[str], *, limit: int) -> list[str]:
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        normalized = str(value or "").strip()
-        if not normalized or normalized in seen:
+def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
+    payload = _load_json(company_discovery_frontier_path(data_dir), default=[])
+    if not isinstance(payload, list):
+        return []
+    tasks: list[dict[str, Any]] = []
+    for raw_task in payload:
+        if not isinstance(raw_task, Mapping):
             continue
-        seen.add(normalized)
-        ordered.append(normalized)
-        if len(ordered) >= limit:
-            break
-    return ordered
+        try:
+            task = CompanyDiscoveryFrontierTask.model_validate(raw_task)
+        except Exception:
+            continue
+        tasks.append(task.model_dump(mode="json"))
+    return tasks
+
+
+def save_company_discovery_frontier(data_dir: Path, tasks: list[Mapping[str, Any]]) -> None:
+    rendered = [CompanyDiscoveryFrontierTask.model_validate(task).model_dump(mode="json") for task in tasks]
+    _write_json(company_discovery_frontier_path(data_dir), rendered)
+
+
+def load_company_discovery_crawl_history(data_dir: Path) -> dict[str, dict[str, Any]]:
+    payload = _load_json(company_discovery_crawl_history_path(data_dir), default={})
+    if not isinstance(payload, dict):
+        return {}
+    records: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_entry in payload.items():
+        if not isinstance(raw_entry, Mapping):
+            continue
+        try:
+            record = CompanyDiscoveryCrawlRecord.model_validate(raw_entry)
+        except Exception:
+            continue
+        records[str(raw_key)] = record.model_dump(mode="json")
+    return records
+
+
+def save_company_discovery_crawl_history(data_dir: Path, records: Mapping[str, Mapping[str, Any]]) -> None:
+    rendered = {
+        str(key): CompanyDiscoveryCrawlRecord.model_validate(value).model_dump(mode="json")
+        for key, value in records.items()
+    }
+    _write_json(company_discovery_crawl_history_path(data_dir), rendered)
+
+
+def load_company_discovery_audit(data_dir: Path) -> list[dict[str, Any]]:
+    payload = _load_json(company_discovery_audit_path(data_dir), default=[])
+    if not isinstance(payload, list):
+        return []
+    return [dict(item) for item in payload if isinstance(item, Mapping)]
+
+
+def save_company_discovery_audit(data_dir: Path, entries: list[Mapping[str, Any]]) -> None:
+    _write_json(company_discovery_audit_path(data_dir), [dict(item) for item in entries])
 
 
 def infer_careers_root(url: str | None) -> str | None:
@@ -192,17 +304,52 @@ def board_url_ats_type(url: str | None) -> str | None:
     return None
 
 
+def classify_source_kind(url: str | None, *, explicit_task_type: str | None = None) -> str:
+    if explicit_task_type in {"directory_source", "portfolio_source"}:
+        return explicit_task_type
+    normalized = str(url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return "other"
+    host = (urlparse(normalized).netloc or "").lower()
+    if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
+        return "board_url"
+    if any(fragment in host for fragment in LOW_TRUST_SCOUT_HOST_FRAGMENTS):
+        return "low_trust_scout"
+    if host.endswith("ycombinator.com") or "workatastartup.com" in host or "wellfound.com" in host or "builtin" in host:
+        return "directory_source"
+    return "company_page"
+
+
+def trust_score_for_url(url: str | None, *, explicit_task_type: str | None = None) -> int:
+    normalized = str(url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return 0
+    host = (urlparse(normalized).netloc or "").lower()
+    if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
+        return 10
+    if explicit_task_type == "portfolio_source":
+        return 6
+    if classify_source_kind(url, explicit_task_type=explicit_task_type) == "directory_source":
+        return 5
+    if any(fragment in host for fragment in LOW_TRUST_SCOUT_HOST_FRAGMENTS):
+        return 2
+    return 7
+
+
 def extract_embedded_board_urls(page_url: str, html: str) -> list[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     candidates: list[str] = []
 
     def maybe_add(raw_url: str | None) -> None:
         normalized = str(raw_url or "").strip()
-        if not normalized.startswith(("http://", "https://")):
+        if not normalized:
             return
-        host = (urlparse(normalized).netloc or "").lower()
+        resolved = urljoin(page_url, normalized)
+        if not resolved.startswith(("http://", "https://")):
+            return
+        host = (urlparse(resolved).netloc or "").lower()
         if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
-            candidates.append(normalized)
+            candidates.append(resolved)
 
     for tag in soup.find_all(["a", "iframe", "script"]):
         maybe_add(tag.get("href") or tag.get("src"))
@@ -220,7 +367,287 @@ def extract_embedded_board_urls(page_url: str, html: str) -> list[str]:
     if page_url.startswith(("http://", "https://")):
         maybe_add(page_url)
 
+    return _dedupe_strings(candidates, limit=16)
+
+
+def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates: list[str] = []
+    parsed_page = urlparse(page_url) if page_url.startswith(("http://", "https://")) else None
+    page_host = (parsed_page.netloc or "").lower() if parsed_page else ""
+
+    def maybe_add(raw_url: str | None) -> None:
+        normalized = str(raw_url or "").strip()
+        if not normalized:
+            return
+        resolved = urljoin(page_url, normalized)
+        if not resolved.startswith(("http://", "https://")):
+            return
+        parsed = urlparse(resolved)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        if page_host and host != page_host:
+            return
+        if any(path.startswith(candidate) or candidate in path for candidate in COMMON_CAREERS_PATHS):
+            candidates.append(resolved.rstrip("/"))
+
+    for tag in soup.find_all("a"):
+        maybe_add(tag.get("href"))
     return _dedupe_strings(candidates, limit=12)
+
+
+def extract_company_homepage_urls(page_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates: list[str] = []
+    page_host = (urlparse(page_url).netloc or "").lower() if page_url.startswith(("http://", "https://")) else ""
+    for tag in soup.find_all("a"):
+        href = str(tag.get("href") or "").strip()
+        if not href:
+            continue
+        resolved = urljoin(page_url, href)
+        if not resolved.startswith(("http://", "https://")):
+            continue
+        parsed = urlparse(resolved)
+        host = (parsed.netloc or "").lower()
+        if not host or host == page_host:
+            continue
+        if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
+            continue
+        if any(fragment in host for fragment in LOW_TRUST_SCOUT_HOST_FRAGMENTS):
+            continue
+        candidates.append(f"{parsed.scheme}://{parsed.netloc}")
+    return _dedupe_strings(candidates, limit=16)
+
+
+def default_careers_candidate_urls(source_url: str | None) -> list[str]:
+    normalized = str(source_url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return []
+    parsed = urlparse(normalized)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    candidates = [f"{base}{path}" for path in COMMON_CAREERS_PATHS]
+    return _dedupe_strings(candidates, limit=8)
+
+
+def frontier_task_key(
+    task_type: str,
+    url: str,
+    *,
+    board_identifier: str | None = None,
+) -> str:
+    normalized_url = str(url).strip().rstrip("/")
+    suffix = f":{board_identifier}" if board_identifier else ""
+    return f"{task_type}:{normalized_url}{suffix}"
+
+
+def make_frontier_task(
+    *,
+    task_type: str,
+    url: str,
+    company_name: str | None = None,
+    company_key: str | None = None,
+    board_identifier: str | None = None,
+    source_kind: str | None = None,
+    source_trust: int | None = None,
+    priority: int = 0,
+    discovered_from: str | None = None,
+    attempts: int = 0,
+    status: str = "pending",
+    next_retry_at: str | None = None,
+) -> dict[str, Any]:
+    normalized_url = str(url or "").strip().rstrip("/")
+    normalized_company_key = company_key or _normalize_company_key(company_name)
+    return CompanyDiscoveryFrontierTask(
+        task_key=frontier_task_key(task_type, normalized_url, board_identifier=board_identifier),
+        task_type=task_type,
+        url=normalized_url,
+        company_name=company_name,
+        company_key=normalized_company_key or None,
+        board_identifier=board_identifier,
+        source_kind=source_kind or classify_source_kind(normalized_url, explicit_task_type=task_type),
+        source_trust=int(source_trust if source_trust is not None else trust_score_for_url(normalized_url, explicit_task_type=task_type)),
+        priority=int(priority),
+        attempts=int(attempts),
+        status=status,
+        discovered_from=discovered_from,
+        next_retry_at=next_retry_at,
+    ).model_dump(mode="json")
+
+
+def upsert_frontier_task(
+    tasks: list[dict[str, Any]],
+    *,
+    task_type: str,
+    url: str,
+    company_name: str | None = None,
+    company_key: str | None = None,
+    board_identifier: str | None = None,
+    source_kind: str | None = None,
+    source_trust: int | None = None,
+    priority: int = 0,
+    discovered_from: str | None = None,
+) -> bool:
+    task = make_frontier_task(
+        task_type=task_type,
+        url=url,
+        company_name=company_name,
+        company_key=company_key,
+        board_identifier=board_identifier,
+        source_kind=source_kind,
+        source_trust=source_trust,
+        priority=priority,
+        discovered_from=discovered_from,
+    )
+    task_key = task["task_key"]
+    for existing in tasks:
+        if str(existing.get("task_key") or "") != task_key:
+            continue
+        existing["priority"] = max(int(existing.get("priority") or 0), int(task["priority"] or 0))
+        existing["source_trust"] = max(int(existing.get("source_trust") or 0), int(task["source_trust"] or 0))
+        if not existing.get("company_name") and task.get("company_name"):
+            existing["company_name"] = task["company_name"]
+        if not existing.get("company_key") and task.get("company_key"):
+            existing["company_key"] = task["company_key"]
+        if existing.get("status") == "completed":
+            existing["status"] = "pending"
+        return False
+    tasks.append(task)
+    return True
+
+
+def select_frontier_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    budget: int,
+    task_types: set[str] | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    if budget <= 0:
+        return []
+    moment = now or datetime.now(UTC)
+
+    def is_ready(task: dict[str, Any]) -> bool:
+        if task_types and str(task.get("task_type") or "") not in task_types:
+            return False
+        if str(task.get("status") or "pending") != "pending":
+            return False
+        next_retry = _parse_datetime(str(task.get("next_retry_at") or ""))
+        return next_retry is None or next_retry <= moment
+
+    candidates = [task for task in tasks if is_ready(task)]
+    candidates.sort(
+        key=lambda task: (
+            -int(task.get("priority") or 0),
+            -int(task.get("source_trust") or 0),
+            int(task.get("attempts") or 0),
+            str(task.get("url") or ""),
+        )
+    )
+    return [dict(task) for task in candidates[:budget]]
+
+
+def update_frontier_task_state(
+    tasks: list[dict[str, Any]],
+    *,
+    task_key: str,
+    success: bool,
+    error: str | None = None,
+    keep_pending: bool = False,
+    retry_delay: timedelta = DEFAULT_FRONTIER_RETRY_DELAY,
+) -> None:
+    for task in tasks:
+        if str(task.get("task_key") or "") != task_key:
+            continue
+        task["attempts"] = int(task.get("attempts") or 0) + 1
+        task["last_attempted_at"] = _utc_now_iso()
+        if success and not keep_pending:
+            task["status"] = "completed"
+            task["next_retry_at"] = None
+            task["last_error"] = None
+        elif success and keep_pending:
+            task["status"] = "pending"
+            task["next_retry_at"] = None
+            task["last_error"] = None
+        else:
+            task["status"] = "pending"
+            task["next_retry_at"] = (datetime.now(UTC) + retry_delay).isoformat(timespec="seconds")
+            task["last_error"] = error
+        return
+
+
+def crawl_record_key(target_type: str, url: str, board_identifier: str | None = None) -> str:
+    normalized_url = str(url or "").strip().rstrip("/")
+    suffix = f":{board_identifier}" if board_identifier else ""
+    return f"{target_type}:{normalized_url}{suffix}"
+
+
+def record_crawl_result(
+    records: dict[str, dict[str, Any]],
+    *,
+    target_type: str,
+    url: str,
+    company_key: str | None = None,
+    board_identifier: str | None = None,
+    success: bool,
+    http_status: int | None = None,
+    error: str | None = None,
+    fresh_role_count: int = 0,
+) -> None:
+    key = crawl_record_key(target_type, url, board_identifier)
+    existing = CompanyDiscoveryCrawlRecord.model_validate(
+        {
+            "record_key": key,
+            "target_type": target_type,
+            "url": url,
+            "company_key": company_key,
+            "board_identifier": board_identifier,
+            **(records.get(key) or {}),
+        }
+    )
+    updated = existing.model_copy(
+        update={
+            "company_key": company_key or existing.company_key,
+            "board_identifier": board_identifier or existing.board_identifier,
+            "attempt_count": existing.attempt_count + 1,
+            "success_count": existing.success_count + (1 if success else 0),
+            "failure_count": existing.failure_count + (0 if success else 1),
+            "last_status": "success" if success else "failure",
+            "last_http_status": http_status,
+            "last_attempted_at": _utc_now_iso(),
+            "last_succeeded_at": _utc_now_iso() if success else existing.last_succeeded_at,
+            "last_error": None if success else error,
+            "last_fresh_role_count": int(fresh_role_count),
+        }
+    )
+    records[key] = updated.model_dump(mode="json")
+
+
+def append_company_discovery_audit_entry(
+    entries: list[dict[str, Any]],
+    payload: Mapping[str, Any],
+    *,
+    limit: int = 500,
+) -> None:
+    rendered = dict(payload)
+    rendered.setdefault("recorded_at", _utc_now_iso())
+    entries.append(rendered)
+    if len(entries) > limit:
+        del entries[:-limit]
+
+
+def source_directory_seed_tasks() -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for url in DIRECTORY_SOURCE_URLS:
+        tasks.append(
+            make_frontier_task(
+                task_type="directory_source",
+                url=url,
+                source_kind="directory_source",
+                source_trust=trust_score_for_url(url, explicit_task_type="directory_source"),
+                priority=3,
+            )
+        )
+    return tasks
 
 
 def upsert_company_discovery_entry(
@@ -237,6 +664,9 @@ def upsert_company_discovery_entry(
     run_id: str | None = None,
     ai_pm_candidate_delta: int = 0,
     official_board_lead_delta: int = 0,
+    source_kind: str | None = None,
+    board_crawl_succeeded: bool | None = None,
+    fresh_role_delta: int = 0,
 ) -> tuple[bool, int]:
     company_key = _normalize_company_key(company_name)
     if not company_key:
@@ -250,7 +680,7 @@ def upsert_company_discovery_entry(
         identifier = board_identifier_from_url(board_url)
         if identifier:
             new_board_identifiers.append(identifier)
-    deduped_board_identifiers = _dedupe_strings([*existing_board_identifiers, *new_board_identifiers], limit=16)
+    deduped_board_identifiers = _dedupe_strings([*existing_board_identifiers, *new_board_identifiers], limit=24)
     new_board_count = len(set(deduped_board_identifiers) - set(existing_board_identifiers))
     existing = CompanyDiscoveryEntry.model_validate(
         {
@@ -260,16 +690,20 @@ def upsert_company_discovery_entry(
             **entry,
         }
     )
+    source_key = source_kind or classify_source_kind(source_url)
+    source_type_counts = dict(existing.source_type_counts)
+    if source_key:
+        source_type_counts[source_key] = int(source_type_counts.get(source_key) or 0) + 1
     updated = existing.model_copy(
         update={
             "company_name": company_name,
-            "careers_roots": _dedupe_strings([*existing.careers_roots, *( [careers_root] if careers_root else [] )], limit=8),
+            "careers_roots": _dedupe_strings([*existing.careers_roots, *([careers_root] if careers_root else [])], limit=12),
             "ats_types": _dedupe_strings(
                 [*existing.ats_types, *(ats_types or []), *[value for value in (board_url_ats_type(url) for url in board_urls or []) if value]],
-                limit=8,
+                limit=12,
             ),
             "board_identifiers": deduped_board_identifiers,
-            "board_urls": _dedupe_strings([*existing.board_urls, *(board_urls or [])], limit=16),
+            "board_urls": _dedupe_strings([*existing.board_urls, *(board_urls or [])], limit=24),
             "source_hosts": _dedupe_strings(
                 [
                     *existing.source_hosts,
@@ -279,13 +713,22 @@ def upsert_company_discovery_entry(
                         else []
                     ),
                 ],
-                limit=8,
+                limit=12,
             ),
             "source_trust": max(existing.source_trust, int(source_trust or 0)),
             "last_seen_at": timestamp,
             "last_successful_discovery_run": run_id or existing.last_successful_discovery_run,
             "ai_pm_candidate_count": max(0, existing.ai_pm_candidate_count + int(ai_pm_candidate_delta or 0)),
             "official_board_lead_count": max(0, existing.official_board_lead_count + int(official_board_lead_delta or 0)),
+            "source_type_counts": source_type_counts,
+            "board_crawl_success_count": existing.board_crawl_success_count + (1 if board_crawl_succeeded is True else 0),
+            "board_crawl_failure_count": existing.board_crawl_failure_count + (1 if board_crawl_succeeded is False else 0),
+            "recent_fresh_role_count": max(0, existing.recent_fresh_role_count + int(fresh_role_delta or 0)),
+            "last_crawl_status": (
+                "success" if board_crawl_succeeded is True else "failure" if board_crawl_succeeded is False else existing.last_crawl_status
+            ),
+            "last_attempted_at": timestamp if board_crawl_succeeded is not None else existing.last_attempted_at,
+            "next_retry_at": None if board_crawl_succeeded is True else existing.next_retry_at,
         }
     )
     entries[company_key] = updated.model_dump(mode="json")

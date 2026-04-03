@@ -135,6 +135,12 @@ class SearchDiagnostics(BaseModel):
     companies_with_ai_pm_leads_count: int = 0
     principal_ai_pm_salary_presumption_count: int = 0
     official_roles_missed_count: int = 0
+    frontier_tasks_consumed_count: int = 0
+    frontier_backlog_count: int = 0
+    official_board_crawl_attempt_count: int = 0
+    official_board_crawl_success_count: int = 0
+    company_lead_counts: dict[str, int] = Field(default_factory=dict)
+    source_adapter_yields: dict[str, int] = Field(default_factory=dict)
     failures: list[SearchFailure] = Field(default_factory=list)
     passes: list[SearchPassSummary] = Field(default_factory=list)
     near_misses: list[NearMissJob] = Field(default_factory=list)
@@ -317,6 +323,9 @@ class RunManifest(BaseModel):
     total_current_validated_jobs_count: int = 0
     reacquired_jobs_json_path: str | None = None
     company_discovery_json_path: str | None = None
+    company_discovery_frontier_json_path: str | None = None
+    company_discovery_crawl_history_json_path: str | None = None
+    company_discovery_audit_json_path: str | None = None
     near_miss_docx_path: str | None = None
     near_miss_json_path: str | None = None
     ollama_summary_json_path: str | None = None
@@ -386,6 +395,12 @@ class RunDiscoveryMetrics(BaseModel):
     zero_yield_pass_count: int = 0
     discovery_efficiency: float = 0.0
     company_discovery_yield: float = 0.0
+    company_concentration_top_10_share: float = 0.0
+    frontier_tasks_consumed_count: int = 0
+    frontier_backlog_count: int = 0
+    official_board_crawl_success_rate: float = 0.0
+    new_company_to_fresh_lead_yield: float = 0.0
+    source_adapter_yields: dict[str, int] = Field(default_factory=dict)
 
 
 class RunValidationMetrics(BaseModel):
@@ -455,6 +470,9 @@ class RunScorecard(BaseModel):
     near_miss_json_path: str | None = None
     ollama_summary_json_path: str | None = None
     company_discovery_json_path: str | None = None
+    company_discovery_frontier_json_path: str | None = None
+    company_discovery_crawl_history_json_path: str | None = None
+    company_discovery_audit_json_path: str | None = None
 
 
 class ImprovementPattern(BaseModel):
@@ -521,6 +539,62 @@ class CompanyDiscoveryEntry(BaseModel):
     last_successful_discovery_run: str | None = None
     ai_pm_candidate_count: int = 0
     official_board_lead_count: int = 0
+    source_type_counts: dict[str, int] = Field(default_factory=dict)
+    board_crawl_success_count: int = 0
+    board_crawl_failure_count: int = 0
+    recent_fresh_role_count: int = 0
+    last_crawl_status: str | None = None
+    last_attempted_at: str | None = None
+    next_retry_at: str | None = None
+
+
+class CompanyDiscoveryFrontierTask(BaseModel):
+    task_key: str
+    task_type: Literal["company_page", "careers_root", "board_url", "portfolio_source", "directory_source"]
+    url: str
+    company_name: str | None = None
+    company_key: str | None = None
+    board_identifier: str | None = None
+    source_kind: str | None = None
+    source_trust: int = 0
+    priority: int = 0
+    attempts: int = 0
+    status: Literal["pending", "completed", "failed"] = "pending"
+    discovered_from: str | None = None
+    last_attempted_at: str | None = None
+    next_retry_at: str | None = None
+    last_error: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def validate_frontier_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return value
+
+
+class CompanyDiscoveryCrawlRecord(BaseModel):
+    record_key: str
+    target_type: Literal["company_page", "careers_root", "board_url", "directory_source", "portfolio_source"]
+    url: str
+    company_key: str | None = None
+    board_identifier: str | None = None
+    attempt_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    last_status: str | None = None
+    last_http_status: int | None = None
+    last_attempted_at: str | None = None
+    last_succeeded_at: str | None = None
+    last_error: str | None = None
+    last_fresh_role_count: int = 0
+
+    @field_validator("url")
+    @classmethod
+    def validate_crawl_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return value
 
 
 class AutoLoopIteration(BaseModel):

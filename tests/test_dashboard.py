@@ -25,7 +25,13 @@ def test_format_scorecard_summary_renders_primary_metrics() -> None:
                 "fresh_new_leads_count": 14,
                 "actionable_near_miss_count": 3,
             },
-            "discovery": {"query_timeout_count": 4, "new_companies_discovered_count": 3, "new_boards_discovered_count": 5},
+            "discovery": {
+                "query_timeout_count": 4,
+                "new_companies_discovered_count": 3,
+                "new_boards_discovered_count": 5,
+                "frontier_tasks_consumed_count": 6,
+                "frontier_backlog_count": 8,
+            },
             "validation": {"validated_yield": 0.143},
         }
     )
@@ -39,6 +45,8 @@ def test_format_scorecard_summary_renders_primary_metrics() -> None:
     assert "Actionable near-misses: 3" in rendered
     assert "New companies: 3" in rendered
     assert "New boards: 5" in rendered
+    assert "Frontier consumed: 6" in rendered
+    assert "Backlog: 8" in rendered
 
 
 def test_scorecard_detail_lines_include_discovery_and_ollama_context() -> None:
@@ -64,6 +72,12 @@ def test_scorecard_detail_lines_include_discovery_and_ollama_context() -> None:
                 "new_boards_discovered_count": 3,
                 "official_board_leads_count": 1,
                 "company_discovery_yield": 1.0,
+                "company_concentration_top_10_share": 0.8,
+                "frontier_tasks_consumed_count": 6,
+                "frontier_backlog_count": 8,
+                "official_board_crawl_success_rate": 0.5,
+                "new_company_to_fresh_lead_yield": 4.5,
+                "source_adapter_yields": {"ashby": 2, "directory_source": 4},
             },
             "validation": {
                 "message_coverage_rate": 0.5,
@@ -84,6 +98,8 @@ def test_scorecard_detail_lines_include_discovery_and_ollama_context() -> None:
     assert "Principal AI PM salary presumptions: 1" in lines
     assert "New companies discovered: 2" in lines
     assert "Official roles missed: 1" in lines
+    assert "Frontier tasks consumed: 6" in lines
+    assert "Official-board crawl success rate: 0.5" in lines
     assert "Replay seeds: 4" in lines
     assert "Reacquisition attempts: 2" in lines
     assert "Ollama requests: 2" in lines

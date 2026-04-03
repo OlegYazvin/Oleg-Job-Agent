@@ -133,6 +133,8 @@ def _format_scorecard_summary(scorecard: dict[str, Any] | None) -> str:
         f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}\n"
         f"New companies: {int(discovery.get('new_companies_discovered_count') or 0)} | "
         f"New boards: {int(discovery.get('new_boards_discovered_count') or 0)}\n"
+        f"Frontier consumed: {int(discovery.get('frontier_tasks_consumed_count') or 0)} | "
+        f"Backlog: {int(discovery.get('frontier_backlog_count') or 0)}\n"
         f"Timeouts: {int(discovery.get('query_timeout_count') or 0)} | "
         f"Validation yield: {validation.get('validated_yield', 0.0)}"
     )
@@ -159,6 +161,12 @@ def _scorecard_detail_lines(scorecard: dict[str, Any] | None) -> list[str]:
         f"New boards discovered: {int(discovery.get('new_boards_discovered_count') or 0)}",
         f"Official-board leads: {int(discovery.get('official_board_leads_count') or 0)}",
         f"Company discovery yield: {discovery.get('company_discovery_yield', 0.0)}",
+        f"Company concentration (top 10 share): {discovery.get('company_concentration_top_10_share', 0.0)}",
+        f"Frontier tasks consumed: {int(discovery.get('frontier_tasks_consumed_count') or 0)}",
+        f"Frontier backlog: {int(discovery.get('frontier_backlog_count') or 0)}",
+        f"Official-board crawl success rate: {discovery.get('official_board_crawl_success_rate', 0.0)}",
+        f"New company to fresh lead yield: {discovery.get('new_company_to_fresh_lead_yield', 0.0)}",
+        f"Source adapter yields: {dict(discovery.get('source_adapter_yields') or {})}",
         f"Replay seeds: {int(discovery.get('replayed_seed_leads_count') or 0)}",
         f"Reacquisition attempts: {int(discovery.get('reacquisition_attempt_count') or 0)}",
         f"Suppressed repeats: {int(discovery.get('reacquired_jobs_suppressed_count') or 0)}",

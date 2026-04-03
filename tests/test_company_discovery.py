@@ -3,7 +3,9 @@ from pathlib import Path
 from job_agent.company_discovery import (
     extract_embedded_board_urls,
     load_company_discovery_entries,
+    make_frontier_task,
     save_company_discovery_entries,
+    select_frontier_tasks,
     upsert_company_discovery_entry,
 )
 
@@ -59,3 +61,22 @@ def test_upsert_company_discovery_entry_merges_repeated_board_discoveries(tmp_pa
     reloaded = load_company_discovery_entries(tmp_path)
     assert reloaded["butterflymx"]["source_trust"] == 9
     assert "https://butterflymx.com/careers" in reloaded["butterflymx"]["careers_roots"]
+
+
+def test_select_frontier_tasks_only_returns_pending_ready_items() -> None:
+    tasks = [
+        make_frontier_task(task_type="directory_source", url="https://www.ycombinator.com/companies", priority=3),
+        {
+            **make_frontier_task(task_type="board_url", url="https://jobs.ashbyhq.com/butterflymx", priority=9),
+            "status": "completed",
+        },
+        {
+            **make_frontier_task(task_type="company_page", url="https://butterflymx.com", priority=5),
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+        },
+    ]
+
+    selected = select_frontier_tasks(tasks, budget=5)
+
+    assert len(selected) == 1
+    assert selected[0]["task_type"] == "directory_source"

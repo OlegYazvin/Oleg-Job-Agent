@@ -48,6 +48,9 @@ THEME_COMMIT_SUMMARIES = {
     "diversification_gap": "increase novel validated job discovery",
     "company_discovery_gap": "expand built-in company and board discovery",
     "official_board_coverage_gap": "close official board coverage gaps",
+    "discovery_starvation": "unblock discovery growth and index expansion",
+    "company_concentration_gap": "reduce overreliance on the same few companies",
+    "directory_source_yield_gap": "improve directory and careers-source yields",
     "salary_presumption_opportunity": "apply principal AI PM salary presumption",
     "general_iterative_improvement": "apply bounded iterative improvement",
 }
@@ -440,6 +443,15 @@ def _analysis_artifact_paths(settings: Settings, run_id: str | None) -> dict[str
     company_discovery_path = settings.data_dir / "company-discovery-index.json"
     if company_discovery_path.exists():
         artifact_paths["company_discovery_index"] = str(company_discovery_path)
+    frontier_path = settings.data_dir / "company-discovery-frontier.json"
+    if frontier_path.exists():
+        artifact_paths["company_discovery_frontier"] = str(frontier_path)
+    crawl_history_path = settings.data_dir / "company-discovery-crawl-history.json"
+    if crawl_history_path.exists():
+        artifact_paths["company_discovery_crawl_history"] = str(crawl_history_path)
+    audit_path = settings.data_dir / "company-discovery-audit.json"
+    if audit_path.exists():
+        artifact_paths["company_discovery_audit"] = str(audit_path)
     return artifact_paths
 
 
@@ -587,6 +599,24 @@ def _build_patterns(
         )
 
     if (
+        current.discovery.new_companies_discovered_count == 0
+        and current.discovery.new_boards_discovered_count == 0
+        and current.discovery.frontier_backlog_count <= 2
+        and current.outcome.fresh_new_leads_count <= 6
+    ):
+        patterns.append(
+            _pattern(
+                "discovery_starvation",
+                "The discovery frontier is not growing and fresh lead generation is starved; expand source adapters, frontier seeding, or board enumeration.",
+                40.0,
+                fresh_new_leads_count=current.outcome.fresh_new_leads_count,
+                frontier_backlog_count=current.discovery.frontier_backlog_count,
+                new_companies_discovered_count=current.discovery.new_companies_discovered_count,
+                new_boards_discovered_count=current.discovery.new_boards_discovered_count,
+            )
+        )
+
+    if (
         current.validation.official_roles_missed_count > 0
         or (
             current.discovery.official_board_leads_count > 0
@@ -600,6 +630,34 @@ def _build_patterns(
                 38.0,
                 official_board_leads_count=current.discovery.official_board_leads_count,
                 official_roles_missed_count=current.validation.official_roles_missed_count,
+            )
+        )
+
+    if current.discovery.company_concentration_top_10_share >= 0.75 and current.outcome.fresh_new_leads_count <= 8:
+        patterns.append(
+            _pattern(
+                "company_concentration_gap",
+                "Discovery is concentrating too heavily on the same small set of companies; prioritize new-company expansion and less recursive sourcing.",
+                36.0 + current.discovery.company_concentration_top_10_share * 10.0,
+                company_concentration_top_10_share=current.discovery.company_concentration_top_10_share,
+                fresh_new_leads_count=current.outcome.fresh_new_leads_count,
+            )
+        )
+
+    directory_yield = float(current.discovery.source_adapter_yields.get("directory_source") or 0)
+    if (
+        current.discovery.new_companies_discovered_count == 0
+        and directory_yield == 0
+        and current.outcome.total_current_validated_jobs_count == 0
+        and current.outcome.fresh_new_leads_count <= 6
+    ):
+        patterns.append(
+            _pattern(
+                "directory_source_yield_gap",
+                "Directory and ecosystem sources are not producing new company frontier expansion; improve homepage extraction, careers crawling, or source coverage.",
+                33.0,
+                directory_source_yield=directory_yield,
+                new_companies_discovered_count=current.discovery.new_companies_discovered_count,
             )
         )
 
@@ -772,6 +830,9 @@ def _metric_deltas(window: list[RunScorecard]) -> dict[str, float]:
     previous_timeouts = _average_metric(previous_entries, lambda item: item.discovery.query_timeout_count)
     previous_messages = _average_metric(previous_entries, lambda item: item.outcome.jobs_with_messages_count)
     previous_ollama = _average_metric(previous_entries, lambda item: item.ollama.request_count)
+    previous_new_companies = _average_metric(previous_entries, lambda item: item.discovery.new_companies_discovered_count)
+    previous_new_boards = _average_metric(previous_entries, lambda item: item.discovery.new_boards_discovered_count)
+    previous_official_board_leads = _average_metric(previous_entries, lambda item: item.discovery.official_board_leads_count)
     return {
         "validated_jobs_delta": round(current.outcome.novel_validated_jobs_count - previous_validated, 3),
         "total_current_validated_jobs_delta": round(
@@ -782,6 +843,15 @@ def _metric_deltas(window: list[RunScorecard]) -> dict[str, float]:
         "query_timeout_delta": round(current.discovery.query_timeout_count - previous_timeouts, 3),
         "jobs_with_messages_delta": round(current.outcome.jobs_with_messages_count - previous_messages, 3),
         "ollama_request_delta": round(current.ollama.request_count - previous_ollama, 3),
+        "new_companies_discovered_delta": round(
+            current.discovery.new_companies_discovered_count - previous_new_companies,
+            3,
+        ),
+        "new_boards_discovered_delta": round(current.discovery.new_boards_discovered_count - previous_new_boards, 3),
+        "official_board_leads_delta": round(
+            current.discovery.official_board_leads_count - previous_official_board_leads,
+            3,
+        ),
     }
 
 
@@ -802,6 +872,11 @@ def _scorecard_metrics_for_run(settings: Settings, run_id: str | None) -> dict[s
             "new_companies_discovered_count": entry.discovery.new_companies_discovered_count,
             "new_boards_discovered_count": entry.discovery.new_boards_discovered_count,
             "official_board_leads_count": entry.discovery.official_board_leads_count,
+            "frontier_tasks_consumed_count": entry.discovery.frontier_tasks_consumed_count,
+            "frontier_backlog_count": entry.discovery.frontier_backlog_count,
+            "official_board_crawl_success_rate": entry.discovery.official_board_crawl_success_rate,
+            "company_concentration_top_10_share": entry.discovery.company_concentration_top_10_share,
+            "new_company_to_fresh_lead_yield": entry.discovery.new_company_to_fresh_lead_yield,
             "principal_ai_pm_salary_presumption_count": entry.validation.principal_ai_pm_salary_presumption_count,
         }
     return {}
@@ -836,10 +911,21 @@ def _rerun_metrics_are_acceptable(
     after_messages = float(after_metrics.get("jobs_with_messages_count") or 0)
     before_timeouts = float(before_metrics.get("query_timeout_count") or 0)
     after_timeouts = float(after_metrics.get("query_timeout_count") or 0)
+    before_new_companies = float(before_metrics.get("new_companies_discovered_count") or 0)
+    after_new_companies = float(after_metrics.get("new_companies_discovered_count") or 0)
+    before_new_boards = float(before_metrics.get("new_boards_discovered_count") or 0)
+    after_new_boards = float(after_metrics.get("new_boards_discovered_count") or 0)
+    before_official_board_leads = float(before_metrics.get("official_board_leads_count") or 0)
+    after_official_board_leads = float(after_metrics.get("official_board_leads_count") or 0)
+    discovery_progress = (
+        after_new_companies > before_new_companies
+        or after_new_boards > before_new_boards
+        or after_official_board_leads > before_official_board_leads
+    )
     return (
         after_total >= before_total
         and after_messages >= before_messages
-        and after_fresh >= max(0.0, before_fresh - 2.0)
+        and (after_fresh >= max(0.0, before_fresh - 2.0) or discovery_progress)
         and after_timeouts <= before_timeouts + 3.0
     )
 
@@ -882,7 +968,13 @@ def build_run_improvement_analysis(
             "official_board_leads_count": current.discovery.official_board_leads_count,
             "companies_with_ai_pm_leads_count": current.discovery.companies_with_ai_pm_leads_count,
             "company_discovery_yield": current.discovery.company_discovery_yield,
-            "discovery_efficiency": current.discovery.discovery_efficiency,
+                "company_concentration_top_10_share": current.discovery.company_concentration_top_10_share,
+                "frontier_tasks_consumed_count": current.discovery.frontier_tasks_consumed_count,
+                "frontier_backlog_count": current.discovery.frontier_backlog_count,
+                "official_board_crawl_success_rate": current.discovery.official_board_crawl_success_rate,
+                "new_company_to_fresh_lead_yield": current.discovery.new_company_to_fresh_lead_yield,
+                "source_adapter_yields": json.dumps(current.discovery.source_adapter_yields, sort_keys=True),
+                "discovery_efficiency": current.discovery.discovery_efficiency,
             "validated_yield": current.validation.validated_yield,
             "novel_validated_yield": current.validation.novel_validated_yield,
             "reacquisition_yield": current.validation.reacquisition_yield,
@@ -988,6 +1080,7 @@ def render_codex_prompt(
             "Required behavior:",
             "- Inspect the repository and relevant artifacts as needed.",
             "- Make the code changes yourself.",
+            "- It is allowed to add or expand discovery lanes, persistent indexes/frontiers, source adapters, or instrumentation when that is the highest-yield path.",
             "- Run the required validation check(s).",
             "- Summarize what changed, what tests ran, and whether they passed.",
             "- The controller may rerun the workflow after your changes to measure before/after behavior; you do not need to run it yourself.",

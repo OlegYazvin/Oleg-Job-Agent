@@ -98,6 +98,8 @@ def build_summary_document(
     output_dir: Path,
     *,
     reacquired_jobs: list[JobPosting] | None = None,
+    discovery_summary: dict[str, object] | None = None,
+    official_board_audit: list[dict[str, object]] | None = None,
     generated_at: datetime | None = None,
 ) -> Path:
     generated_at = generated_at or datetime.now(UTC)
@@ -152,6 +154,43 @@ def build_summary_document(
             evidence_summary = job.evidence_notes or (job.validation_evidence[0] if job.validation_evidence else "")
             if evidence_summary:
                 document.add_paragraph(f"Current validation evidence: {evidence_summary}")
+
+    if discovery_summary:
+        document.add_heading("Discovery Expansion", level=1)
+        for label, key in (
+            ("New companies discovered", "new_companies_discovered_count"),
+            ("New boards discovered", "new_boards_discovered_count"),
+            ("Official board leads", "official_board_leads_count"),
+            ("Companies with AI PM leads", "companies_with_ai_pm_leads_count"),
+            ("Frontier tasks consumed", "frontier_tasks_consumed_count"),
+            ("Frontier backlog", "frontier_backlog_count"),
+        ):
+            document.add_paragraph(f"{label}: {discovery_summary.get(key, 0)}")
+        adapter_yields = dict(discovery_summary.get("source_adapter_yields") or {})
+        if adapter_yields:
+            document.add_paragraph(f"Source adapter yields: {adapter_yields}")
+
+    audit_items = list(official_board_audit or [])
+    if audit_items:
+        document.add_heading("Official Board Audit", level=1)
+        for item in audit_items[:12]:
+            status = str(item.get("status") or "").strip() or "unknown"
+            company = str(item.get("company_name") or "").strip() or "Unknown Company"
+            role = str(item.get("role_title") or "").strip()
+            board_identifier = str(item.get("board_identifier") or "").strip()
+            document.add_paragraph(
+                " | ".join(
+                    part
+                    for part in (
+                        company,
+                        role,
+                        board_identifier,
+                        status,
+                        str(item.get("direct_job_url") or item.get("board_url") or "").strip(),
+                    )
+                    if part
+                )
+            )
 
     path = output_dir / f"job_summary-{_timestamp_slug(generated_at)}.docx"
     document.save(path)
@@ -332,6 +371,9 @@ def build_manifest(
     near_misses: list[NearMissJob] | None = None,
     reacquired_jobs_json_path: Path | None = None,
     company_discovery_json_path: Path | None = None,
+    company_discovery_frontier_json_path: Path | None = None,
+    company_discovery_crawl_history_json_path: Path | None = None,
+    company_discovery_audit_json_path: Path | None = None,
     near_miss_docx_path: Path | None = None,
     near_miss_json_path: Path | None = None,
     ollama_summary_json_path: Path | None = None,
@@ -356,6 +398,15 @@ def build_manifest(
         total_current_validated_jobs_count=novel_validated_jobs_count + reacquired_validated_jobs_count,
         reacquired_jobs_json_path=str(reacquired_jobs_json_path) if reacquired_jobs_json_path else None,
         company_discovery_json_path=str(company_discovery_json_path) if company_discovery_json_path else None,
+        company_discovery_frontier_json_path=(
+            str(company_discovery_frontier_json_path) if company_discovery_frontier_json_path else None
+        ),
+        company_discovery_crawl_history_json_path=(
+            str(company_discovery_crawl_history_json_path) if company_discovery_crawl_history_json_path else None
+        ),
+        company_discovery_audit_json_path=(
+            str(company_discovery_audit_json_path) if company_discovery_audit_json_path else None
+        ),
         near_miss_docx_path=str(near_miss_docx_path) if near_miss_docx_path else None,
         near_miss_json_path=str(near_miss_json_path) if near_miss_json_path else None,
         ollama_summary_json_path=str(ollama_summary_json_path) if ollama_summary_json_path else None,

@@ -321,6 +321,25 @@ def build_run_scorecard(
         for item in diagnostics_payload.get("passes", [])
         if isinstance(item, Mapping) and int(item.get("unique_leads_discovered") or 0) == 0
     )
+    company_lead_counts = {
+        str(key): int(value or 0)
+        for key, value in dict(diagnostics_payload.get("company_lead_counts") or {}).items()
+        if str(key).strip()
+    }
+    source_adapter_yields = {
+        str(key): int(value or 0)
+        for key, value in dict(diagnostics_payload.get("source_adapter_yields") or {}).items()
+        if str(key).strip()
+    }
+    total_company_leads = sum(company_lead_counts.values())
+    company_concentration_top_10_share = (
+        round(sum(sorted(company_lead_counts.values(), reverse=True)[:10]) / total_company_leads, 3)
+        if total_company_leads
+        else 0.0
+    )
+    new_companies_discovered_count = int(diagnostics_payload.get("new_companies_discovered_count") or 0)
+    official_board_crawl_attempt_count = int(diagnostics_payload.get("official_board_crawl_attempt_count") or 0)
+    official_board_crawl_success_count = int(diagnostics_payload.get("official_board_crawl_success_count") or 0)
 
     started_at = str((status_payload or {}).get("started_at") or "").strip() or None
     ended_at = (
@@ -368,7 +387,7 @@ def build_run_scorecard(
             replayed_seed_leads_count=replayed_seed_leads_count,
             reacquisition_attempt_count=reacquisition_attempt_count,
             reacquired_jobs_suppressed_count=reacquired_jobs_suppressed_count,
-            new_companies_discovered_count=int(diagnostics_payload.get("new_companies_discovered_count") or 0),
+            new_companies_discovered_count=new_companies_discovered_count,
             new_boards_discovered_count=int(diagnostics_payload.get("new_boards_discovered_count") or 0),
             official_board_leads_count=int(diagnostics_payload.get("official_board_leads_count") or 0),
             companies_with_ai_pm_leads_count=int(diagnostics_payload.get("companies_with_ai_pm_leads_count") or 0),
@@ -380,9 +399,22 @@ def build_run_scorecard(
             discovery_efficiency=round(fresh_new_leads_count / executed_query_count, 3) if executed_query_count else 0.0,
             company_discovery_yield=round(
                 int(diagnostics_payload.get("companies_with_ai_pm_leads_count") or 0)
-                / max(1, int(diagnostics_payload.get("new_companies_discovered_count") or 0)),
+                / max(1, new_companies_discovered_count),
                 3,
             ),
+            company_concentration_top_10_share=company_concentration_top_10_share,
+            frontier_tasks_consumed_count=int(diagnostics_payload.get("frontier_tasks_consumed_count") or 0),
+            frontier_backlog_count=int(diagnostics_payload.get("frontier_backlog_count") or 0),
+            official_board_crawl_success_rate=round(
+                official_board_crawl_success_count / official_board_crawl_attempt_count,
+                3,
+            )
+            if official_board_crawl_attempt_count
+            else 0.0,
+            new_company_to_fresh_lead_yield=round(fresh_new_leads_count / new_companies_discovered_count, 3)
+            if new_companies_discovered_count
+            else 0.0,
+            source_adapter_yields=source_adapter_yields,
         ),
         validation=RunValidationMetrics(
             validated_jobs_count=validated_jobs_count,
@@ -447,6 +479,15 @@ def build_run_scorecard(
         near_miss_json_path=str(manifest_payload.get("near_miss_json_path") or "") or None,
         ollama_summary_json_path=str(manifest_payload.get("ollama_summary_json_path") or "") or None,
         company_discovery_json_path=str(manifest_payload.get("company_discovery_json_path") or "") or None,
+        company_discovery_frontier_json_path=(
+            str(manifest_payload.get("company_discovery_frontier_json_path") or "") or None
+        ),
+        company_discovery_crawl_history_json_path=(
+            str(manifest_payload.get("company_discovery_crawl_history_json_path") or "") or None
+        ),
+        company_discovery_audit_json_path=(
+            str(manifest_payload.get("company_discovery_audit_json_path") or "") or None
+        ),
     )
 
 

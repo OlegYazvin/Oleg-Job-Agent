@@ -17,13 +17,32 @@ from bs4 import BeautifulSoup
 import httpx
 
 from .company_discovery import (
+    append_company_discovery_audit_entry,
     board_identifier_from_url,
     board_url_ats_type,
+    company_discovery_audit_path,
+    company_discovery_crawl_history_path,
+    company_discovery_frontier_path,
     company_discovery_index_path,
+    default_careers_candidate_urls,
+    extract_careers_page_urls,
+    extract_company_homepage_urls,
     extract_embedded_board_urls,
     infer_careers_root,
+    load_company_discovery_audit,
+    load_company_discovery_crawl_history,
     load_company_discovery_entries,
+    load_company_discovery_frontier,
+    record_crawl_result,
+    save_company_discovery_audit,
+    save_company_discovery_crawl_history,
     save_company_discovery_entries,
+    save_company_discovery_frontier,
+    select_frontier_tasks,
+    source_directory_seed_tasks,
+    trust_score_for_url,
+    update_frontier_task_state,
+    upsert_frontier_task,
     upsert_company_discovery_entry,
 )
 from .config import Settings
@@ -318,6 +337,7 @@ BUILTIN_HTML_CACHE: dict[str, str] = {}
 BUILTIN_LEAD_CACHE: dict[str, JobLead | None] = {}
 GREENHOUSE_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 ASHBY_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
+LEVER_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 SEARCH_ENGINE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -2517,10 +2537,16 @@ def _build_company_discovery_seed_queries(settings: Settings, tuning: SearchTuni
     role_terms = [
         "\"Principal Product Manager\" AI remote",
         "\"Principal Product Manager\" \"machine learning\" remote",
-        "\"Senior Product Manager\" AI remote",
+        "\"Principal Product Manager\" GenAI remote",
         "\"Staff Product Manager\" AI remote",
+        "\"Group Product Manager\" AI remote",
+        "\"Lead Product Manager\" AI remote",
+        "\"Senior Product Manager\" AI remote",
         "\"AI Product Manager\" remote",
         "\"AI platform product manager\" remote",
+        "\"agentic AI\" \"product manager\" remote",
+        "\"applied AI\" \"product manager\" remote",
+        "\"model platform\" \"product manager\" remote",
     ]
     ats_domains = [
         "jobs.ashbyhq.com",
@@ -2530,6 +2556,18 @@ def _build_company_discovery_seed_queries(settings: Settings, tuning: SearchTuni
         "myworkdayjobs.com",
         "careers.workday.com",
         "jobs.smartrecruiters.com",
+        "jobs.icims.com",
+        "jobs.workable.com",
+        "jobs.jobvite.com",
+        "jobs.recruitee.com",
+        "careers.tellent.com",
+        "ats.rippling.com",
+    ]
+    directory_domains = [
+        "www.ycombinator.com",
+        "www.workatastartup.com",
+        "wellfound.com",
+        "www.builtin.com",
     ]
     recency_terms = _current_recency_terms(settings.timezone)
     queries: list[str] = []
@@ -2537,7 +2575,9 @@ def _build_company_discovery_seed_queries(settings: Settings, tuning: SearchTuni
         for domain in ats_domains:
             queries.append(f"{role_term} site:{domain}")
             queries.append(f"{role_term} site:{domain} {recency_terms[0]}")
-    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 10)]
+        for domain in directory_domains:
+            queries.append(f"{role_term} site:{domain}")
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 3, 18)]
 
 
 def _build_local_small_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
@@ -4890,6 +4930,17 @@ def _extract_ashby_board_token(url: str) -> str | None:
     return segments[0].lower()
 
 
+def _extract_lever_board_token(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if "jobs.lever.co" not in host:
+        return None
+    segments = _path_segments(parsed.path)
+    if not segments:
+        return None
+    return segments[0].lower()
+
+
 async def _fetch_ashby_board_jobs(board_token: str) -> list[dict[str, object]]:
     cached = ASHBY_BOARD_JOBS_CACHE.get(board_token)
     if cached is not None:
@@ -4921,6 +4972,38 @@ async def _fetch_ashby_board_jobs(board_token: str) -> list[dict[str, object]]:
     normalized_jobs = [job for job in jobs if isinstance(job, dict)]
     ASHBY_BOARD_JOBS_CACHE[board_token] = normalized_jobs
     return normalized_jobs
+
+
+async def _fetch_lever_board_jobs(board_token: str) -> list[dict[str, object]]:
+    cached = LEVER_BOARD_JOBS_CACHE.get(board_token)
+    if cached is not None:
+        return cached
+
+    api_url = f"https://api.lever.co/v0/postings/{board_token}?mode=json"
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20.0,
+        ) as client:
+            response = await client.get(api_url)
+    except httpx.RequestError:
+        LEVER_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    if response.status_code != 200:
+        LEVER_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        LEVER_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    if not isinstance(payload, list):
+        LEVER_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    jobs = [job for job in payload if isinstance(job, dict)]
+    LEVER_BOARD_JOBS_CACHE[board_token] = jobs
+    return jobs
 
 
 def _greenhouse_board_job_match_score(lead: JobLead, job: dict[str, object]) -> int:
@@ -5036,6 +5119,48 @@ def _ashby_board_job_to_lead(
     )
 
 
+def _lever_board_job_to_lead(
+    board_token: str,
+    company_name: str,
+    job: dict[str, object],
+) -> JobLead | None:
+    title = str(job.get("text") or job.get("title") or "").strip()
+    direct_job_url = _normalize_direct_job_url(str(job.get("hostedUrl") or job.get("applyUrl") or "").strip())
+    if not title or not direct_job_url.startswith(("http://", "https://")):
+        return None
+    categories = job.get("categories") if isinstance(job.get("categories"), dict) else {}
+    location_text = str(categories.get("location") or "").strip()
+    description_text = str(job.get("descriptionPlain") or job.get("description") or "").strip()
+    if not _is_ai_related_product_manager_text(" ".join(part for part in (title, description_text) if part)):
+        return None
+    workplace_type = str(categories.get("commitment") or "").strip()
+    salary_text = None
+    salary_range = job.get("salaryRange") if isinstance(job.get("salaryRange"), dict) else {}
+    if salary_range:
+        interval = str(salary_range.get("interval") or "").strip()
+        min_salary = salary_range.get("min")
+        max_salary = salary_range.get("max")
+        currency = str(salary_range.get("currency") or "USD").strip()
+        if isinstance(min_salary, (int, float)) and isinstance(max_salary, (int, float)):
+            salary_text = f"{currency} {int(min_salary):,} - {int(max_salary):,} {interval}".strip()
+    is_remote_hint = "remote" in " ".join([location_text, workplace_type]).lower()
+    created_at = str(job.get("createdAt") or "").strip()
+    return JobLead(
+        company_name=company_name,
+        role_title=title,
+        source_url=f"https://jobs.lever.co/{board_token}",
+        source_type="direct_ats",
+        direct_job_url=direct_job_url,
+        location_hint=location_text,
+        posted_date_hint=created_at[:10] or None,
+        is_remote_hint=is_remote_hint or None,
+        salary_text_hint=salary_text,
+        source_query=f"company_discovery:lever:{board_token}",
+        evidence_notes="Discovered via official Lever board enumeration.",
+        source_quality_score_hint=10,
+    )
+
+
 def _company_discovery_trust_score(lead: JobLead) -> int:
     if lead.source_type == "direct_ats":
         return 10
@@ -5044,6 +5169,49 @@ def _company_discovery_trust_score(lead: JobLead) -> int:
     if lead.direct_job_url and _is_allowed_direct_job_url(lead.direct_job_url):
         return 8
     return 5
+
+
+def _increment_metric_count(bucket: dict[str, int], key: str | None, delta: int = 1) -> None:
+    normalized_key = str(key or "").strip()
+    if not normalized_key or delta == 0:
+        return
+    bucket[normalized_key] = int(bucket.get(normalized_key) or 0) + int(delta)
+
+
+def _frontier_task_kwargs(task: dict[str, object]) -> dict[str, object]:
+    return {
+        "task_type": str(task.get("task_type") or "").strip(),
+        "url": str(task.get("url") or "").strip(),
+        "company_name": str(task.get("company_name") or "").strip() or None,
+        "company_key": str(task.get("company_key") or "").strip() or None,
+        "board_identifier": str(task.get("board_identifier") or "").strip() or None,
+        "source_kind": str(task.get("source_kind") or "").strip() or None,
+        "source_trust": int(task.get("source_trust") or 0),
+        "priority": int(task.get("priority") or 0),
+        "discovered_from": str(task.get("discovered_from") or "").strip() or None,
+    }
+
+
+def _company_name_for_frontier_task(
+    task: dict[str, object],
+    entries: dict[str, dict[str, object]],
+) -> str:
+    company_name = str(task.get("company_name") or "").strip()
+    if company_name:
+        return company_name
+    company_key = str(task.get("company_key") or "").strip()
+    if company_key and company_key in entries:
+        entry_name = str(entries[company_key].get("company_name") or "").strip()
+        if entry_name:
+            return entry_name
+    url = str(task.get("url") or "").strip()
+    if url:
+        inferred = _company_hint_from_url(url)
+        if inferred:
+            return inferred
+    if company_key:
+        return _title_case_company_name(company_key)
+    return "Unknown Company"
 
 
 def _upsert_company_discovery_from_lead(
@@ -5120,16 +5288,428 @@ async def _collect_company_discovery_seed_leads(
     *,
     discovery_agent: Agent | None,
     run_id: str | None,
-) -> tuple[list[JobLead], dict[str, int]]:
+) -> tuple[list[JobLead], dict[str, object]]:
     entries = load_company_discovery_entries(settings.data_dir)
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    crawl_history = load_company_discovery_crawl_history(settings.data_dir)
+    audit_entries = load_company_discovery_audit(settings.data_dir)
     new_company_keys: set[str] = set()
     new_board_identifiers: set[str] = set()
     company_keys_with_ai_pm_leads: set[str] = set()
     official_board_leads_count = 0
+    official_roles_missed_count = 0
+    frontier_tasks_consumed_count = 0
+    official_board_crawl_attempt_count = 0
+    official_board_crawl_success_count = 0
+    source_adapter_yields: Counter[str] = Counter()
 
     query_leads: list[JobLead] = []
+    official_board_leads: list[JobLead] = []
+
+    def _queue_frontier_url(
+        *,
+        url: str | None,
+        company_name: str | None,
+        discovered_from: str | None,
+        priority: int,
+        preferred_task_type: str | None = None,
+    ) -> None:
+        normalized_url = str(url or "").strip()
+        if not normalized_url.startswith(("http://", "https://")):
+            return
+        source_trust = trust_score_for_url(normalized_url, explicit_task_type=preferred_task_type)
+        if source_trust <= 0 or source_trust > settings.company_discovery_source_max_trust:
+            return
+        board_identifier = board_identifier_from_url(normalized_url)
+        if board_identifier:
+            upsert_frontier_task(
+                frontier,
+                task_type="board_url",
+                url=normalized_url,
+                company_name=company_name,
+                company_key=_normalize_company_key(company_name),
+                board_identifier=board_identifier,
+                source_kind="board_url",
+                source_trust=source_trust,
+                priority=max(priority, 9),
+                discovered_from=discovered_from,
+            )
+            return
+        task_type = preferred_task_type or ("careers_root" if "/careers" in normalized_url.lower() or normalized_url.lower().endswith("/jobs") else "company_page")
+        upsert_frontier_task(
+            frontier,
+            task_type=task_type,
+            url=normalized_url,
+            company_name=company_name,
+            company_key=_normalize_company_key(company_name),
+            source_kind=task_type,
+            source_trust=source_trust,
+            priority=priority,
+            discovered_from=discovered_from,
+        )
+
+    def _record_company_discovery_lead(lead: JobLead, *, source_adapter: str) -> None:
+        was_new_company, new_board_count = _upsert_company_discovery_from_lead(
+            entries,
+            lead,
+            run_id=run_id,
+            ai_pm_candidate_delta=1,
+        )
+        company_key = _normalize_company_key(lead.company_name)
+        if was_new_company and company_key:
+            new_company_keys.add(company_key)
+        if new_board_count:
+            for identifier in (
+                board_identifier_from_url(lead.direct_job_url),
+                board_identifier_from_url(lead.source_url),
+            ):
+                if identifier:
+                    new_board_identifiers.add(identifier)
+        if company_key:
+            company_keys_with_ai_pm_leads.add(company_key)
+        _increment_metric_count(source_adapter_yields, source_adapter)
+        _queue_frontier_url(
+            url=lead.source_url,
+            company_name=lead.company_name,
+            discovered_from=lead.source_query or source_adapter,
+            priority=7,
+            preferred_task_type="company_page",
+        )
+        _queue_frontier_url(
+            url=lead.direct_job_url,
+            company_name=lead.company_name,
+            discovered_from=lead.source_query or source_adapter,
+            priority=10,
+            preferred_task_type="board_url",
+        )
+        for careers_candidate in default_careers_candidate_urls(lead.source_url):
+            _queue_frontier_url(
+                url=careers_candidate,
+                company_name=lead.company_name,
+                discovered_from=lead.source_query or source_adapter,
+                priority=6,
+                preferred_task_type="careers_root",
+            )
+
+    async def _crawl_board_frontier(*, budget: int, phase_label: str) -> None:
+        nonlocal official_board_leads_count
+        nonlocal official_roles_missed_count
+        nonlocal frontier_tasks_consumed_count
+        nonlocal official_board_crawl_attempt_count
+        nonlocal official_board_crawl_success_count
+
+        for task in select_frontier_tasks(frontier, budget=budget, task_types={"board_url"}):
+            task_key = str(task.get("task_key") or "")
+            task_url = str(task.get("url") or "").strip()
+            board_identifier = str(task.get("board_identifier") or board_identifier_from_url(task_url) or "").strip()
+            if not task_url or not board_identifier:
+                update_frontier_task_state(frontier, task_key=task_key, success=False, error="missing_board_identifier")
+                record_crawl_result(
+                    crawl_history,
+                    target_type="board_url",
+                    url=task_url,
+                    company_key=str(task.get("company_key") or "").strip() or None,
+                    board_identifier=board_identifier or None,
+                    success=False,
+                    error="missing_board_identifier",
+                )
+                official_roles_missed_count += 1
+                frontier_tasks_consumed_count += 1
+                continue
+
+            prefix, _, token = board_identifier.partition(":")
+            company_name = _company_name_for_frontier_task(task, entries)
+            company_key = _normalize_company_key(company_name)
+            leads_for_task: list[JobLead] = []
+            official_board_crawl_attempt_count += 1
+            frontier_tasks_consumed_count += 1
+
+            try:
+                if prefix == "greenhouse" and token:
+                    leads_for_task = [
+                        lead
+                        for lead in (
+                            _greenhouse_board_job_to_lead(token, company_name, job)
+                            for job in await _fetch_greenhouse_board_jobs(token)
+                        )
+                        if lead is not None
+                    ]
+                elif prefix == "ashby" and token:
+                    leads_for_task = [
+                        lead
+                        for lead in (
+                            _ashby_board_job_to_lead(token, company_name, job)
+                            for job in await _fetch_ashby_board_jobs(token)
+                        )
+                        if lead is not None
+                    ]
+                elif prefix == "lever" and token:
+                    leads_for_task = [
+                        lead
+                        for lead in (
+                            _lever_board_job_to_lead(token, company_name, job)
+                            for job in await _fetch_lever_board_jobs(token)
+                        )
+                        if lead is not None
+                    ]
+                else:
+                    append_company_discovery_audit_entry(
+                        audit_entries,
+                        {
+                            "run_id": run_id,
+                            "phase": phase_label,
+                            "status": "unsupported_adapter",
+                            "company_name": company_name,
+                            "board_identifier": board_identifier,
+                            "board_url": task_url,
+                        },
+                    )
+                    update_frontier_task_state(frontier, task_key=task_key, success=False, error="unsupported_adapter")
+                    record_crawl_result(
+                        crawl_history,
+                        target_type="board_url",
+                        url=task_url,
+                        company_key=company_key or None,
+                        board_identifier=board_identifier,
+                        success=False,
+                        error="unsupported_adapter",
+                    )
+                    official_roles_missed_count += 1
+                    continue
+            except Exception as exc:
+                update_frontier_task_state(frontier, task_key=task_key, success=False, error=str(exc))
+                record_crawl_result(
+                    crawl_history,
+                    target_type="board_url",
+                    url=task_url,
+                    company_key=company_key or None,
+                    board_identifier=board_identifier,
+                    success=False,
+                    error=str(exc),
+                )
+                append_company_discovery_audit_entry(
+                    audit_entries,
+                    {
+                        "run_id": run_id,
+                        "phase": phase_label,
+                        "status": "crawl_failed",
+                        "company_name": company_name,
+                        "board_identifier": board_identifier,
+                        "board_url": task_url,
+                        "error": str(exc),
+                    },
+                )
+                official_roles_missed_count += 1
+                continue
+
+            official_board_crawl_success_count += 1
+            record_crawl_result(
+                crawl_history,
+                target_type="board_url",
+                url=task_url,
+                company_key=company_key or None,
+                board_identifier=board_identifier,
+                success=True,
+                fresh_role_count=len(leads_for_task),
+            )
+            update_frontier_task_state(frontier, task_key=task_key, success=True)
+            was_new_company, new_board_count = upsert_company_discovery_entry(
+                entries,
+                company_name=company_name,
+                source_url=task_url,
+                careers_root=infer_careers_root(task_url),
+                board_urls=[task_url],
+                board_identifiers=[board_identifier],
+                ats_types=[board_url_ats_type(task_url)] if board_url_ats_type(task_url) else [],
+                source_trust=max(int(task.get("source_trust") or 0), 9),
+                run_id=run_id,
+                ai_pm_candidate_delta=len(leads_for_task),
+                official_board_lead_delta=len(leads_for_task),
+                source_kind="board_url",
+                board_crawl_succeeded=True,
+                fresh_role_delta=len(leads_for_task),
+            )
+            if was_new_company and company_key:
+                new_company_keys.add(company_key)
+            if new_board_count:
+                new_board_identifiers.add(board_identifier)
+            if company_key and leads_for_task:
+                company_keys_with_ai_pm_leads.add(company_key)
+            _increment_metric_count(source_adapter_yields, prefix, len(leads_for_task))
+
+            for lead in leads_for_task:
+                official_board_leads.append(lead)
+                official_board_leads_count += 1
+                append_company_discovery_audit_entry(
+                    audit_entries,
+                    {
+                        "run_id": run_id,
+                        "phase": phase_label,
+                        "status": "surfaced",
+                        "company_name": lead.company_name,
+                        "role_title": lead.role_title,
+                        "board_identifier": board_identifier,
+                        "board_url": task_url,
+                        "direct_job_url": lead.direct_job_url,
+                    },
+                )
+
+    if settings.company_discovery_indexer_enabled:
+        for seeded_task in source_directory_seed_tasks():
+            upsert_frontier_task(frontier, **_frontier_task_kwargs(seeded_task))
+
+        for company_key, entry in sorted(
+            entries.items(),
+            key=lambda item: (
+                -int(item[1].get("official_board_lead_count") or 0),
+                -int(item[1].get("recent_fresh_role_count") or 0),
+                -int(item[1].get("source_trust") or 0),
+                str(item[1].get("company_name") or ""),
+            ),
+        )[:40]:
+            company_name = str(entry.get("company_name") or "").strip() or _title_case_company_name(company_key)
+            priority = max(
+                4,
+                min(
+                    12,
+                    4
+                    + int(entry.get("official_board_lead_count") or 0)
+                    + int(entry.get("recent_fresh_role_count") or 0),
+                ),
+            )
+            for board_url in [str(item) for item in entry.get("board_urls") or [] if str(item).strip()][:4]:
+                _queue_frontier_url(
+                    url=board_url,
+                    company_name=company_name,
+                    discovered_from="company_discovery_index",
+                    priority=priority,
+                    preferred_task_type="board_url",
+                )
+            for careers_root in [str(item) for item in entry.get("careers_roots") or [] if str(item).strip()][:3]:
+                _queue_frontier_url(
+                    url=careers_root,
+                    company_name=company_name,
+                    discovered_from="company_discovery_index",
+                    priority=max(6, priority - 1),
+                    preferred_task_type="careers_root",
+                )
+
+        directory_budget = max(0, settings.company_discovery_directory_crawl_budget_per_run)
+        for task in select_frontier_tasks(frontier, budget=directory_budget, task_types={"directory_source", "portfolio_source"}):
+            task_key = str(task.get("task_key") or "")
+            task_url = str(task.get("url") or "").strip()
+            frontier_tasks_consumed_count += 1
+            html = await _fetch_page_html(task_url)
+            if not html:
+                update_frontier_task_state(frontier, task_key=task_key, success=False, error="fetch_failed")
+                record_crawl_result(
+                    crawl_history,
+                    target_type=str(task.get("task_type") or "directory_source"),
+                    url=task_url,
+                    success=False,
+                    error="fetch_failed",
+                )
+                continue
+            company_urls = extract_company_homepage_urls(task_url, html)
+            discovered_count = 0
+            for homepage in company_urls:
+                _queue_frontier_url(
+                    url=homepage,
+                    company_name=None,
+                    discovered_from=task_url,
+                    priority=6,
+                    preferred_task_type="company_page",
+                )
+                discovered_count += 1
+            _increment_metric_count(source_adapter_yields, str(task.get("task_type") or "directory_source"), discovered_count)
+            update_frontier_task_state(frontier, task_key=task_key, success=True)
+            record_crawl_result(
+                crawl_history,
+                target_type=str(task.get("task_type") or "directory_source"),
+                url=task_url,
+                success=True,
+            )
+
+        frontier_budget = max(0, settings.company_discovery_frontier_budget_per_run)
+        for task in select_frontier_tasks(frontier, budget=frontier_budget, task_types={"company_page", "careers_root"}):
+            task_key = str(task.get("task_key") or "")
+            task_url = str(task.get("url") or "").strip()
+            task_type = str(task.get("task_type") or "company_page")
+            company_name = _company_name_for_frontier_task(task, entries)
+            frontier_tasks_consumed_count += 1
+            html = await _fetch_page_html(task_url)
+            if not html:
+                update_frontier_task_state(frontier, task_key=task_key, success=False, error="fetch_failed")
+                record_crawl_result(
+                    crawl_history,
+                    target_type=task_type,
+                    url=task_url,
+                    company_key=_normalize_company_key(company_name) or None,
+                    success=False,
+                    error="fetch_failed",
+                )
+                continue
+
+            extracted_careers = extract_careers_page_urls(task_url, html)
+            if task_type == "company_page":
+                extracted_careers = _dedupe_queries([*extracted_careers, *default_careers_candidate_urls(task_url)])
+            board_urls = extract_embedded_board_urls(task_url, html)
+            discovered_count = 0
+            if task_type == "careers_root":
+                was_new_company, new_board_count = upsert_company_discovery_entry(
+                    entries,
+                    company_name=company_name,
+                    source_url=task_url,
+                    careers_root=task_url,
+                    board_urls=board_urls,
+                    ats_types=[value for value in (board_url_ats_type(url) for url in board_urls) if value],
+                    source_trust=max(int(task.get("source_trust") or 0), 7),
+                    run_id=run_id,
+                    source_kind="careers_root",
+                )
+                if was_new_company:
+                    new_company_keys.add(_normalize_company_key(company_name))
+                if new_board_count:
+                    for board_url in board_urls:
+                        identifier = board_identifier_from_url(board_url)
+                        if identifier:
+                            new_board_identifiers.add(identifier)
+            for careers_url in extracted_careers[:8]:
+                _queue_frontier_url(
+                    url=careers_url,
+                    company_name=company_name,
+                    discovered_from=task_url,
+                    priority=8 if task_type == "company_page" else 7,
+                    preferred_task_type="careers_root",
+                )
+                discovered_count += 1
+            for board_url in board_urls[:8]:
+                _queue_frontier_url(
+                    url=board_url,
+                    company_name=company_name,
+                    discovered_from=task_url,
+                    priority=10,
+                    preferred_task_type="board_url",
+                )
+                discovered_count += 1
+            _increment_metric_count(source_adapter_yields, task_type, discovered_count)
+            update_frontier_task_state(frontier, task_key=task_key, success=True)
+            record_crawl_result(
+                crawl_history,
+                target_type=task_type,
+                url=task_url,
+                company_key=_normalize_company_key(company_name) or None,
+                success=True,
+            )
+
+        await _crawl_board_frontier(
+            budget=max(0, settings.company_discovery_board_crawl_budget_per_run),
+            phase_label="frontier_board_crawl",
+        )
+
     if settings.company_discovery_enabled:
-        for query in _build_company_discovery_seed_queries(settings, SearchTuning(attempt_number=1))[: max(4, settings.search_round_query_limit)]:
+        query_budget = max(6, settings.search_round_query_limit * 2)
+        for query in _build_company_discovery_seed_queries(settings, SearchTuning(attempt_number=1))[:query_budget]:
             try:
                 _, discovered = await _search_query_with_context(
                     discovery_agent,
@@ -5141,117 +5721,110 @@ async def _collect_company_discovery_seed_leads(
                 )
             except Exception:
                 continue
+            fresh_for_query = 0
             for lead in discovered:
-                was_new_company, new_board_count = _upsert_company_discovery_from_lead(
+                _record_company_discovery_lead(lead, source_adapter="role_first_search")
+                query_leads.append(lead)
+                fresh_for_query += 1
+
+        query_followup_budget = min(max(0, settings.company_discovery_frontier_budget_per_run), 6)
+        for task in select_frontier_tasks(frontier, budget=query_followup_budget, task_types={"company_page", "careers_root"}):
+            task_key = str(task.get("task_key") or "")
+            task_url = str(task.get("url") or "").strip()
+            task_type = str(task.get("task_type") or "company_page")
+            company_name = _company_name_for_frontier_task(task, entries)
+            frontier_tasks_consumed_count += 1
+            html = await _fetch_page_html(task_url)
+            if not html:
+                update_frontier_task_state(frontier, task_key=task_key, success=False, error="fetch_failed")
+                record_crawl_result(
+                    crawl_history,
+                    target_type=task_type,
+                    url=task_url,
+                    company_key=_normalize_company_key(company_name) or None,
+                    success=False,
+                    error="fetch_failed",
+                )
+                continue
+
+            extracted_careers = extract_careers_page_urls(task_url, html)
+            if task_type == "company_page":
+                extracted_careers = _dedupe_queries([*extracted_careers, *default_careers_candidate_urls(task_url)])
+            board_urls = extract_embedded_board_urls(task_url, html)
+            discovered_count = 0
+            if task_type == "careers_root":
+                was_new_company, new_board_count = upsert_company_discovery_entry(
                     entries,
-                    lead,
+                    company_name=company_name,
+                    source_url=task_url,
+                    careers_root=task_url,
+                    board_urls=board_urls,
+                    ats_types=[value for value in (board_url_ats_type(url) for url in board_urls) if value],
+                    source_trust=max(int(task.get("source_trust") or 0), 7),
                     run_id=run_id,
-                    ai_pm_candidate_delta=1,
+                    source_kind="careers_root",
                 )
                 if was_new_company:
-                    new_company_keys.add(_normalize_company_key(lead.company_name))
+                    new_company_keys.add(_normalize_company_key(company_name))
                 if new_board_count:
-                    for identifier in (
-                        board_identifier_from_url(lead.direct_job_url),
-                        board_identifier_from_url(lead.source_url),
-                    ):
+                    for board_url in board_urls:
+                        identifier = board_identifier_from_url(board_url)
                         if identifier:
                             new_board_identifiers.add(identifier)
-                company_keys_with_ai_pm_leads.add(_normalize_company_key(lead.company_name))
-                query_leads.append(lead)
-
-        roots_to_crawl: list[tuple[str, dict[str, object]]] = []
-        for key, entry in sorted(
-            entries.items(),
-            key=lambda item: (
-                -int(item[1].get("official_board_lead_count") or 0),
-                -int(item[1].get("ai_pm_candidate_count") or 0),
-                str(item[1].get("company_name") or ""),
-            ),
-        )[:8]:
-            careers_roots = [str(item) for item in entry.get("careers_roots") or [] if str(item).strip()]
-            for careers_root in careers_roots[:2]:
-                roots_to_crawl.append((careers_root, entry))
-
-        for careers_root, entry in roots_to_crawl:
-            html = await _fetch_page_html(careers_root)
-            if not html:
-                continue
-            board_urls = extract_embedded_board_urls(careers_root, html)
-            if not board_urls:
-                continue
-            was_new_company, new_board_count = upsert_company_discovery_entry(
-                entries,
-                company_name=str(entry.get("company_name") or ""),
-                source_url=careers_root,
-                careers_root=careers_root,
-                board_urls=board_urls,
-                ats_types=[value for value in (board_url_ats_type(url) for url in board_urls) if value],
-                source_trust=max(int(entry.get("source_trust") or 0), 8),
-                run_id=run_id,
+            for careers_url in extracted_careers[:8]:
+                _queue_frontier_url(
+                    url=careers_url,
+                    company_name=company_name,
+                    discovered_from=task_url,
+                    priority=8 if task_type == "company_page" else 7,
+                    preferred_task_type="careers_root",
+                )
+                discovered_count += 1
+            for board_url in board_urls[:8]:
+                _queue_frontier_url(
+                    url=board_url,
+                    company_name=company_name,
+                    discovered_from=task_url,
+                    priority=10,
+                    preferred_task_type="board_url",
+                )
+                discovered_count += 1
+            _increment_metric_count(source_adapter_yields, f"{task_type}_followup", discovered_count)
+            update_frontier_task_state(frontier, task_key=task_key, success=True)
+            record_crawl_result(
+                crawl_history,
+                target_type=task_type,
+                url=task_url,
+                company_key=_normalize_company_key(company_name) or None,
+                success=True,
             )
-            if was_new_company:
-                new_company_keys.add(_normalize_company_key(str(entry.get("company_name") or "")))
-            if new_board_count:
-                for board_url in board_urls:
-                    identifier = board_identifier_from_url(board_url)
-                    if identifier:
-                        new_board_identifiers.add(identifier)
 
-    official_board_leads: list[JobLead] = []
-    for key, entry in sorted(
-        entries.items(),
-        key=lambda item: (
-            -int(item[1].get("source_trust") or 0),
-            -int(item[1].get("official_board_lead_count") or 0),
-            -int(item[1].get("ai_pm_candidate_count") or 0),
-        ),
-    )[:12]:
-        company_name = str(entry.get("company_name") or "").strip() or _title_case_company_name(key)
-        board_identifiers = [str(item) for item in entry.get("board_identifiers") or [] if str(item).strip()]
-        for identifier in board_identifiers[:4]:
-            prefix, _, token = identifier.partition(":")
-            if not token:
-                continue
-            if prefix == "greenhouse":
-                for job in await _fetch_greenhouse_board_jobs(token):
-                    lead = _greenhouse_board_job_to_lead(token, company_name, job)
-                    if lead is None:
-                        continue
-                    official_board_leads.append(lead)
-                    official_board_leads_count += 1
-                    company_keys_with_ai_pm_leads.add(_normalize_company_key(company_name))
-                    _upsert_company_discovery_from_lead(
-                        entries,
-                        lead,
-                        run_id=run_id,
-                        ai_pm_candidate_delta=1,
-                        official_board_lead_delta=1,
-                    )
-            elif prefix == "ashby":
-                for job in await _fetch_ashby_board_jobs(token):
-                    lead = _ashby_board_job_to_lead(token, company_name, job)
-                    if lead is None:
-                        continue
-                    official_board_leads.append(lead)
-                    official_board_leads_count += 1
-                    company_keys_with_ai_pm_leads.add(_normalize_company_key(company_name))
-                    _upsert_company_discovery_from_lead(
-                        entries,
-                        lead,
-                        run_id=run_id,
-                        ai_pm_candidate_delta=1,
-                        official_board_lead_delta=1,
-                    )
+        remaining_board_budget = max(
+            0,
+            settings.company_discovery_board_crawl_budget_per_run - official_board_crawl_attempt_count,
+        )
+        if remaining_board_budget:
+            await _crawl_board_frontier(
+                budget=remaining_board_budget,
+                phase_label="query_discovered_board_crawl",
+            )
 
     save_company_discovery_entries(settings.data_dir, entries)
+    save_company_discovery_frontier(settings.data_dir, frontier)
+    save_company_discovery_crawl_history(settings.data_dir, crawl_history)
+    save_company_discovery_audit(settings.data_dir, audit_entries)
     leads = _dedupe_round_leads([*query_leads, *official_board_leads], settings)
     metrics = {
         "new_companies_discovered_count": len(new_company_keys),
         "new_boards_discovered_count": len(new_board_identifiers),
         "official_board_leads_count": official_board_leads_count,
         "companies_with_ai_pm_leads_count": len(company_keys_with_ai_pm_leads),
-        "official_roles_missed_count": official_board_leads_count,
+        "official_roles_missed_count": official_roles_missed_count,
+        "frontier_tasks_consumed_count": frontier_tasks_consumed_count,
+        "frontier_backlog_count": sum(1 for task in frontier if str(task.get("status") or "pending") == "pending"),
+        "official_board_crawl_attempt_count": official_board_crawl_attempt_count,
+        "official_board_crawl_success_count": official_board_crawl_success_count,
+        "source_adapter_yields": dict(source_adapter_yields),
     }
     return leads, metrics
 
@@ -5878,15 +6451,35 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
     if not source_url.startswith(("http://", "https://")):
         source_url = direct_job_url
     salary_min, salary_max, salary_text = _hydrate_salary_hint_values(None, None, failure.salary_text, failure.detail)
+    source_type = _normalize_source_type(direct_job_url)
+    replay_remote_haystack = " ".join(
+        part
+        for part in (
+            failure.role_title,
+            source_url,
+            direct_job_url,
+            failure.detail or "",
+        )
+        if part
+    ).lower()
+    is_remote_hint = failure.is_remote
+    if is_remote_hint is None:
+        lowered_query = " ".join(str(failure.source_query or "").lower().split())
+        if (
+            source_type in {"direct_ats", "company_site"}
+            and not any(token in replay_remote_haystack for token in ("hybrid", "on-site", "onsite", "in office"))
+            and (" remote" in f" {lowered_query}" or "work from home" in lowered_query)
+        ):
+            is_remote_hint = True
     lead = JobLead(
         company_name=failure.company_name,
         role_title=failure.role_title,
         source_url=source_url,
-        source_type=_normalize_source_type(direct_job_url),
+        source_type=source_type,
         direct_job_url=direct_job_url,
-        location_hint="Remote" if failure.is_remote else None,
+        location_hint="Remote" if is_remote_hint else None,
         posted_date_hint=failure.posted_date_text,
-        is_remote_hint=failure.is_remote,
+        is_remote_hint=is_remote_hint,
         base_salary_min_usd_hint=salary_min,
         base_salary_max_usd_hint=salary_max,
         salary_text_hint=salary_text,
@@ -6044,6 +6637,7 @@ async def _replay_seed_leads(
             continue
         seen_lead_keys.add(key)
         total_unique_leads += 1
+        _increment_metric_count(diagnostics.company_lead_counts, _normalize_company_key(lead.company_name))
         fresh_seed_leads.append(lead)
 
     fresh_seed_leads = _dedupe_round_leads(fresh_seed_leads, settings)
@@ -8955,6 +9549,25 @@ async def find_matching_jobs(
                 diagnostics.official_roles_missed_count += int(
                     discovery_metrics.get("official_roles_missed_count") or 0
                 )
+                diagnostics.frontier_tasks_consumed_count += int(
+                    discovery_metrics.get("frontier_tasks_consumed_count") or 0
+                )
+                diagnostics.frontier_backlog_count = int(
+                    discovery_metrics.get("frontier_backlog_count") or diagnostics.frontier_backlog_count
+                )
+                diagnostics.official_board_crawl_attempt_count += int(
+                    discovery_metrics.get("official_board_crawl_attempt_count") or 0
+                )
+                diagnostics.official_board_crawl_success_count += int(
+                    discovery_metrics.get("official_board_crawl_success_count") or 0
+                )
+                for adapter_key, adapter_count in dict(discovery_metrics.get("source_adapter_yields") or {}).items():
+                    _increment_metric_count(
+                        diagnostics.source_adapter_yields,
+                        str(adapter_key),
+                        int(adapter_count or 0),
+                    )
+                company_discovery_entries = load_company_discovery_entries(settings.data_dir)
                 _persist_search_diagnostics(settings, diagnostics)
                 if company_discovery_seed_leads:
                     total_unique_leads, resolved_leads_this_attempt = await _replay_seed_leads(
@@ -9190,6 +9803,7 @@ async def find_matching_jobs(
                             continue
                         seen_lead_keys.add(key)
                         total_unique_leads += 1
+                        _increment_metric_count(diagnostics.company_lead_counts, _normalize_company_key(lead.company_name))
                         fresh_leads += 1
                         round_leads.append(lead)
 

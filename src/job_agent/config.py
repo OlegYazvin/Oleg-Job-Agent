@@ -86,6 +86,11 @@ class Settings:
     ollama_degraded_for_run: bool = False
     ollama_degraded_reason: str | None = None
     auto_loop_max_workflow_reruns_per_iteration: int = 2
+    company_discovery_indexer_enabled: bool = True
+    company_discovery_frontier_budget_per_run: int = 12
+    company_discovery_board_crawl_budget_per_run: int = 12
+    company_discovery_directory_crawl_budget_per_run: int = 8
+    company_discovery_source_max_trust: int = 10
 
     @property
     def user_location(self) -> dict[str, object]:
@@ -268,5 +273,22 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         auto_loop_max_workflow_reruns_per_iteration=max(
             0,
             int(os.getenv("AUTO_LOOP_MAX_WORKFLOW_RERUNS_PER_ITERATION", "2")),
+        ),
+        company_discovery_indexer_enabled=os.getenv("COMPANY_DISCOVERY_INDEXER_ENABLED", "true").lower() == "true",
+        company_discovery_frontier_budget_per_run=max(
+            0,
+            int(os.getenv("COMPANY_DISCOVERY_FRONTIER_BUDGET_PER_RUN", "12")),
+        ),
+        company_discovery_board_crawl_budget_per_run=max(
+            0,
+            int(os.getenv("COMPANY_DISCOVERY_BOARD_CRAWL_BUDGET_PER_RUN", "12")),
+        ),
+        company_discovery_directory_crawl_budget_per_run=max(
+            0,
+            int(os.getenv("COMPANY_DISCOVERY_DIRECTORY_CRAWL_BUDGET_PER_RUN", "8")),
+        ),
+        company_discovery_source_max_trust=max(
+            0,
+            int(os.getenv("COMPANY_DISCOVERY_SOURCE_MAX_TRUST", "10")),
         ),
     )

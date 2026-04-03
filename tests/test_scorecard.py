@@ -40,6 +40,12 @@ def test_build_run_scorecard_splits_fresh_leads_and_actionable_near_misses() -> 
         official_board_leads_count=2,
         companies_with_ai_pm_leads_count=2,
         official_roles_missed_count=1,
+        frontier_tasks_consumed_count=6,
+        frontier_backlog_count=8,
+        official_board_crawl_attempt_count=2,
+        official_board_crawl_success_count=1,
+        company_lead_counts={"acme": 7, "butterflymx": 5, "hopper": 3},
+        source_adapter_yields={"ashby": 2, "greenhouse": 1, "directory_source": 4},
         failures=[
             SearchFailure(stage="discovery", reason_code="query_timeout", detail="timed out"),
             SearchFailure(stage="filter", reason_code="repeated_failed_lead", detail="replayed dead lead"),
@@ -136,6 +142,12 @@ def test_build_run_scorecard_splits_fresh_leads_and_actionable_near_misses() -> 
     assert scorecard.discovery.new_boards_discovered_count == 4
     assert scorecard.discovery.official_board_leads_count == 2
     assert scorecard.discovery.company_discovery_yield == 0.667
+    assert scorecard.discovery.frontier_tasks_consumed_count == 6
+    assert scorecard.discovery.frontier_backlog_count == 8
+    assert scorecard.discovery.official_board_crawl_success_rate == 0.5
+    assert scorecard.discovery.company_concentration_top_10_share == 1.0
+    assert scorecard.discovery.new_company_to_fresh_lead_yield == 5.0
+    assert scorecard.discovery.source_adapter_yields["directory_source"] == 4
     assert scorecard.validation.novel_validated_yield == scorecard.validation.validated_yield
     assert scorecard.validation.message_coverage_rate == 0.5
     assert scorecard.validation.official_roles_missed_count == 1

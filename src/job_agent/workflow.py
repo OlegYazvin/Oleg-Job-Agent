@@ -5,6 +5,12 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from .company_discovery import (
+    company_discovery_audit_path,
+    company_discovery_crawl_history_path,
+    company_discovery_frontier_path,
+    load_company_discovery_audit,
+)
 from .config import Settings
 from .drafting import draft_outreach_bundle
 from .history import record_failed_run
@@ -171,11 +177,27 @@ async def _run_daily_workflow_body(
     if status:
         status.emit("reporting", "Building Word documents and saving run artifacts.", qualifying_jobs=len(jobs))
     generated_at = datetime.now(UTC)
+    discovery_summary = {
+        "new_companies_discovered_count": search_diagnostics.new_companies_discovered_count,
+        "new_boards_discovered_count": search_diagnostics.new_boards_discovered_count,
+        "official_board_leads_count": search_diagnostics.official_board_leads_count,
+        "companies_with_ai_pm_leads_count": search_diagnostics.companies_with_ai_pm_leads_count,
+        "frontier_tasks_consumed_count": search_diagnostics.frontier_tasks_consumed_count,
+        "frontier_backlog_count": search_diagnostics.frontier_backlog_count,
+        "source_adapter_yields": dict(search_diagnostics.source_adapter_yields),
+    }
+    official_board_audit = [
+        item
+        for item in load_company_discovery_audit(settings.data_dir)
+        if str(item.get("run_id") or "").strip() == run_id
+    ]
     message_docx_path = build_message_document(bundles, settings.output_dir, generated_at=generated_at)
     summary_docx_path = build_summary_document(
         bundles,
         settings.output_dir,
         reacquired_jobs=reacquired_jobs,
+        discovery_summary=discovery_summary,
+        official_board_audit=official_board_audit,
         generated_at=generated_at,
     )
     near_miss_docx_path = build_near_miss_document(
@@ -213,6 +235,9 @@ async def _run_daily_workflow_body(
         summary_docx_path=summary_docx_path,
         reacquired_jobs_json_path=settings.data_dir / "reacquired-jobs-latest.json",
         company_discovery_json_path=settings.data_dir / "company-discovery-index.json",
+        company_discovery_frontier_json_path=company_discovery_frontier_path(settings.data_dir),
+        company_discovery_crawl_history_json_path=company_discovery_crawl_history_path(settings.data_dir),
+        company_discovery_audit_json_path=company_discovery_audit_path(settings.data_dir),
         near_misses=search_diagnostics.near_misses,
         near_miss_docx_path=near_miss_docx_path,
         near_miss_json_path=settings.data_dir / "near-misses-latest.json",

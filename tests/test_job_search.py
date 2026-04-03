@@ -1495,6 +1495,50 @@ def test_seed_lead_from_failure_parses_salary_text_into_numeric_hints() -> None:
     assert lead.base_salary_max_usd_hint == 265080
 
 
+def test_seed_lead_from_failure_uses_remote_query_for_trusted_direct_replay_when_remote_is_missing() -> None:
+    failure = SearchFailure(
+        stage="validation",
+        reason_code="missing_posted_date",
+        detail="No posted date was available from the direct page or trusted hints.",
+        company_name="Krisp",
+        role_title="Senior Product Manager, Voice AI SDK",
+        source_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
+        direct_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        posted_date_text=None,
+        salary_text=None,
+        is_remote=None,
+        source_query='"senior product manager" "voice AI" remote "growth stage"',
+    )
+
+    lead = _seed_lead_from_failure(failure)
+
+    assert lead is not None
+    assert lead.is_remote_hint is True
+    assert lead.location_hint == "Remote"
+
+
+def test_seed_lead_from_failure_does_not_override_explicit_hybrid_signal_with_remote_query() -> None:
+    failure = SearchFailure(
+        stage="validation",
+        reason_code="missing_posted_date",
+        detail="Hybrid role with office collaboration. No posted date was available from the direct page or trusted hints.",
+        company_name="Krisp",
+        role_title="Senior Product Manager, Voice AI SDK",
+        source_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
+        direct_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        posted_date_text=None,
+        salary_text=None,
+        is_remote=None,
+        source_query='"senior product manager" "voice AI" remote "growth stage"',
+    )
+
+    lead = _seed_lead_from_failure(failure)
+
+    assert lead is not None
+    assert lead.is_remote_hint is None
+    assert lead.location_hint is None
+
+
 def test_rippling_direct_job_url_is_trustworthy() -> None:
     url = "https://ats.rippling.com/vendr/jobs/8f3edee4-bf55-44cf-a467-ea36dcc23605"
     lead = JobLead(
@@ -5394,8 +5438,15 @@ def test_collect_company_discovery_seed_leads_discovers_embedded_ashby_board(mon
     assert metrics["new_companies_discovered_count"] == 1
     assert metrics["new_boards_discovered_count"] >= 1
     assert metrics["official_board_leads_count"] == 1
+    assert metrics["frontier_tasks_consumed_count"] >= 1
+    assert metrics["official_board_crawl_attempt_count"] >= 1
+    assert metrics["official_board_crawl_success_count"] == 1
+    assert metrics["source_adapter_yields"]["ashby"] == 1
 
     entries = load_company_discovery_entries(settings.data_dir)
     butterfly_entry = entries["butterflymx"]
     assert "ashby:butterflymx" in butterfly_entry["board_identifiers"]
     assert butterfly_entry["official_board_lead_count"] >= 1
+    assert (settings.data_dir / "company-discovery-frontier.json").exists()
+    assert (settings.data_dir / "company-discovery-crawl-history.json").exists()
+    assert (settings.data_dir / "company-discovery-audit.json").exists()
