@@ -129,6 +129,12 @@ class SearchDiagnostics(BaseModel):
     seed_replayed_lead_count: int = 0
     reacquisition_attempt_count: int = 0
     reacquired_jobs_suppressed_count: int = 0
+    new_companies_discovered_count: int = 0
+    new_boards_discovered_count: int = 0
+    official_board_leads_count: int = 0
+    companies_with_ai_pm_leads_count: int = 0
+    principal_ai_pm_salary_presumption_count: int = 0
+    official_roles_missed_count: int = 0
     failures: list[SearchFailure] = Field(default_factory=list)
     passes: list[SearchPassSummary] = Field(default_factory=list)
     near_misses: list[NearMissJob] = Field(default_factory=list)
@@ -173,6 +179,7 @@ class JobPosting(BaseModel):
     salary_text: str | None = Field(default=None)
     salary_inferred: bool = Field(default=False)
     salary_inference_reason: str | None = Field(default=None)
+    salary_inference_kind: str | None = Field(default=None)
     inferred_experience_years_min: int | None = Field(default=None)
     source_query: str | None = Field(default=None)
     job_page_title: str | None = Field(default=None)
@@ -309,6 +316,7 @@ class RunManifest(BaseModel):
     reacquired_validated_jobs_count: int = 0
     total_current_validated_jobs_count: int = 0
     reacquired_jobs_json_path: str | None = None
+    company_discovery_json_path: str | None = None
     near_miss_docx_path: str | None = None
     near_miss_json_path: str | None = None
     ollama_summary_json_path: str | None = None
@@ -352,6 +360,8 @@ class RunOutcomeMetrics(BaseModel):
     novel_validated_jobs_count: int = 0
     reacquired_validated_jobs_count: int = 0
     total_current_validated_jobs_count: int = 0
+    validated_jobs_with_inferred_salary_count: int = 0
+    principal_ai_pm_salary_presumption_count: int = 0
     jobs_with_messages_count: int = 0
     unique_leads_discovered_count: int = 0
     fresh_new_leads_count: int = 0
@@ -365,12 +375,17 @@ class RunDiscoveryMetrics(BaseModel):
     replayed_seed_leads_count: int = 0
     reacquisition_attempt_count: int = 0
     reacquired_jobs_suppressed_count: int = 0
+    new_companies_discovered_count: int = 0
+    new_boards_discovered_count: int = 0
+    official_board_leads_count: int = 0
+    companies_with_ai_pm_leads_count: int = 0
     repeated_failed_leads_suppressed_count: int = 0
     executed_query_count: int = 0
     query_timeout_count: int = 0
     query_skipped_timeout_budget_count: int = 0
     zero_yield_pass_count: int = 0
     discovery_efficiency: float = 0.0
+    company_discovery_yield: float = 0.0
 
 
 class RunValidationMetrics(BaseModel):
@@ -384,6 +399,9 @@ class RunValidationMetrics(BaseModel):
     reacquired_jobs_suppressed_count: int = 0
     reacquisition_yield: float = 0.0
     coverage_retention_rate: float | None = None
+    validated_jobs_with_inferred_salary_count: int = 0
+    principal_ai_pm_salary_presumption_count: int = 0
+    official_roles_missed_count: int = 0
     jobs_with_messages_count: int = 0
     message_coverage_rate: float = 0.0
     raw_near_miss_count: int = 0
@@ -436,6 +454,7 @@ class RunScorecard(BaseModel):
     near_miss_docx_path: str | None = None
     near_miss_json_path: str | None = None
     ollama_summary_json_path: str | None = None
+    company_discovery_json_path: str | None = None
 
 
 class ImprovementPattern(BaseModel):
@@ -481,8 +500,27 @@ class CodexIterationResult(BaseModel):
     summary: str | None = None
     validation_commands: list[str] = Field(default_factory=list)
     validation_results: list[ValidationCommandResult] = Field(default_factory=list)
+    workflow_rerun_run_ids: list[str] = Field(default_factory=list)
+    workflow_rerun_count: int = 0
+    metric_comparison: dict[str, float | int | str | None] = Field(default_factory=dict)
     commit_hash: str | None = None
     commit_message: str | None = None
+
+
+class CompanyDiscoveryEntry(BaseModel):
+    company_key: str
+    company_name: str
+    careers_roots: list[str] = Field(default_factory=list)
+    ats_types: list[str] = Field(default_factory=list)
+    board_identifiers: list[str] = Field(default_factory=list)
+    board_urls: list[str] = Field(default_factory=list)
+    source_hosts: list[str] = Field(default_factory=list)
+    source_trust: int = 0
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
+    last_successful_discovery_run: str | None = None
+    ai_pm_candidate_count: int = 0
+    official_board_lead_count: int = 0
 
 
 class AutoLoopIteration(BaseModel):

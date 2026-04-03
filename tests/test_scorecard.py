@@ -35,6 +35,11 @@ def test_build_run_scorecard_splits_fresh_leads_and_actionable_near_misses() -> 
         minimum_qualifying_jobs=5,
         unique_leads_discovered=25,
         seed_replayed_lead_count=10,
+        new_companies_discovered_count=3,
+        new_boards_discovered_count=4,
+        official_board_leads_count=2,
+        companies_with_ai_pm_leads_count=2,
+        official_roles_missed_count=1,
         failures=[
             SearchFailure(stage="discovery", reason_code="query_timeout", detail="timed out"),
             SearchFailure(stage="filter", reason_code="repeated_failed_lead", detail="replayed dead lead"),
@@ -127,8 +132,13 @@ def test_build_run_scorecard_splits_fresh_leads_and_actionable_near_misses() -> 
     assert scorecard.outcome.actionable_near_miss_count == 1
     assert scorecard.discovery.executed_query_count == 14
     assert scorecard.discovery.zero_yield_pass_count == 1
+    assert scorecard.discovery.new_companies_discovered_count == 3
+    assert scorecard.discovery.new_boards_discovered_count == 4
+    assert scorecard.discovery.official_board_leads_count == 2
+    assert scorecard.discovery.company_discovery_yield == 0.667
     assert scorecard.validation.novel_validated_yield == scorecard.validation.validated_yield
     assert scorecard.validation.message_coverage_rate == 0.5
+    assert scorecard.validation.official_roles_missed_count == 1
     assert scorecard.ollama.useful_action_count == 2.0
     assert scorecard.ollama.useful_actions_per_request == 1.0
     assert scorecard.timing.time_to_first_validated_job_seconds == 600.0
@@ -181,6 +191,38 @@ def test_build_run_scorecard_tracks_reacquired_validated_jobs_separately() -> No
     assert scorecard.discovery.reacquired_jobs_suppressed_count == 1
     assert scorecard.outcome.fresh_new_leads_count == 4
     assert scorecard.validation.reacquisition_yield == 1.0
+
+
+def test_build_run_scorecard_counts_inferred_salary_validated_jobs() -> None:
+    manifest = RunManifest(
+        run_id="run-inferred-salary",
+        generated_at=datetime(2026, 4, 2, 1, 0, 0),
+        message_docx_path="/tmp/messages.docx",
+        summary_docx_path="/tmp/summary.docx",
+        jobs_found_by_search=5,
+        jobs_kept_after_validation=1,
+        jobs_with_any_messages=0,
+    )
+    scorecard = build_run_scorecard(
+        run_id="run-inferred-salary",
+        status="completed",
+        manifest=manifest,
+        bundles=[
+            {
+                "job": {
+                    "company_name": "ButterflyMX",
+                    "role_title": "Principal Product Manager, AI",
+                    "salary_inferred": True,
+                    "salary_inference_kind": "salary_presumed_from_principal_ai_pm",
+                }
+            }
+        ],
+    )
+
+    assert scorecard.outcome.validated_jobs_with_inferred_salary_count == 1
+    assert scorecard.outcome.principal_ai_pm_salary_presumption_count == 1
+    assert scorecard.validation.validated_jobs_with_inferred_salary_count == 1
+    assert scorecard.validation.principal_ai_pm_salary_presumption_count == 1
 
 
 def test_run_scorecard_history_bootstraps_from_run_artifacts(tmp_path: Path) -> None:

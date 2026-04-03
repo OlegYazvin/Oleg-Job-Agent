@@ -15,7 +15,9 @@ from job_agent.config import Settings
 from job_agent.models import (
     AutoLoopState,
     CodexIterationResult,
+    ImprovementPattern,
     RunDiscoveryMetrics,
+    RunImprovementAnalysis,
     RunOllamaMetrics,
     RunOutcomeMetrics,
     RunScorecard,
@@ -50,6 +52,8 @@ def build_settings(tmp_path: Path) -> Settings:
         search_city="Chicago",
         search_region="Illinois",
         min_base_salary_usd=200000,
+        enable_principal_ai_pm_salary_presumption=True,
+        company_discovery_enabled=True,
         posted_within_days=14,
         minimum_qualifying_jobs=5,
         target_job_count=10,
@@ -516,6 +520,7 @@ def test_invoke_codex_iteration_resume_places_exec_options_before_subcommand(tmp
 
 def test_run_autonomous_loop_continues_after_validation_failure(tmp_path: Path, monkeypatch) -> None:
     settings = build_settings(tmp_path)
+    settings.auto_loop_max_workflow_reruns_per_iteration = 0
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     first = _make_scorecard(
@@ -624,3 +629,148 @@ def test_run_autonomous_loop_continues_after_validation_failure(tmp_path: Path, 
     assert state.iterations[1].run_status == "completed"
     assert state.iterations[1].validation_passed is True
     assert state.latest_commit_hash == "commit-2"
+
+
+def test_build_run_improvement_analysis_can_prioritize_company_discovery_gap(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 4, 3, 12, 0, tzinfo=UTC),
+        fresh_new_leads_count=4,
+    ).model_copy(
+        update={
+            "discovery": RunDiscoveryMetrics(
+                unique_leads_discovered_count=4,
+                fresh_new_leads_count=4,
+                replayed_seed_leads_count=0,
+                repeated_failed_leads_suppressed_count=0,
+                executed_query_count=6,
+                query_timeout_count=0,
+                query_skipped_timeout_budget_count=0,
+                zero_yield_pass_count=0,
+                discovery_efficiency=0.667,
+                new_companies_discovered_count=0,
+                new_boards_discovered_count=0,
+                official_board_leads_count=0,
+                companies_with_ai_pm_leads_count=0,
+                company_discovery_yield=0.0,
+            )
+        }
+    )
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(settings, iteration_number=1, run_id="run-current")
+
+    assert analysis.selected_theme == "company_discovery_gap"
+
+
+def test_run_autonomous_loop_records_workflow_rerun_evidence(tmp_path: Path, monkeypatch) -> None:
+    settings = build_settings(tmp_path)
+    settings.auto_loop_max_workflow_reruns_per_iteration = 1
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    workflow_results = iter(
+        [
+            ("run-1", "completed", None),
+            ("run-1-rerun", "completed", None),
+        ]
+    )
+
+    async def fake_run_workflow_attempt(_settings: Settings, *, timeout_seconds: int | None = None):
+        return next(workflow_results)
+
+    def fake_analysis(_settings: Settings, *, iteration_number: int, run_id: str | None, failure_message: str | None = None):
+        return RunImprovementAnalysis(
+            iteration_number=iteration_number,
+            generated_at=datetime.now(UTC),
+            target_run_id=run_id,
+            analyzed_run_ids=[run_id] if run_id else [],
+            recent_selected_themes=[],
+            current_run_status="completed",
+            current_metrics={"fresh_new_leads_count": 3, "query_timeout_count": 1, "total_current_validated_jobs_count": 0},
+            metric_deltas={},
+            top_patterns=[
+                ImprovementPattern(
+                    key="company_discovery_gap",
+                    summary="Improve company discovery.",
+                    severity_score=10.0,
+                    evidence={},
+                )
+            ],
+            selected_theme="company_discovery_gap",
+            selected_summary="Improve company discovery.",
+            acceptance_checks=[],
+            artifact_paths={},
+        )
+
+    metric_snapshots = {
+        "run-1": {
+            "fresh_new_leads_count": 3,
+            "query_timeout_count": 1,
+            "total_current_validated_jobs_count": 0,
+            "jobs_with_messages_count": 0,
+            "actionable_near_miss_count": 0,
+            "novel_validated_jobs_count": 0,
+            "reacquired_validated_jobs_count": 0,
+            "new_companies_discovered_count": 0,
+            "new_boards_discovered_count": 0,
+            "official_board_leads_count": 0,
+            "principal_ai_pm_salary_presumption_count": 0,
+        },
+        "run-1-rerun": {
+            "fresh_new_leads_count": 5,
+            "query_timeout_count": 1,
+            "total_current_validated_jobs_count": 0,
+            "jobs_with_messages_count": 0,
+            "actionable_near_miss_count": 0,
+            "novel_validated_jobs_count": 0,
+            "reacquired_validated_jobs_count": 0,
+            "new_companies_discovered_count": 2,
+            "new_boards_discovered_count": 1,
+            "official_board_leads_count": 1,
+            "principal_ai_pm_salary_presumption_count": 0,
+        },
+    }
+
+    monkeypatch.setattr("job_agent.auto_loop._ensure_main_branch", lambda _settings: None)
+    monkeypatch.setattr("job_agent.auto_loop.ensure_baseline_commit", lambda _settings, iteration_number=1: "baseline123")
+    monkeypatch.setattr("job_agent.auto_loop._run_workflow_attempt", fake_run_workflow_attempt)
+    monkeypatch.setattr("job_agent.auto_loop.build_run_improvement_analysis", fake_analysis)
+    monkeypatch.setattr("job_agent.auto_loop._scorecard_metrics_for_run", lambda _settings, run_id: metric_snapshots.get(run_id or "", {}))
+    monkeypatch.setattr(
+        "job_agent.auto_loop.invoke_codex_iteration",
+        lambda *_args, **_kwargs: CodexIterationResult(
+            iteration_number=1,
+            generated_at=datetime.now(UTC),
+            status="succeeded",
+            session_id="session-1",
+            selected_theme="company_discovery_gap",
+            summary="Expanded company discovery.",
+        ),
+    )
+    monkeypatch.setattr(
+        "job_agent.auto_loop.run_validation_commands",
+        lambda _settings, *, iteration_number: [
+            ValidationCommandResult(
+                command="PYTHONPATH=src .venv/bin/pytest -q",
+                passed=True,
+                exit_code=0,
+                output_path=str(settings.auto_loop_dir / "iteration-01" / "validation-1.log"),
+            )
+        ],
+    )
+    monkeypatch.setattr("job_agent.auto_loop._git_head", lambda _settings: "head123")
+    monkeypatch.setattr("job_agent.auto_loop._working_tree_dirty", lambda _settings: True)
+    monkeypatch.setattr("job_agent.auto_loop._commit_all_changes", lambda _settings, _message: "commit-1")
+
+    state = asyncio.run(run_autonomous_loop(settings, attempts=1, show_gui=False, timeout_seconds=1))
+
+    assert state.status == "stopped"
+    result_path = Path(state.iterations[0].result_path)
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["workflow_rerun_count"] == 1
+    assert payload["workflow_rerun_run_ids"] == ["run-1-rerun"]
+    assert payload["metric_comparison"]["after_fresh_new_leads_count"] == 5

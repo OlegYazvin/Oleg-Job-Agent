@@ -212,6 +212,7 @@ async def _run_daily_workflow_body(
         message_docx_path=message_docx_path,
         summary_docx_path=summary_docx_path,
         reacquired_jobs_json_path=settings.data_dir / "reacquired-jobs-latest.json",
+        company_discovery_json_path=settings.data_dir / "company-discovery-index.json",
         near_misses=search_diagnostics.near_misses,
         near_miss_docx_path=near_miss_docx_path,
         near_miss_json_path=settings.data_dir / "near-misses-latest.json",

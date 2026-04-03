@@ -106,11 +106,19 @@ def test_live_outreach_payload_includes_live_message_metadata() -> None:
 
 def test_summary_report_counts_second_order_targets_not_messages(tmp_path: Path) -> None:
     bundle = build_bundle()
+    bundle.job = bundle.job.model_copy(
+        update={
+            "salary_inferred": True,
+            "salary_inference_kind": "salary_presumed_from_principal_ai_pm",
+            "salary_text": "Presumed likely >= $200,000 base",
+        }
+    )
     summary_doc = build_summary_document([bundle], tmp_path)
     doc = Document(summary_doc)
     table = doc.tables[0]
     assert table.rows[0].cells[7].text == "2nd-Degree Contacts Messaged"
     assert table.rows[1].cells[7].text == "2"
+    assert "(inferred)" in table.rows[1].cells[4].text
 
 
 def test_summary_report_renders_still_open_again_section_for_reacquired_jobs(tmp_path: Path) -> None:

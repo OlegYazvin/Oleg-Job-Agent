@@ -34,6 +34,8 @@ def build_settings(tmp_path: Path) -> Settings:
         search_city="Chicago",
         search_region="Illinois",
         min_base_salary_usd=200000,
+        enable_principal_ai_pm_salary_presumption=True,
+        company_discovery_enabled=True,
         posted_within_days=14,
         minimum_qualifying_jobs=5,
         target_job_count=10,

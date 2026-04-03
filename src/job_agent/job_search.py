@@ -16,6 +16,16 @@ from agents import Agent, Runner, WebSearchTool
 from bs4 import BeautifulSoup
 import httpx
 
+from .company_discovery import (
+    board_identifier_from_url,
+    board_url_ats_type,
+    company_discovery_index_path,
+    extract_embedded_board_urls,
+    infer_careers_root,
+    load_company_discovery_entries,
+    save_company_discovery_entries,
+    upsert_company_discovery_entry,
+)
 from .config import Settings
 from .criteria import DEFAULT_ROLE_SEARCH_PROFILE
 from .history import (
@@ -307,6 +317,7 @@ BUILTIN_CATEGORY_PAGE_COUNT = 3
 BUILTIN_HTML_CACHE: dict[str, str] = {}
 BUILTIN_LEAD_CACHE: dict[str, JobLead | None] = {}
 GREENHOUSE_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
+ASHBY_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 SEARCH_ENGINE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1531,15 +1542,152 @@ def _seniority_signal_score(*parts: str | None) -> int:
         elif years_floor >= 7:
             score += 1
     if _has_senior_title_signal(text):
-        score += 1
+            score += 1
     return score
+
+
+def _is_principal_ai_pm_title_text(text: str | None) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized or "principal" not in normalized:
+        return False
+    if "product manager" not in normalized and "technical product manager" not in normalized:
+        return False
+    return any(
+        token in normalized
+        for token in (
+            " ai",
+            "ai ",
+            "machine learning",
+            "ml ",
+            " llm",
+            "llm ",
+            "genai",
+            "generative ai",
+            "agentic",
+            "applied ai",
+            "ai/ml",
+            "ai platform",
+            "ml platform",
+        )
+    )
+
+
+def _job_looks_us_remote_without_geo_limit(job: JobPosting, snapshot: JobPageSnapshot) -> bool:
+    if job.is_fully_remote is not True:
+        return False
+    if _job_has_geo_limited_remote_restriction(job, snapshot):
+        return False
+    context = " ".join(
+        part
+        for part in (
+            job.location_text,
+            snapshot.location_text,
+            snapshot.text_excerpt,
+            job.evidence_notes,
+        )
+        if part
+    ).lower()
+    has_non_us_market_hint = any(
+        re.search(rf"\b{re.escape(pattern)}\b", context) for pattern in NON_US_MARKET_HINT_PATTERNS
+    )
+    has_us_market_hint = bool(
+        re.search(
+            r"\b(united states|u\.s\.|usa|us-based|us remote|remote\s*[-,]?\s*(?:us|usa|united states)|within the united states)\b",
+            context,
+        )
+    )
+    if re.search(
+        r"\b(?:within|in|for|across)?\s*(?:the )?(?:united states|u\.s\.|usa|us)\s+only\b",
+        context,
+    ):
+        return False
+    return not has_non_us_market_hint or has_us_market_hint
+
+
+def _job_supports_principal_ai_pm_salary_presumption(
+    job: JobPosting,
+    snapshot: JobPageSnapshot,
+    settings: Settings,
+) -> bool:
+    if not settings.enable_principal_ai_pm_salary_presumption:
+        return False
+    title_context = " ".join(
+        part
+        for part in (
+            job.role_title,
+            job.job_page_title,
+            snapshot.role_title,
+            snapshot.page_title,
+        )
+        if part
+    )
+    if not _is_principal_ai_pm_title_text(title_context):
+        return False
+    if not _is_ai_related_product_manager(job):
+        return False
+    if not _job_looks_us_remote_without_geo_limit(job, snapshot):
+        return False
+    job_url = str(job.resolved_job_url or job.direct_job_url)
+    if not _is_allowed_direct_job_url(job_url):
+        return False
+    if _lead_source_quality_score(
+        JobLead(
+            company_name=job.company_name,
+            role_title=job.role_title,
+            source_url=job_url,
+            source_type="direct_ats" if any(fragment in job_url for fragment in ALLOWED_JOB_HOST_FRAGMENTS) else "company_site",
+            direct_job_url=job_url,
+            location_hint=job.location_text,
+            posted_date_hint=job.posted_date_text,
+            is_remote_hint=job.is_fully_remote,
+            base_salary_min_usd_hint=job.base_salary_min_usd,
+            base_salary_max_usd_hint=job.base_salary_max_usd,
+            salary_text_hint=job.salary_text,
+            evidence_notes=job.evidence_notes,
+            source_query=job.source_query,
+            source_quality_score_hint=job.source_quality_score,
+        ),
+        settings,
+    ) < 7:
+        return False
+    if not _is_recent_enough(
+        job.posted_date_iso,
+        job.posted_date_text or "",
+        settings.posted_within_days,
+        timezone_name=settings.timezone,
+    ):
+        return False
+    return True
 
 
 def _infer_salary_from_experience(
     job: JobPosting,
     snapshot: JobPageSnapshot,
     settings: Settings,
-) -> tuple[bool, str | None, int | None]:
+) -> tuple[bool, str | None, int | None, str | None]:
+    if _salary_values(job):
+        return False, None, None, None
+    years_floor = _extract_experience_years_floor(
+        " ".join(
+            part
+            for part in (
+                job.role_title,
+                job.job_page_title or "",
+                job.location_text,
+                job.evidence_notes,
+                snapshot.location_text,
+                snapshot.text_excerpt,
+            )
+            if part
+        )
+    )
+    if job.is_fully_remote is True and _job_has_geo_limited_remote_restriction(job, snapshot):
+        return False, None, years_floor, None
+    if _job_supports_principal_ai_pm_salary_presumption(job, snapshot, settings):
+        reason = (
+            f"Presumed likely >= ${settings.min_base_salary_usd:,} base because this is a fresh, US-remote principal AI product role on an official source."
+        )
+        return True, reason, years_floor, "salary_presumed_from_principal_ai_pm"
     context_text = " ".join(
         part
         for part in (
@@ -1562,7 +1710,6 @@ def _infer_salary_from_experience(
     has_non_us_market_hint = any(
         re.search(rf"\b{re.escape(pattern)}\b", lowered_context) for pattern in NON_US_MARKET_HINT_PATTERNS
     )
-    years_floor = _extract_experience_years_floor(context_text)
     title_context = " ".join(
         part
         for part in (
@@ -1576,23 +1723,23 @@ def _infer_salary_from_experience(
     if years_floor is None or years_floor < 7:
         has_high_salary_title_signal = any(token in title_context for token in TITLE_ONLY_SALARY_INFERENCE_TOKENS)
         if not (has_us_market_hint and has_high_salary_title_signal):
-            return False, None, years_floor
+            return False, None, years_floor, None
         reason = (
             f"Inferred likely >= ${settings.min_base_salary_usd:,} base because this appears to be a US-remote "
             f"{job.role_title} role, which is typically compensated at this level."
         )
-        return True, reason, years_floor
+        return True, reason, years_floor, "experience_title_market_inference"
     if has_non_us_market_hint and not has_us_market_hint:
-        return False, None, years_floor
+        return False, None, years_floor, None
     reason = (
         f"Inferred likely >= ${settings.min_base_salary_usd:,} base because the posting appears to require "
         f"at least {years_floor} years of experience."
     )
-    return True, reason, years_floor
+    return True, reason, years_floor, "experience_years_inference"
 
 
 def _apply_salary_inference(job: JobPosting, snapshot: JobPageSnapshot, settings: Settings) -> JobPosting:
-    inferred_ok, inference_reason, years_floor = _infer_salary_from_experience(job, snapshot, settings)
+    inferred_ok, inference_reason, years_floor, inference_kind = _infer_salary_from_experience(job, snapshot, settings)
     if not inferred_ok:
         return job
     merged_notes = " ".join(part for part in (job.evidence_notes, inference_reason) if part).strip()
@@ -1601,6 +1748,7 @@ def _apply_salary_inference(job: JobPosting, snapshot: JobPageSnapshot, settings
         update={
             "salary_inferred": True,
             "salary_inference_reason": inference_reason,
+            "salary_inference_kind": inference_kind,
             "inferred_experience_years_min": years_floor,
             "salary_text": inferred_salary_text,
             "evidence_notes": merged_notes,
@@ -2080,18 +2228,54 @@ def _watchlist_entry_should_skip_resolution(
     return not _lead_has_strong_override_hints(lead, settings)
 
 
+def _merged_focus_company_entries(
+    settings: Settings,
+    *,
+    company_discovery_entries: dict[str, dict[str, object]] | None = None,
+) -> dict[str, dict[str, object]]:
+    merged = {
+        key: dict(value)
+        for key, value in load_company_watchlist_entries(settings.data_dir).items()
+    }
+    discovery_entries = company_discovery_entries or load_company_discovery_entries(settings.data_dir)
+    for key, raw_entry in discovery_entries.items():
+        existing = dict(merged.get(key) or {})
+        board_identifiers = [
+            str(item)
+            for item in [*(existing.get("board_identifiers") or []), *(raw_entry.get("board_identifiers") or [])]
+            if str(item).strip()
+        ]
+        source_hosts = [
+            str(item)
+            for item in [*(existing.get("source_hosts") or []), *(raw_entry.get("source_hosts") or [])]
+            if str(item).strip()
+        ]
+        merged[key] = {
+            **existing,
+            **raw_entry,
+            "company_name": str(raw_entry.get("company_name") or existing.get("company_name") or key),
+            "board_identifiers": list(dict.fromkeys(board_identifiers))[:16],
+            "source_hosts": list(dict.fromkeys(source_hosts))[:8],
+            "priority_score": max(int(existing.get("priority_score") or 0), int(raw_entry.get("source_trust") or 0)),
+        }
+    return merged
+
+
 def _select_watchlist_focus_companies(
     settings: Settings,
     known_company_keys: set[str],
     *,
+    company_discovery_entries: dict[str, dict[str, object]] | None = None,
     limit: int = 10,
 ) -> list[str]:
-    watchlist = load_company_watchlist_entries(settings.data_dir)
+    focus_entries = _merged_focus_company_entries(settings, company_discovery_entries=company_discovery_entries)
     ranked_entries = sorted(
-        watchlist.values(),
+        focus_entries.values(),
         key=lambda entry: (
             0 if _normalize_company_key(entry.get("company_name")) not in known_company_keys else 1,
             0 if _company_looks_small_from_hosts([str(item) for item in entry.get("source_hosts", [])]) else 1,
+            -int(entry.get("official_board_lead_count") or 0),
+            -int(entry.get("ai_pm_candidate_count") or 0),
             *_watchlist_focus_penalties(entry),
             -int(entry.get("priority_score") or 0),
             str(entry.get("company_name") or "").lower(),
@@ -2306,7 +2490,7 @@ def _build_watchlist_board_focus_queries(settings: Settings, tuning: SearchTunin
     focus_roles = tuning.focus_roles or _default_focus_role_terms()
     if not tuning.focus_companies or not focus_roles:
         return []
-    watchlist = load_company_watchlist_entries(settings.data_dir)
+    watchlist = _merged_focus_company_entries(settings)
     recency_terms = _current_recency_terms(settings.timezone)
     salary_terms = [f"\"${settings.min_base_salary_usd:,}\"", *_salary_disclosure_terms()]
     queries: list[str] = []
@@ -2325,6 +2509,33 @@ def _build_watchlist_board_focus_queries(settings: Settings, tuning: SearchTunin
                     queries.append(f"{company_term} {role_term} remote {site_hint} {recency_terms[0]}")
                 if tuning.prioritize_salary:
                     queries.append(f"{company_term} {role_term} remote {site_hint} {salary_terms[0]}")
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 10)]
+
+
+def _build_company_discovery_seed_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
+    role_terms = [
+        "\"Principal Product Manager\" AI remote",
+        "\"Principal Product Manager\" \"machine learning\" remote",
+        "\"Senior Product Manager\" AI remote",
+        "\"Staff Product Manager\" AI remote",
+        "\"AI Product Manager\" remote",
+        "\"AI platform product manager\" remote",
+    ]
+    ats_domains = [
+        "jobs.ashbyhq.com",
+        "job-boards.greenhouse.io",
+        "boards.greenhouse.io",
+        "jobs.lever.co",
+        "myworkdayjobs.com",
+        "careers.workday.com",
+        "jobs.smartrecruiters.com",
+    ]
+    recency_terms = _current_recency_terms(settings.timezone)
+    queries: list[str] = []
+    for role_term in role_terms:
+        for domain in ats_domains:
+            queries.append(f"{role_term} site:{domain}")
+            queries.append(f"{role_term} site:{domain} {recency_terms[0]}")
     return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 2, 10)]
 
 
@@ -4652,6 +4863,50 @@ async def _fetch_greenhouse_board_jobs(board_token: str) -> list[dict[str, objec
     return normalized_jobs
 
 
+def _extract_ashby_board_token(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if "ashbyhq.com" not in host:
+        return None
+    segments = _path_segments(parsed.path)
+    if not segments:
+        return None
+    return segments[0].lower()
+
+
+async def _fetch_ashby_board_jobs(board_token: str) -> list[dict[str, object]]:
+    cached = ASHBY_BOARD_JOBS_CACHE.get(board_token)
+    if cached is not None:
+        return cached
+
+    api_url = f"https://api.ashbyhq.com/posting-api/job-board/{board_token}?includeCompensation=true"
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20.0,
+        ) as client:
+            response = await client.get(api_url)
+    except httpx.RequestError:
+        ASHBY_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    if response.status_code != 200:
+        ASHBY_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        ASHBY_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(jobs, list):
+        ASHBY_BOARD_JOBS_CACHE[board_token] = []
+        return []
+    normalized_jobs = [job for job in jobs if isinstance(job, dict)]
+    ASHBY_BOARD_JOBS_CACHE[board_token] = normalized_jobs
+    return normalized_jobs
+
+
 def _greenhouse_board_job_match_score(lead: JobLead, job: dict[str, object]) -> int:
     title = str(job.get("title") or "").strip()
     absolute_url = str(job.get("absolute_url") or "").strip()
@@ -4689,6 +4944,274 @@ async def _resolve_greenhouse_board_job_url_from_lead(lead: JobLead) -> str | No
     if best_score <= 0:
         return None
     return _normalize_direct_job_url(best_url)
+
+
+def _title_case_company_name(company_name: str) -> str:
+    words = re.split(r"[\s_-]+", company_name.strip())
+    return " ".join(word[:1].upper() + word[1:] for word in words if word)
+
+
+def _greenhouse_board_job_to_lead(
+    board_token: str,
+    company_name: str,
+    job: dict[str, object],
+) -> JobLead | None:
+    title = str(job.get("title") or "").strip()
+    absolute_url = _normalize_direct_job_url(str(job.get("absolute_url") or "").strip())
+    if not title or not absolute_url.startswith(("http://", "https://")):
+        return None
+    location_text = ""
+    location = job.get("location")
+    if isinstance(location, dict):
+        location_text = str(location.get("name") or "").strip()
+    content_text = " ".join(part for part in (title, location_text) if part)
+    if not _is_ai_related_product_manager_text(content_text):
+        return None
+    posted_date_hint = str(job.get("updated_at") or job.get("created_at") or "").strip()[:10]
+    is_remote_hint = "remote" in location_text.lower()
+    compensation_text = str(job.get("salary") or "").strip() or None
+    return JobLead(
+        company_name=company_name,
+        role_title=title,
+        source_url=f"https://job-boards.greenhouse.io/{board_token}",
+        source_type="direct_ats",
+        direct_job_url=absolute_url,
+        location_hint=location_text,
+        posted_date_hint=posted_date_hint or None,
+        is_remote_hint=is_remote_hint or None,
+        salary_text_hint=compensation_text,
+        source_query=f"company_discovery:greenhouse:{board_token}",
+        evidence_notes="Discovered via official Greenhouse board enumeration.",
+        source_quality_score_hint=10,
+    )
+
+
+def _ashby_board_job_to_lead(
+    board_token: str,
+    company_name: str,
+    job: dict[str, object],
+) -> JobLead | None:
+    title = str(job.get("title") or "").strip()
+    direct_job_url = _normalize_direct_job_url(str(job.get("jobUrl") or "").strip())
+    if not title or not direct_job_url.startswith(("http://", "https://")):
+        return None
+    description_text = str(job.get("descriptionPlain") or "").strip()
+    location_text = str(job.get("location") or "").strip()
+    if not _is_ai_related_product_manager_text(" ".join(part for part in (title, description_text) if part)):
+        return None
+    compensation = job.get("compensation") if isinstance(job.get("compensation"), dict) else {}
+    salary_text_hint = str(compensation.get("scrapeableCompensationSalarySummary") or "").strip() or None
+    is_remote = job.get("isRemote")
+    is_remote_hint = True if is_remote is True else ("remote" in location_text.lower() if location_text else None)
+    published_at = str(job.get("publishedAt") or "").strip()
+    return JobLead(
+        company_name=company_name,
+        role_title=title,
+        source_url=f"https://jobs.ashbyhq.com/{board_token}",
+        source_type="direct_ats",
+        direct_job_url=direct_job_url,
+        location_hint=location_text,
+        posted_date_hint=published_at[:10] or None,
+        is_remote_hint=is_remote_hint,
+        salary_text_hint=salary_text_hint,
+        source_query=f"company_discovery:ashby:{board_token}",
+        evidence_notes="Discovered via official Ashby board enumeration.",
+        source_quality_score_hint=10,
+    )
+
+
+def _company_discovery_trust_score(lead: JobLead) -> int:
+    if lead.source_type == "direct_ats":
+        return 10
+    if lead.source_type == "company_site":
+        return 8
+    if lead.direct_job_url and _is_allowed_direct_job_url(lead.direct_job_url):
+        return 8
+    return 5
+
+
+def _upsert_company_discovery_from_lead(
+    entries: dict[str, dict[str, object]],
+    lead: JobLead,
+    *,
+    run_id: str | None,
+    ai_pm_candidate_delta: int = 0,
+    official_board_lead_delta: int = 0,
+) -> tuple[bool, int]:
+    board_urls = [
+        url
+        for url in (lead.direct_job_url, lead.source_url)
+        if board_identifier_from_url(url)
+    ]
+    return upsert_company_discovery_entry(
+        entries,
+        company_name=lead.company_name,
+        source_url=lead.source_url,
+        careers_root=infer_careers_root(lead.direct_job_url or lead.source_url),
+        board_urls=board_urls,
+        board_identifiers=[value for value in (_extract_company_board_identifier(lead.direct_job_url), _extract_company_board_identifier(lead.source_url)) if value],
+        ats_types=[value for value in (board_url_ats_type(lead.direct_job_url), board_url_ats_type(lead.source_url)) if value],
+        source_trust=_company_discovery_trust_score(lead),
+        run_id=run_id,
+        ai_pm_candidate_delta=ai_pm_candidate_delta,
+        official_board_lead_delta=official_board_lead_delta,
+    )
+
+
+async def _fetch_page_html(url: str) -> str | None:
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20.0,
+        ) as client:
+            response = await client.get(url)
+    except httpx.RequestError:
+        return None
+    if response.status_code != 200:
+        return None
+    return response.text
+
+
+async def _collect_company_discovery_seed_leads(
+    settings: Settings,
+    *,
+    discovery_agent: Agent | None,
+    run_id: str | None,
+) -> tuple[list[JobLead], dict[str, int]]:
+    entries = load_company_discovery_entries(settings.data_dir)
+    new_company_keys: set[str] = set()
+    new_board_identifiers: set[str] = set()
+    company_keys_with_ai_pm_leads: set[str] = set()
+    official_board_leads_count = 0
+
+    query_leads: list[JobLead] = []
+    if settings.company_discovery_enabled:
+        for query in _build_company_discovery_seed_queries(settings, SearchTuning(attempt_number=1))[: max(4, settings.search_round_query_limit)]:
+            try:
+                _, discovered = await _search_query_with_context(
+                    discovery_agent,
+                    settings,
+                    query,
+                    _query_timeout_seconds_for_query(settings, query),
+                    attempt_number=1,
+                    run_id=run_id,
+                )
+            except Exception:
+                continue
+            for lead in discovered:
+                was_new_company, new_board_count = _upsert_company_discovery_from_lead(
+                    entries,
+                    lead,
+                    run_id=run_id,
+                    ai_pm_candidate_delta=1,
+                )
+                if was_new_company:
+                    new_company_keys.add(_normalize_company_key(lead.company_name))
+                if new_board_count:
+                    for identifier in (
+                        board_identifier_from_url(lead.direct_job_url),
+                        board_identifier_from_url(lead.source_url),
+                    ):
+                        if identifier:
+                            new_board_identifiers.add(identifier)
+                company_keys_with_ai_pm_leads.add(_normalize_company_key(lead.company_name))
+                query_leads.append(lead)
+
+        roots_to_crawl: list[tuple[str, dict[str, object]]] = []
+        for key, entry in sorted(
+            entries.items(),
+            key=lambda item: (
+                -int(item[1].get("official_board_lead_count") or 0),
+                -int(item[1].get("ai_pm_candidate_count") or 0),
+                str(item[1].get("company_name") or ""),
+            ),
+        )[:8]:
+            careers_roots = [str(item) for item in entry.get("careers_roots") or [] if str(item).strip()]
+            for careers_root in careers_roots[:2]:
+                roots_to_crawl.append((careers_root, entry))
+
+        for careers_root, entry in roots_to_crawl:
+            html = await _fetch_page_html(careers_root)
+            if not html:
+                continue
+            board_urls = extract_embedded_board_urls(careers_root, html)
+            if not board_urls:
+                continue
+            was_new_company, new_board_count = upsert_company_discovery_entry(
+                entries,
+                company_name=str(entry.get("company_name") or ""),
+                source_url=careers_root,
+                careers_root=careers_root,
+                board_urls=board_urls,
+                ats_types=[value for value in (board_url_ats_type(url) for url in board_urls) if value],
+                source_trust=max(int(entry.get("source_trust") or 0), 8),
+                run_id=run_id,
+            )
+            if was_new_company:
+                new_company_keys.add(_normalize_company_key(str(entry.get("company_name") or "")))
+            if new_board_count:
+                for board_url in board_urls:
+                    identifier = board_identifier_from_url(board_url)
+                    if identifier:
+                        new_board_identifiers.add(identifier)
+
+    official_board_leads: list[JobLead] = []
+    for key, entry in sorted(
+        entries.items(),
+        key=lambda item: (
+            -int(item[1].get("source_trust") or 0),
+            -int(item[1].get("official_board_lead_count") or 0),
+            -int(item[1].get("ai_pm_candidate_count") or 0),
+        ),
+    )[:12]:
+        company_name = str(entry.get("company_name") or "").strip() or _title_case_company_name(key)
+        board_identifiers = [str(item) for item in entry.get("board_identifiers") or [] if str(item).strip()]
+        for identifier in board_identifiers[:4]:
+            prefix, _, token = identifier.partition(":")
+            if not token:
+                continue
+            if prefix == "greenhouse":
+                for job in await _fetch_greenhouse_board_jobs(token):
+                    lead = _greenhouse_board_job_to_lead(token, company_name, job)
+                    if lead is None:
+                        continue
+                    official_board_leads.append(lead)
+                    official_board_leads_count += 1
+                    company_keys_with_ai_pm_leads.add(_normalize_company_key(company_name))
+                    _upsert_company_discovery_from_lead(
+                        entries,
+                        lead,
+                        run_id=run_id,
+                        ai_pm_candidate_delta=1,
+                        official_board_lead_delta=1,
+                    )
+            elif prefix == "ashby":
+                for job in await _fetch_ashby_board_jobs(token):
+                    lead = _ashby_board_job_to_lead(token, company_name, job)
+                    if lead is None:
+                        continue
+                    official_board_leads.append(lead)
+                    official_board_leads_count += 1
+                    company_keys_with_ai_pm_leads.add(_normalize_company_key(company_name))
+                    _upsert_company_discovery_from_lead(
+                        entries,
+                        lead,
+                        run_id=run_id,
+                        ai_pm_candidate_delta=1,
+                        official_board_lead_delta=1,
+                    )
+
+    save_company_discovery_entries(settings.data_dir, entries)
+    leads = _dedupe_round_leads([*query_leads, *official_board_leads], settings)
+    metrics = {
+        "new_companies_discovered_count": len(new_company_keys),
+        "new_boards_discovered_count": len(new_board_identifiers),
+        "official_board_leads_count": official_board_leads_count,
+        "companies_with_ai_pm_leads_count": len(company_keys_with_ai_pm_leads),
+        "official_roles_missed_count": official_board_leads_count,
+    }
+    return leads, metrics
 
 
 def _jsonld_graph_nodes(payload: object) -> list[dict[str, object]]:
@@ -5439,6 +5962,8 @@ async def _replay_seed_leads(
     attempt_number: int,
     status: StatusReporter | None,
     run_id: str | None = None,
+    track_as_seed_replay: bool = True,
+    status_label: str | None = None,
 ) -> tuple[int, int]:
     if not seed_leads:
         return total_unique_leads, resolved_leads_this_attempt
@@ -5494,11 +6019,13 @@ async def _replay_seed_leads(
             fresh_seed_leads,
             run_id=run_id,
         )
-    diagnostics.seed_replayed_lead_count = len(fresh_seed_leads)
+    if track_as_seed_replay:
+        diagnostics.seed_replayed_lead_count += len(fresh_seed_leads)
     if status:
         status.emit(
             "search",
-            f"Pass {attempt_number}, replaying {len(fresh_seed_leads)} seeded ATS candidates from prior findings.",
+            status_label
+            or f"Pass {attempt_number}, replaying {len(fresh_seed_leads)} seeded ATS candidates from prior findings.",
             attempt_number=attempt_number,
             round_number=0,
             unique_leads_discovered=total_unique_leads,
@@ -5707,6 +6234,8 @@ async def _replay_seed_leads(
         if validated is None:
             continue
 
+        if validated.salary_inference_kind == "salary_presumed_from_principal_ai_pm":
+            diagnostics.principal_ai_pm_salary_presumption_count += 1
         validated_key = _job_posting_dedupe_key(validated)
         post_validation_reacquisition_entry = reacquisition_entry or _validated_job_history_entry_for_url(
             validated.resolved_job_url or validated.direct_job_url,
@@ -8279,6 +8808,7 @@ async def find_matching_jobs(
     validated_job_history_index = load_validated_job_history_index(settings.data_dir)
     previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
     company_watchlist = load_company_watchlist_entries(settings.data_dir)
+    company_discovery_entries = load_company_discovery_entries(settings.data_dir) if settings.company_discovery_enabled else {}
     failed_lead_history = _load_failed_lead_history(settings)
     query_family_history = _load_query_family_history(settings)
     query_family_metrics: dict[str, dict[str, int]] = {}
@@ -8295,7 +8825,11 @@ async def find_matching_jobs(
         prioritize_recency=True,
         prioritize_salary=settings.min_base_salary_usd >= 180000,
         prioritize_remote=True,
-        focus_companies=_select_watchlist_focus_companies(settings, previously_reported_company_keys),
+        focus_companies=_select_watchlist_focus_companies(
+            settings,
+            previously_reported_company_keys,
+            company_discovery_entries=company_discovery_entries,
+        ),
     )
     for attempt_number in range(1, settings.max_adaptive_search_passes + 1):
         if len(jobs_by_url) >= stop_goal:
@@ -8324,6 +8858,61 @@ async def find_matching_jobs(
             lead_timeout_seconds = max(lead_timeout_seconds, 40)
 
         if attempt_number == 1 and len(jobs_by_url) < stop_goal:
+            if settings.company_discovery_enabled:
+                company_discovery_seed_leads, discovery_metrics = await _collect_company_discovery_seed_leads(
+                    settings,
+                    discovery_agent=discovery_agent,
+                    run_id=run_id,
+                )
+                diagnostics.new_companies_discovered_count += int(
+                    discovery_metrics.get("new_companies_discovered_count") or 0
+                )
+                diagnostics.new_boards_discovered_count += int(
+                    discovery_metrics.get("new_boards_discovered_count") or 0
+                )
+                diagnostics.official_board_leads_count += int(
+                    discovery_metrics.get("official_board_leads_count") or 0
+                )
+                diagnostics.companies_with_ai_pm_leads_count += int(
+                    discovery_metrics.get("companies_with_ai_pm_leads_count") or 0
+                )
+                diagnostics.official_roles_missed_count += int(
+                    discovery_metrics.get("official_roles_missed_count") or 0
+                )
+                _persist_search_diagnostics(settings, diagnostics)
+                if company_discovery_seed_leads:
+                    total_unique_leads, resolved_leads_this_attempt = await _replay_seed_leads(
+                        company_discovery_seed_leads,
+                        settings=settings,
+                        diagnostics=diagnostics,
+                        company_watchlist=company_watchlist,
+                        failed_lead_history=failed_lead_history,
+                        jobs_by_url=jobs_by_url,
+                        reacquired_jobs_by_url=reacquired_jobs_by_url,
+                        previously_reported_company_keys=previously_reported_company_keys,
+                        validated_job_history_index=validated_job_history_index,
+                        reacquisition_attempted_keys=reacquisition_attempted_keys,
+                        reacquisition_suppressed_keys=reacquisition_suppressed_keys,
+                        seen_lead_keys=seen_lead_keys,
+                        total_unique_leads=total_unique_leads,
+                        resolved_leads_this_attempt=resolved_leads_this_attempt,
+                        stop_goal=stop_goal,
+                        lead_timeout_seconds=lead_timeout_seconds,
+                        resolution_agent=resolution_agent,
+                        attempt_number=attempt_number,
+                        status=status,
+                        run_id=run_id,
+                        track_as_seed_replay=False,
+                        status_label=(
+                            f"Pass {attempt_number}, company discovery surfaced "
+                            f"{len(company_discovery_seed_leads)} official ATS candidates."
+                        ),
+                    )
+                    if len(jobs_by_url) >= stop_goal:
+                        diagnostics.unique_leads_discovered = total_unique_leads
+                        _persist_search_diagnostics(settings, diagnostics)
+                        break
+
             total_unique_leads, resolved_leads_this_attempt = await _replay_seed_leads(
                 _collect_replay_seed_leads(settings),
                 settings=settings,
@@ -8901,6 +9490,8 @@ async def find_matching_jobs(
                 if validated is None:
                     continue
 
+                if validated.salary_inference_kind == "salary_presumed_from_principal_ai_pm":
+                    diagnostics.principal_ai_pm_salary_presumption_count += 1
                 validated_key = _job_posting_dedupe_key(validated)
                 post_validation_reacquisition_entry = reacquisition_entry or _validated_job_history_entry_for_url(
                     validated.resolved_job_url or validated.direct_job_url,

@@ -299,6 +299,16 @@ def build_run_scorecard(
         or (status_payload or {}).get("metrics", {}).get("jobs_with_any_messages")
         or 0
     )
+    validated_jobs_with_inferred_salary_count = sum(
+        1
+        for item in [*bundle_jobs, *reacquired_items]
+        if bool(item.get("salary_inferred"))
+    )
+    principal_ai_pm_salary_presumption_count = sum(
+        1
+        for item in [*bundle_jobs, *reacquired_items]
+        if str(item.get("salary_inference_kind") or "").strip() == "salary_presumed_from_principal_ai_pm"
+    )
     actionable_near_miss_count = sum(1 for item in near_miss_items if _is_actionable_near_miss(item))
     raw_near_miss_count = len(near_miss_items)
     executed_query_count = sum(
@@ -344,6 +354,8 @@ def build_run_scorecard(
             novel_validated_jobs_count=novel_validated_jobs_count,
             reacquired_validated_jobs_count=reacquired_validated_jobs_count,
             total_current_validated_jobs_count=total_current_validated_jobs_count,
+            validated_jobs_with_inferred_salary_count=validated_jobs_with_inferred_salary_count,
+            principal_ai_pm_salary_presumption_count=principal_ai_pm_salary_presumption_count,
             jobs_with_messages_count=jobs_with_messages_count,
             unique_leads_discovered_count=unique_leads_discovered,
             fresh_new_leads_count=fresh_new_leads_count,
@@ -356,12 +368,21 @@ def build_run_scorecard(
             replayed_seed_leads_count=replayed_seed_leads_count,
             reacquisition_attempt_count=reacquisition_attempt_count,
             reacquired_jobs_suppressed_count=reacquired_jobs_suppressed_count,
+            new_companies_discovered_count=int(diagnostics_payload.get("new_companies_discovered_count") or 0),
+            new_boards_discovered_count=int(diagnostics_payload.get("new_boards_discovered_count") or 0),
+            official_board_leads_count=int(diagnostics_payload.get("official_board_leads_count") or 0),
+            companies_with_ai_pm_leads_count=int(diagnostics_payload.get("companies_with_ai_pm_leads_count") or 0),
             repeated_failed_leads_suppressed_count=int(failure_counts.get("repeated_failed_lead") or 0),
             executed_query_count=executed_query_count,
             query_timeout_count=int(failure_counts.get("query_timeout") or 0),
             query_skipped_timeout_budget_count=int(failure_counts.get("query_skipped_timeout_budget") or 0),
             zero_yield_pass_count=zero_yield_pass_count,
             discovery_efficiency=round(fresh_new_leads_count / executed_query_count, 3) if executed_query_count else 0.0,
+            company_discovery_yield=round(
+                int(diagnostics_payload.get("companies_with_ai_pm_leads_count") or 0)
+                / max(1, int(diagnostics_payload.get("new_companies_discovered_count") or 0)),
+                3,
+            ),
         ),
         validation=RunValidationMetrics(
             validated_jobs_count=validated_jobs_count,
@@ -374,6 +395,9 @@ def build_run_scorecard(
             reacquired_jobs_suppressed_count=reacquired_jobs_suppressed_count,
             reacquisition_yield=round(reacquired_validated_jobs_count / reacquisition_attempt_count, 3) if reacquisition_attempt_count else 0.0,
             coverage_retention_rate=None,
+            validated_jobs_with_inferred_salary_count=validated_jobs_with_inferred_salary_count,
+            principal_ai_pm_salary_presumption_count=principal_ai_pm_salary_presumption_count,
+            official_roles_missed_count=int(diagnostics_payload.get("official_roles_missed_count") or 0),
             jobs_with_messages_count=jobs_with_messages_count,
             message_coverage_rate=round(jobs_with_messages_count / validated_jobs_count, 3) if validated_jobs_count else 0.0,
             raw_near_miss_count=raw_near_miss_count,
@@ -422,6 +446,7 @@ def build_run_scorecard(
         near_miss_docx_path=str(manifest_payload.get("near_miss_docx_path") or "") or None,
         near_miss_json_path=str(manifest_payload.get("near_miss_json_path") or "") or None,
         ollama_summary_json_path=str(manifest_payload.get("ollama_summary_json_path") or "") or None,
+        company_discovery_json_path=str(manifest_payload.get("company_discovery_json_path") or "") or None,
     )
 
 

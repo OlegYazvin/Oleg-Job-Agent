@@ -131,6 +131,8 @@ def _format_scorecard_summary(scorecard: dict[str, Any] | None) -> str:
         f"Jobs with messages: {int(outcome.get('jobs_with_messages_count') or 0)}\n"
         f"Fresh leads: {int(outcome.get('fresh_new_leads_count') or 0)} | "
         f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}\n"
+        f"New companies: {int(discovery.get('new_companies_discovered_count') or 0)} | "
+        f"New boards: {int(discovery.get('new_boards_discovered_count') or 0)}\n"
         f"Timeouts: {int(discovery.get('query_timeout_count') or 0)} | "
         f"Validation yield: {validation.get('validated_yield', 0.0)}"
     )
@@ -151,6 +153,12 @@ def _scorecard_detail_lines(scorecard: dict[str, Any] | None) -> list[str]:
         f"Reacquired validated jobs: {int(outcome.get('reacquired_validated_jobs_count') or 0)}",
         f"Fresh new leads: {int(outcome.get('fresh_new_leads_count') or 0)}",
         f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}",
+        f"Validated jobs with inferred salary: {int(outcome.get('validated_jobs_with_inferred_salary_count') or validation.get('validated_jobs_with_inferred_salary_count') or 0)}",
+        f"Principal AI PM salary presumptions: {int(outcome.get('principal_ai_pm_salary_presumption_count') or validation.get('principal_ai_pm_salary_presumption_count') or 0)}",
+        f"New companies discovered: {int(discovery.get('new_companies_discovered_count') or 0)}",
+        f"New boards discovered: {int(discovery.get('new_boards_discovered_count') or 0)}",
+        f"Official-board leads: {int(discovery.get('official_board_leads_count') or 0)}",
+        f"Company discovery yield: {discovery.get('company_discovery_yield', 0.0)}",
         f"Replay seeds: {int(discovery.get('replayed_seed_leads_count') or 0)}",
         f"Reacquisition attempts: {int(discovery.get('reacquisition_attempt_count') or 0)}",
         f"Suppressed repeats: {int(discovery.get('reacquired_jobs_suppressed_count') or 0)}",
@@ -160,6 +168,7 @@ def _scorecard_detail_lines(scorecard: dict[str, Any] | None) -> list[str]:
         f"Novel validated yield: {validation.get('novel_validated_yield', validation.get('validated_yield', 0.0))}",
         f"Reacquisition yield: {validation.get('reacquisition_yield', 0.0)}",
         f"Message coverage: {validation.get('message_coverage_rate', 0.0)}",
+        f"Official roles missed: {int(validation.get('official_roles_missed_count') or 0)}",
         f"Ollama requests: {int(ollama.get('request_count') or 0)}",
         f"Ollama useful/request: {ollama.get('useful_actions_per_request', 0.0)}",
         f"Duration (s): {timing.get('duration_seconds', 'n/a')}",

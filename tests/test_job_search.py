@@ -3,6 +3,7 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 
+from job_agent.company_discovery import load_company_discovery_entries
 from job_agent.config import Settings
 from job_agent.history import load_validated_job_history_index
 from job_agent.job_search import (
@@ -30,6 +31,7 @@ from job_agent.job_search import (
     _candidate_direct_job_url_is_trustworthy,
     _company_names_match,
     _company_hint_from_url,
+    _collect_company_discovery_seed_leads,
     _collect_replay_seed_leads,
     _dedupe_round_leads,
     _deterministic_trim_local_leads,
@@ -124,6 +126,8 @@ def build_settings() -> Settings:
         search_city="Chicago",
         search_region="Illinois",
         min_base_salary_usd=200000,
+        enable_principal_ai_pm_salary_presumption=True,
+        company_discovery_enabled=True,
         posted_within_days=7,
         minimum_qualifying_jobs=5,
         target_job_count=10,
@@ -722,8 +726,70 @@ def test_apply_salary_inference_accepts_us_remote_principal_role_without_explici
     )
     inferred = _apply_salary_inference(job, snapshot, settings)
     assert inferred.salary_inferred is True
+    assert inferred.salary_inference_kind == "salary_presumed_from_principal_ai_pm"
     reason_code, detail = _evaluate_merged_job(inferred, snapshot, settings, expected_company_name="Webflow")
     assert reason_code is None, detail
+
+
+def test_apply_salary_inference_rejects_geo_limited_principal_remote_role(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
+    job = JobPosting(
+        company_name="Webflow",
+        role_title="Principal Product Manager, AI",
+        direct_job_url="https://boards.greenhouse.io/webflow/jobs/123",
+        ats_platform="Greenhouse",
+        location_text="Remote, United States only",
+        is_fully_remote=True,
+        posted_date_text="2 days ago",
+        posted_date_iso="2026-03-22",
+        base_salary_min_usd=None,
+        base_salary_max_usd=None,
+        salary_text=None,
+        evidence_notes="Remote within the United States only.",
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Greenhouse",
+        status_code=200,
+        location_text="Remote, United States only",
+        text_excerpt="Principal Product Manager, AI. Remote within the United States only.",
+    )
+    inferred = _apply_salary_inference(job, snapshot, settings)
+    assert inferred.salary_inferred is False
+    assert inferred.salary_inference_kind is None
+
+
+def test_principal_salary_presumption_does_not_override_explicit_low_salary(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
+    job = JobPosting(
+        company_name="Webflow",
+        role_title="Principal Product Manager, AI",
+        direct_job_url="https://boards.greenhouse.io/webflow/jobs/123",
+        ats_platform="Greenhouse",
+        location_text="Remote, United States",
+        is_fully_remote=True,
+        posted_date_text="2 days ago",
+        posted_date_iso="2026-03-22",
+        base_salary_min_usd=150000,
+        base_salary_max_usd=180000,
+        salary_text="$150,000 - $180,000",
+        evidence_notes="US remote principal AI product role with explicit comp.",
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Greenhouse",
+        status_code=200,
+        location_text="Remote, United States",
+        text_excerpt="Principal Product Manager, AI. Remote - United States.",
+    )
+    inferred = _apply_salary_inference(job, snapshot, settings)
+    assert inferred.salary_inferred is False
+    reason_code, _detail = _evaluate_merged_job(inferred, snapshot, settings, expected_company_name="Webflow")
+    assert reason_code == "salary_below_min"
 
 
 def test_apply_salary_inference_does_not_use_search_snippet_title_noise_for_senior_role() -> None:
@@ -5077,3 +5143,73 @@ def test_dead_attempt_helpers_stop_timeout_heavy_zero_yield_passes() -> None:
         attempt_discovery_gain=0,
         resolved_leads_this_attempt=0,
     )
+
+
+def test_collect_company_discovery_seed_leads_discovers_embedded_ashby_board(monkeypatch, tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_search_query_with_context(*_args, **_kwargs):
+        return (
+            "company discovery query",
+            [
+                JobLead(
+                    company_name="ButterflyMX",
+                    role_title="Principal Product Manager, AI",
+                    source_url="https://butterflymx.com/careers",
+                    source_type="company_site",
+                    direct_job_url=None,
+                    location_hint="US Remote",
+                    posted_date_hint="2026-04-01",
+                    is_remote_hint=True,
+                    evidence_notes="Official company careers page mentions the AI PM role.",
+                )
+            ],
+        )
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return '<html><body><a href="https://jobs.ashbyhq.com/butterflymx">Jobs</a></body></html>'
+
+    async def fake_fetch_ashby_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Principal Product Manager, AI",
+                "jobUrl": "https://jobs.ashbyhq.com/butterflymx/6f6f5da0-fb6c-4a6b-9fc1-21909f51f931",
+                "publishedAt": "2026-04-02T12:00:00+00:00",
+                "isRemote": True,
+                "workplaceType": "Remote",
+                "location": "US Remote",
+                "descriptionPlain": "Lead AI and ML product strategy for a remote product platform.",
+                "compensation": {"scrapeableCompensationSalarySummary": None},
+            }
+        ]
+
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: ["q"])
+    monkeypatch.setattr("job_agent.job_search._search_query_with_context", fake_search_query_with_context)
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+    monkeypatch.setattr("job_agent.job_search._fetch_ashby_board_jobs", fake_fetch_ashby_board_jobs)
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+        )
+    )
+
+    assert any(
+        lead.direct_job_url == "https://jobs.ashbyhq.com/butterflymx/6f6f5da0-fb6c-4a6b-9fc1-21909f51f931"
+        for lead in leads
+    )
+    assert metrics["new_companies_discovered_count"] == 1
+    assert metrics["new_boards_discovered_count"] >= 1
+    assert metrics["official_board_leads_count"] == 1
+
+    entries = load_company_discovery_entries(settings.data_dir)
+    butterfly_entry = entries["butterflymx"]
+    assert "ashby:butterflymx" in butterfly_entry["board_identifiers"]
+    assert butterfly_entry["official_board_lead_count"] >= 1

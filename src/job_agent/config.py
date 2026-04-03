@@ -35,6 +35,8 @@ class Settings:
     search_city: str
     search_region: str
     min_base_salary_usd: int
+    enable_principal_ai_pm_salary_presumption: bool
+    company_discovery_enabled: bool
     posted_within_days: int
     minimum_qualifying_jobs: int
     target_job_count: int
@@ -83,6 +85,7 @@ class Settings:
     ollama_enable_auto_tune: bool = True
     ollama_degraded_for_run: bool = False
     ollama_degraded_reason: str | None = None
+    auto_loop_max_workflow_reruns_per_iteration: int = 2
 
     @property
     def user_location(self) -> dict[str, object]:
@@ -203,6 +206,12 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         search_city=os.getenv("JOB_SEARCH_CITY", "Chicago"),
         search_region=os.getenv("JOB_SEARCH_REGION", "Illinois"),
         min_base_salary_usd=int(os.getenv("MIN_BASE_SALARY_USD", "200000")),
+        enable_principal_ai_pm_salary_presumption=os.getenv(
+            "ENABLE_PRINCIPAL_AI_PM_SALARY_PRESUMPTION",
+            "true",
+        ).lower()
+        == "true",
+        company_discovery_enabled=os.getenv("COMPANY_DISCOVERY_ENABLED", "true").lower() == "true",
         posted_within_days=int(os.getenv("POSTED_WITHIN_DAYS", "14")),
         minimum_qualifying_jobs=int(os.getenv("MINIMUM_QUALIFYING_JOBS", "5")),
         target_job_count=int(os.getenv("TARGET_JOB_COUNT", "10")),
@@ -256,4 +265,8 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         firefox_extension_profile_dir=firefox_extension_profile_dir,
         ollama_degraded_model=os.getenv("OLLAMA_DEGRADED_MODEL", "qwen2.5:7b-instruct"),
         ollama_enable_auto_tune=os.getenv("OLLAMA_ENABLE_AUTO_TUNE", "true").lower() == "true",
+        auto_loop_max_workflow_reruns_per_iteration=max(
+            0,
+            int(os.getenv("AUTO_LOOP_MAX_WORKFLOW_RERUNS_PER_ITERATION", "2")),
+        ),
     )

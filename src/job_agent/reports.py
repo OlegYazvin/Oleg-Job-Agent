@@ -31,6 +31,15 @@ def _write_latest_alias(source_path: Path, latest_path: Path) -> None:
     shutil.copy2(source_path, latest_path)
 
 
+def _display_salary(job: JobPosting) -> str:
+    salary_text = job.salary_text or ""
+    if not job.salary_inferred:
+        return salary_text
+    if salary_text:
+        return f"{salary_text} (inferred)"
+    return "Inferred salary qualification"
+
+
 def build_message_document(
     bundles: list[JobOutreachBundle],
     output_dir: Path,
@@ -119,7 +128,7 @@ def build_summary_document(
         row[1].text = bundle.job.role_title
         row[2].text = str(bundle.job.direct_job_url)
         row[3].text = bundle.job.posted_date_text
-        row[4].text = bundle.job.salary_text or ""
+        row[4].text = _display_salary(bundle.job)
         row[5].text = str(len(bundle.first_order_contacts))
         row[6].text = str(len(bundle.second_order_contacts))
         row[7].text = str(_count_second_order_targets_with_messages(bundle))
@@ -138,6 +147,8 @@ def build_summary_document(
                 document.add_paragraph(f"Previously reported most recently: {job.last_reported_at}")
             if job.report_count is not None:
                 document.add_paragraph(f"Times reacquired/reported: {job.report_count}")
+            if job.salary_inferred:
+                document.add_paragraph(f"Salary: {_display_salary(job)}")
             evidence_summary = job.evidence_notes or (job.validation_evidence[0] if job.validation_evidence else "")
             if evidence_summary:
                 document.add_paragraph(f"Current validation evidence: {evidence_summary}")
@@ -320,6 +331,7 @@ def build_manifest(
     summary_docx_path: Path,
     near_misses: list[NearMissJob] | None = None,
     reacquired_jobs_json_path: Path | None = None,
+    company_discovery_json_path: Path | None = None,
     near_miss_docx_path: Path | None = None,
     near_miss_json_path: Path | None = None,
     ollama_summary_json_path: Path | None = None,
@@ -343,6 +355,7 @@ def build_manifest(
         reacquired_validated_jobs_count=reacquired_validated_jobs_count,
         total_current_validated_jobs_count=novel_validated_jobs_count + reacquired_validated_jobs_count,
         reacquired_jobs_json_path=str(reacquired_jobs_json_path) if reacquired_jobs_json_path else None,
+        company_discovery_json_path=str(company_discovery_json_path) if company_discovery_json_path else None,
         near_miss_docx_path=str(near_miss_docx_path) if near_miss_docx_path else None,
         near_miss_json_path=str(near_miss_json_path) if near_miss_json_path else None,
         ollama_summary_json_path=str(ollama_summary_json_path) if ollama_summary_json_path else None,

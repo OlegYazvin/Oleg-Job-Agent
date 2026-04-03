@@ -46,6 +46,9 @@ THEME_COMMIT_SUMMARIES = {
     "plateau_breaker": "break repeated-theme plateau",
     "coverage_regression": "preserve reacquired validated coverage",
     "diversification_gap": "increase novel validated job discovery",
+    "company_discovery_gap": "expand built-in company and board discovery",
+    "official_board_coverage_gap": "close official board coverage gaps",
+    "salary_presumption_opportunity": "apply principal AI PM salary presumption",
     "general_iterative_improvement": "apply bounded iterative improvement",
 }
 
@@ -434,6 +437,9 @@ def _analysis_artifact_paths(settings: Settings, run_id: str | None) -> dict[str
         artifact_paths["live_status"] = str(settings.live_status_path)
     if (settings.data_dir / "run-scorecard-latest.json").exists():
         artifact_paths["run_scorecard"] = str(settings.data_dir / "run-scorecard-latest.json")
+    company_discovery_path = settings.data_dir / "company-discovery-index.json"
+    if company_discovery_path.exists():
+        artifact_paths["company_discovery_index"] = str(company_discovery_path)
     return artifact_paths
 
 
@@ -563,6 +569,40 @@ def _build_patterns(
             )
         )
 
+    if (
+        current.discovery.new_companies_discovered_count == 0
+        and current.discovery.new_boards_discovered_count == 0
+        and current.outcome.total_current_validated_jobs_count == 0
+        and current.outcome.fresh_new_leads_count <= 6
+    ):
+        patterns.append(
+            _pattern(
+                "company_discovery_gap",
+                "The workflow is not expanding its company/board universe enough; improve built-in company discovery instead of relying on replay seeds and known companies.",
+                42.0,
+                new_companies_discovered_count=current.discovery.new_companies_discovered_count,
+                new_boards_discovered_count=current.discovery.new_boards_discovered_count,
+                fresh_new_leads_count=current.outcome.fresh_new_leads_count,
+            )
+        )
+
+    if (
+        current.validation.official_roles_missed_count > 0
+        or (
+            current.discovery.official_board_leads_count > 0
+            and current.outcome.total_current_validated_jobs_count == 0
+        )
+    ):
+        patterns.append(
+            _pattern(
+                "official_board_coverage_gap",
+                "Official ATS board discovery is surfacing roles that are not converting into current validated coverage; improve board ingestion and validation follow-through.",
+                38.0,
+                official_board_leads_count=current.discovery.official_board_leads_count,
+                official_roles_missed_count=current.validation.official_roles_missed_count,
+            )
+        )
+
     resolution_noise = (
         current.validation.company_mismatch_count
         + current.validation.not_specific_job_page_count
@@ -621,7 +661,7 @@ def _build_patterns(
 
     if (
         repeated_theme
-        and repeated_theme_streak >= 3
+        and repeated_theme_streak >= 2
         and len(recent_window) >= 4
         and all(entry.outcome.novel_validated_jobs_count == 0 for entry in recent_window)
         and all(entry.outcome.total_current_validated_jobs_count == 0 for entry in recent_window)
@@ -690,6 +730,20 @@ def _build_patterns(
             )
         )
 
+    if (
+        current.validation.missing_salary_count >= 1
+        and current.validation.principal_ai_pm_salary_presumption_count == 0
+    ):
+        patterns.append(
+            _pattern(
+                "salary_presumption_opportunity",
+                "Principal AI PM roles are still being lost to missing salary; apply or strengthen the principal-level salary presumption path.",
+                26.0 + current.validation.missing_salary_count,
+                missing_salary_count=current.validation.missing_salary_count,
+                principal_ai_pm_salary_presumption_count=current.validation.principal_ai_pm_salary_presumption_count,
+            )
+        )
+
     if not patterns:
         validated_avg = _average_metric(previous_entries or window, lambda item: item.outcome.novel_validated_jobs_count)
         patterns.append(
@@ -731,6 +785,65 @@ def _metric_deltas(window: list[RunScorecard]) -> dict[str, float]:
     }
 
 
+def _scorecard_metrics_for_run(settings: Settings, run_id: str | None) -> dict[str, float | int | None]:
+    if not run_id:
+        return {}
+    for entry in _scorecard_window(settings, run_id, limit=1):
+        if entry.run_id != run_id:
+            continue
+        return {
+            "novel_validated_jobs_count": entry.outcome.novel_validated_jobs_count,
+            "reacquired_validated_jobs_count": entry.outcome.reacquired_validated_jobs_count,
+            "total_current_validated_jobs_count": entry.outcome.total_current_validated_jobs_count,
+            "fresh_new_leads_count": entry.outcome.fresh_new_leads_count,
+            "jobs_with_messages_count": entry.outcome.jobs_with_messages_count,
+            "actionable_near_miss_count": entry.outcome.actionable_near_miss_count,
+            "query_timeout_count": entry.discovery.query_timeout_count,
+            "new_companies_discovered_count": entry.discovery.new_companies_discovered_count,
+            "new_boards_discovered_count": entry.discovery.new_boards_discovered_count,
+            "official_board_leads_count": entry.discovery.official_board_leads_count,
+            "principal_ai_pm_salary_presumption_count": entry.validation.principal_ai_pm_salary_presumption_count,
+        }
+    return {}
+
+
+def _metric_comparison(
+    before_metrics: dict[str, float | int | None],
+    after_metrics: dict[str, float | int | None],
+) -> dict[str, float | int | str | None]:
+    comparison: dict[str, float | int | str | None] = {}
+    for key in sorted(set(before_metrics) | set(after_metrics)):
+        before = before_metrics.get(key)
+        after = after_metrics.get(key)
+        comparison[f"before_{key}"] = before
+        comparison[f"after_{key}"] = after
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            comparison[f"delta_{key}"] = round(float(after) - float(before), 3)
+    return comparison
+
+
+def _rerun_metrics_are_acceptable(
+    before_metrics: dict[str, float | int | None],
+    after_metrics: dict[str, float | int | None],
+) -> bool:
+    if not after_metrics:
+        return False
+    before_total = float(before_metrics.get("total_current_validated_jobs_count") or 0)
+    after_total = float(after_metrics.get("total_current_validated_jobs_count") or 0)
+    before_fresh = float(before_metrics.get("fresh_new_leads_count") or 0)
+    after_fresh = float(after_metrics.get("fresh_new_leads_count") or 0)
+    before_messages = float(before_metrics.get("jobs_with_messages_count") or 0)
+    after_messages = float(after_metrics.get("jobs_with_messages_count") or 0)
+    before_timeouts = float(before_metrics.get("query_timeout_count") or 0)
+    after_timeouts = float(after_metrics.get("query_timeout_count") or 0)
+    return (
+        after_total >= before_total
+        and after_messages >= before_messages
+        and after_fresh >= max(0.0, before_fresh - 2.0)
+        and after_timeouts <= before_timeouts + 3.0
+    )
+
+
 def build_run_improvement_analysis(
     settings: Settings,
     *,
@@ -757,11 +870,18 @@ def build_run_improvement_analysis(
             "jobs_with_messages_count": current.outcome.jobs_with_messages_count,
             "fresh_new_leads_count": current.outcome.fresh_new_leads_count,
             "actionable_near_miss_count": current.outcome.actionable_near_miss_count,
+            "validated_jobs_with_inferred_salary_count": current.outcome.validated_jobs_with_inferred_salary_count,
+            "principal_ai_pm_salary_presumption_count": current.outcome.principal_ai_pm_salary_presumption_count,
             "query_timeout_count": current.discovery.query_timeout_count,
             "query_skipped_timeout_budget_count": current.discovery.query_skipped_timeout_budget_count,
             "replayed_seed_leads_count": current.discovery.replayed_seed_leads_count,
             "reacquisition_attempt_count": current.discovery.reacquisition_attempt_count,
             "reacquired_jobs_suppressed_count": current.discovery.reacquired_jobs_suppressed_count,
+            "new_companies_discovered_count": current.discovery.new_companies_discovered_count,
+            "new_boards_discovered_count": current.discovery.new_boards_discovered_count,
+            "official_board_leads_count": current.discovery.official_board_leads_count,
+            "companies_with_ai_pm_leads_count": current.discovery.companies_with_ai_pm_leads_count,
+            "company_discovery_yield": current.discovery.company_discovery_yield,
             "discovery_efficiency": current.discovery.discovery_efficiency,
             "validated_yield": current.validation.validated_yield,
             "novel_validated_yield": current.validation.novel_validated_yield,
@@ -771,13 +891,14 @@ def build_run_improvement_analysis(
             "fetch_non_200_count": current.validation.fetch_non_200_count,
             "not_remote_count": current.validation.not_remote_count,
             "stale_posting_count": current.validation.stale_posting_count,
+            "official_roles_missed_count": current.validation.official_roles_missed_count,
             "ollama_request_count": current.ollama.request_count,
             "ollama_useful_actions_per_request": current.ollama.useful_actions_per_request,
         }
     acceptance_checks = [
-        "Run `PYTHONPATH=src .venv/bin/pytest -q` successfully.",
+        "Run targeted tests for the changed area and then `PYTHONPATH=src .venv/bin/pytest -q` successfully.",
         "Leave the repository in a clean, committable state.",
-        "Do not run the workflow again.",
+        "The controller will rerun the workflow for evidence after validation; you do not need to run it yourself.",
         "Do not commit or sync; the controller handles commits.",
     ]
     return RunImprovementAnalysis(
@@ -828,7 +949,7 @@ def render_codex_prompt(
     recent_theme_lines = [f"- `{theme}`" for theme in analysis.recent_selected_themes]
     repeated_theme, repeated_theme_streak = _theme_streak(analysis.recent_selected_themes)
     plateau_guardrails: list[str] = []
-    if repeated_theme and repeated_theme_streak >= 3:
+    if repeated_theme and repeated_theme_streak >= 2:
         plateau_guardrails = [
             f"- Recent theme streak: `{repeated_theme}` x{repeated_theme_streak}.",
             "- Do not spend this iteration on another micro-tweak in that same area unless you can directly change a primary metric trend.",
@@ -860,15 +981,16 @@ def render_codex_prompt(
             *(artifact_lines or ["- No artifact paths were available."]),
             "",
             "Task:",
-            f"Implement exactly one bounded improvement batch for `{analysis.selected_theme}`.",
-            "Prefer the smallest change set that materially addresses the selected theme.",
+            f"Implement one primary improvement batch for `{analysis.selected_theme}`.",
+            "You may include up to two adjacent fixes if they are part of the same failure frontier.",
+            "Prefer the smallest coherent change set that can materially improve the selected theme without forcing another plateau micro-tweak.",
             "",
             "Required behavior:",
             "- Inspect the repository and relevant artifacts as needed.",
             "- Make the code changes yourself.",
             "- Run the required validation check(s).",
             "- Summarize what changed, what tests ran, and whether they passed.",
-            "- Do not run the workflow again.",
+            "- The controller may rerun the workflow after your changes to measure before/after behavior; you do not need to run it yourself.",
             "- Do not commit, push, or sync.",
             "",
             "Acceptance checks:",
@@ -979,6 +1101,7 @@ async def run_autonomous_loop(
         iteration.analysis_path = str(paths["analysis"])
         iteration.prompt_path = str(paths["prompt"])
         iteration.selected_theme = analysis.selected_theme
+        baseline_metrics = _scorecard_metrics_for_run(settings, run_id) or dict(analysis.current_metrics)
 
         base_prompt = prompt
         retry_prompt = prompt
@@ -1192,6 +1315,83 @@ async def run_autonomous_loop(
                     failed=False,
                 )
                 break
+
+            rerun_run_ids: list[str] = []
+            metric_comparison: dict[str, float | int | str | None] = {}
+            rerun_limit = max(0, settings.auto_loop_max_workflow_reruns_per_iteration)
+            rerun_metrics_ok = rerun_limit == 0
+            rerun_failure_summary: str | None = None
+            if rerun_limit > 0:
+                for rerun_index in range(1, rerun_limit + 1):
+                    write_auto_loop_status(
+                        settings,
+                        state,
+                        stage="rerun",
+                        message=(
+                            f"Running workflow evidence rerun {rerun_index}/{rerun_limit} "
+                            f"for iteration {iteration_number}."
+                        ),
+                    )
+                    rerun_run_id, rerun_status, rerun_failure = await _run_workflow_attempt(
+                        settings,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    rerun_run_ids.append(rerun_run_id)
+                    if rerun_status != "completed":
+                        rerun_failure_summary = rerun_failure or "Workflow evidence rerun failed."
+                        break
+                    after_metrics = _scorecard_metrics_for_run(settings, rerun_run_id)
+                    metric_comparison = _metric_comparison(baseline_metrics, after_metrics)
+                    if _rerun_metrics_are_acceptable(baseline_metrics, after_metrics):
+                        rerun_metrics_ok = True
+                        break
+                codex_result.workflow_rerun_run_ids = rerun_run_ids
+                codex_result.workflow_rerun_count = len(rerun_run_ids)
+                codex_result.metric_comparison = metric_comparison
+                if rerun_failure_summary is not None or not rerun_metrics_ok:
+                    failure_summary = rerun_failure_summary or "Workflow evidence reruns regressed the targeted metrics."
+                    codex_result.status = "rerun_failed" if rerun_failure_summary else "rerun_regressed"
+                    codex_result.summary = failure_summary
+                    if codex_attempt < AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION:
+                        retry_prompt = _render_codex_retry_prompt(
+                            base_prompt,
+                            attempt_number=codex_attempt + 1,
+                            codex_result=codex_result,
+                            validation_results=validation_results,
+                        )
+                        state.last_failure_summary = failure_summary
+                        save_auto_loop_state(settings, state)
+                        write_auto_loop_status(
+                            settings,
+                            state,
+                            stage="rerun",
+                            message=(
+                                f"Workflow rerun evidence was not good enough after Codex attempt {codex_attempt}. "
+                                f"Retrying repair attempt {codex_attempt + 1}/{AUTO_LOOP_CODEX_MAX_ATTEMPTS_PER_ITERATION}."
+                            ),
+                        )
+                        continue
+                    _record_failed_iteration(
+                        settings,
+                        state=state,
+                        iteration=iteration,
+                        paths=paths,
+                        codex_result=codex_result,
+                        failure_status=codex_result.status,
+                        failure_summary=failure_summary,
+                    )
+                    write_auto_loop_status(
+                        settings,
+                        state,
+                        stage="rerun",
+                        message=(
+                            f"Iteration {iteration_number} failed workflow evidence reruns. "
+                            "Continuing to the next workflow attempt."
+                        ),
+                        done=False,
+                        failed=False,
+                    )
+                    break
 
             try:
                 commit_hash = _commit_all_changes(settings, _commit_message(iteration_number, analysis.selected_theme))
