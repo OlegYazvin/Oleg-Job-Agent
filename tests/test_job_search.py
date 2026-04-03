@@ -3266,6 +3266,45 @@ def test_refine_local_leads_with_ollama_skips_forced_modes_without_cleanup_signa
     assert refined == [lead_one, lead_two]
 
 
+def test_refine_local_leads_with_ollama_allows_single_forced_seed_without_cleanup_signals(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead = JobLead(
+        company_name="Krisp",
+        role_title="Senior Product Manager, Voice AI SDK",
+        source_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
+        source_type="company_site",
+        direct_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        evidence_notes="Direct company role.",
+    )
+    cleanup_calls: list[str] = []
+
+    async def fake_cleanup(_settings: Settings, _query: str, leads: list[JobLead], **_kwargs) -> list[JobLead]:
+        cleanup_calls.append("called")
+        return leads
+
+    monkeypatch.setattr("job_agent.job_search._cleanup_local_leads_with_ollama", fake_cleanup)
+
+    refined = asyncio.run(
+        _refine_local_leads_with_ollama(
+            settings,
+            "seed replay triage",
+            [lead],
+            cleanup_limit=1,
+            refinement_mode="forced_seed_triage",
+            pre_refinement_average_confidence=0.9,
+            pre_refinement_cleanup_signal_count=0,
+            pre_refinement_trustworthy_direct_url_count=1,
+            run_id="run-single-seed-guard",
+        )
+    )
+
+    assert cleanup_calls == ["called"]
+    assert len(refined) == 1
+    assert refined[0].company_name == "Krisp"
+    assert refined[0].direct_job_url == "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk"
+
+
 def test_refine_local_leads_with_ollama_allows_clean_forced_round_samples(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

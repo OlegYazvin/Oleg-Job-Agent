@@ -5886,7 +5886,17 @@ async def _refine_local_leads_with_ollama(
     if not candidate_pool or settings.llm_provider != "ollama" or settings.ollama_degraded_for_run:
         return candidate_pool
     forced_refinement_mode = refinement_mode in {"forced_sample", "forced_seed_triage"}
-    if forced_refinement_mode and (pre_refinement_cleanup_signal_count or 0) <= 0:
+    allow_single_seed_triage_without_cleanup = (
+        refinement_mode == "forced_seed_triage"
+        and len(candidate_pool) == 1
+        and (pre_refinement_average_confidence or 0.0) >= 0.9
+        and (pre_refinement_trustworthy_direct_url_count or 0) >= 1
+    )
+    if (
+        forced_refinement_mode
+        and (pre_refinement_cleanup_signal_count or 0) <= 0
+        and not allow_single_seed_triage_without_cleanup
+    ):
         record_ollama_event(
             settings,
             "lead_refinement_skip",
