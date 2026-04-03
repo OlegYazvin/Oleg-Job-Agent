@@ -250,11 +250,11 @@ FAILED_LEAD_TRACKED_REASON_CODES = {
     "already_reported",
 }
 FAILED_LEAD_IMMEDIATE_SUPPRESS_REASON_CODES = {
-    "company_mismatch",
     "direct_url_not_allowed",
     "not_specific_job_page",
 }
 FAILED_LEAD_REPEAT_SUPPRESS_THRESHOLDS = {
+    "company_mismatch": 2,
     "stale_posting": 2,
     "not_remote": 2,
     "remote_unclear": 3,

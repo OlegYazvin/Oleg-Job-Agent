@@ -2585,6 +2585,37 @@ def test_failed_lead_history_skip_reason_ignores_vendor_host_company_mismatch() 
     assert _failed_lead_history_skip_reason(lead, settings, history) is None
 
 
+def test_failed_lead_history_skip_reason_requires_repeated_company_mismatch() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Acme AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://boards.greenhouse.io/dominos/jobs/123",
+        source_type="direct_ats",
+        direct_job_url="https://boards.greenhouse.io/dominos/jobs/123",
+        evidence_notes="Direct ATS role.",
+    )
+    one_mismatch_history = {
+        "url:https://boards.greenhouse.io/dominos/jobs/123": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"company_mismatch": 1},
+        }
+    }
+    repeated_mismatch_history = {
+        "url:https://boards.greenhouse.io/dominos/jobs/123": {
+            "watch_count": 2,
+            "recent_rejection_reasons": {"company_mismatch": 2},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, one_mismatch_history) is None
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, repeated_mismatch_history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "company_mismatch"
+
+
 def test_persist_validated_jobs_checkpoint_writes_current_jobs(tmp_path: Path) -> None:
     settings = build_settings()
     settings.data_dir = tmp_path
