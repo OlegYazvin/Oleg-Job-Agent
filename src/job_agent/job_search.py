@@ -4032,12 +4032,21 @@ def _ollama_refinement_mode_for_local_leads(
     low_trust_source_count: int,
     trustworthy_direct_url_count: int,
 ) -> str | None:
-    if settings.llm_provider != "ollama" or candidate_pool_count < 3:
+    single_high_confidence_direct_candidate = (
+        candidate_pool_count == 1
+        and cleanup_signal_count == 0
+        and low_trust_source_count == 0
+        and trustworthy_direct_url_count >= 1
+        and average_confidence >= 0.9
+    )
+    if settings.llm_provider != "ollama" or (candidate_pool_count < 3 and not single_high_confidence_direct_candidate):
         return None
     if average_confidence < min(settings.local_confidence_threshold + 0.1, 0.9):
         return "low_confidence"
     if trustworthy_direct_url_count == 0:
         return "no_trustworthy_direct_urls"
+    if single_high_confidence_direct_candidate:
+        return "trusted_direct_bundle"
     if (
         _query_targets_startup_ecosystem(query)
         and candidate_pool_count >= 5
