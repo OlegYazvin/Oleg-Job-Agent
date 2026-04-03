@@ -3422,6 +3422,46 @@ def test_refine_local_leads_with_ollama_allows_clean_forced_round_samples(monkey
     assert [lead.direct_job_url for lead in refined] == [lead_one.direct_job_url, lead_two.direct_job_url]
 
 
+def test_refine_local_leads_with_ollama_allows_clean_forced_seed_bundle_samples(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    leads = [
+        JobLead(
+            company_name=f"Acme AI {index}",
+            role_title="Senior Product Manager, AI",
+            source_url=f"https://jobs.lever.co/acme/{index}",
+            source_type="direct_ats",
+            direct_job_url=f"https://jobs.lever.co/acme/{index}",
+            evidence_notes="Direct ATS role.",
+        )
+        for index in range(5)
+    ]
+    cleanup_calls: list[str] = []
+
+    async def fake_cleanup(_settings: Settings, _query: str, pool: list[JobLead], **_kwargs) -> list[JobLead]:
+        cleanup_calls.append("called")
+        return pool
+
+    monkeypatch.setattr("job_agent.job_search._cleanup_local_leads_with_ollama", fake_cleanup)
+
+    refined = asyncio.run(
+        _refine_local_leads_with_ollama(
+            settings,
+            "seed replay triage",
+            leads,
+            cleanup_limit=2,
+            refinement_mode="forced_seed_triage",
+            pre_refinement_average_confidence=0.9,
+            pre_refinement_cleanup_signal_count=0,
+            pre_refinement_trustworthy_direct_url_count=5,
+            run_id="run-clean-seed-bundle",
+        )
+    )
+
+    assert cleanup_calls == ["called"]
+    assert [lead.direct_job_url for lead in refined] == [lead.direct_job_url for lead in leads]
+
+
 def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"
@@ -4113,6 +4153,57 @@ def test_maybe_force_seed_lead_refinement_with_ollama_allows_single_trusted_seed
 
     assert refined == [lead]
     assert forced_calls == [(1, "forced_seed_triage", "seed replay triage")]
+
+
+def test_maybe_force_seed_lead_refinement_with_ollama_samples_large_clean_trusted_bundle(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    seed_leads = [
+        JobLead(
+            company_name=f"Acme AI {index}",
+            role_title="Senior Product Manager, AI",
+            source_url=f"https://jobs.lever.co/acme/{index}",
+            source_type="direct_ats",
+            direct_job_url=f"https://jobs.lever.co/acme/{index}",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=220000 + index,
+            evidence_notes="Direct ATS role.",
+        )
+        for index in range(5)
+    ]
+    forced_calls: list[tuple[int, str | None, str]] = []
+
+    async def fake_refine(
+        _settings: Settings,
+        query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode, query))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_SEED_REFINEMENT_RUNS.clear()
+
+    refined = asyncio.run(
+        _maybe_force_seed_lead_refinement_with_ollama(
+            settings,
+            seed_leads,
+            run_id="run-clean-seed-bundle",
+        )
+    )
+
+    assert refined == seed_leads
+    assert forced_calls == [(2, "forced_seed_triage", "seed replay triage")]
 
 
 def test_ensure_lazy_ollama_prewarm_only_runs_once_per_run(monkeypatch) -> None:
