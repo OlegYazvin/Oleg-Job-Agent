@@ -166,6 +166,21 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _format_status_stage(stage: str, payload: dict[str, Any]) -> str:
+    metrics = dict(payload.get("metrics", {}) or {})
+    suffix = ""
+    loop_iteration = metrics.get("auto_loop_iteration")
+    loop_target = metrics.get("auto_loop_target_attempts")
+    if loop_iteration is not None and loop_target is not None:
+        suffix = f" | Loop {loop_iteration}/{loop_target}"
+    elif loop_iteration is not None:
+        suffix = f" | Loop {loop_iteration}"
+    status_suffix = ""
+    if payload.get("done"):
+        status_suffix = " (failed)" if payload.get("failed") else " (complete)"
+    return f"{stage}{suffix}{status_suffix}"
+
+
 def run_status_viewer(status_path: Path) -> None:  # pragma: no cover - GUI-only
     if tk is None or scrolledtext is None:
         raise RuntimeError("Tkinter is not available on this system.")
@@ -202,15 +217,17 @@ def run_status_viewer(status_path: Path) -> None:  # pragma: no cover - GUI-only
     def refresh() -> None:
         payload = _read_status_payload(status_path)
         stage = payload.get("stage", "unknown")
-        status_suffix = ""
-        if payload.get("done"):
-            status_suffix = " (failed)" if payload.get("failed") else " (complete)"
-        stage_var.set(f"{stage}{status_suffix}")
+        stage_var.set(_format_status_stage(str(stage), payload))
         message_var.set(payload.get("message", ""))
         updated_var.set(payload.get("updated_at", ""))
 
         metrics = payload.get("metrics", {})
-        metrics_lines = [f"{key}: {value}" for key, value in sorted(metrics.items())]
+        metrics_lines: list[str] = []
+        if "auto_loop_iteration" in metrics and "auto_loop_target_attempts" in metrics:
+            metrics_lines.append(
+                f"loop_progress: {metrics.get('auto_loop_iteration')}/{metrics.get('auto_loop_target_attempts')}"
+            )
+        metrics_lines.extend(f"{key}: {value}" for key, value in sorted(metrics.items()))
         metrics_var.set("\n".join(metrics_lines) if metrics_lines else "No metrics yet.")
 
         recent_events = payload.get("recent_events", [])

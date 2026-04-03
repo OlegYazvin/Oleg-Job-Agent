@@ -1,6 +1,7 @@
 from job_agent.dashboard import (
     _compute_dashboard_minimum_size,
     _format_scorecard_summary,
+    _format_live_metrics_lines,
     _scorecard_detail_lines,
 )
 
@@ -103,3 +104,20 @@ def test_scorecard_detail_lines_include_discovery_and_ollama_context() -> None:
     assert "Replay seeds: 4" in lines
     assert "Reacquisition attempts: 2" in lines
     assert "Ollama requests: 2" in lines
+
+
+def test_format_live_metrics_lines_includes_loop_progress() -> None:
+    lines = _format_live_metrics_lines(
+        {
+            "auto_loop_iteration": 7,
+            "auto_loop_target_attempts": 20,
+            "auto_loop_status": "running",
+            "target_job_count": 10,
+            "unique_leads_discovered": 12,
+            "qualifying_jobs": 2,
+        }
+    )
+
+    assert lines[0] == "Loop: 7/20 (running)"
+    assert "Found by search: 12" in lines
+    assert "Kept after validation: 2" in lines

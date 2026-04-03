@@ -140,6 +140,32 @@ def _format_scorecard_summary(scorecard: dict[str, Any] | None) -> str:
     )
 
 
+def _format_live_metrics_lines(metrics: dict[str, Any] | None) -> list[str]:
+    metrics = dict(metrics or {})
+    loop_iteration = metrics.get("auto_loop_iteration")
+    loop_target = metrics.get("auto_loop_target_attempts")
+    loop_status = str(metrics.get("auto_loop_status") or "").strip()
+    lines: list[str] = []
+    if loop_iteration is not None and loop_target is not None:
+        loop_line = f"Loop: {loop_iteration}/{loop_target}"
+        if loop_status:
+            loop_line += f" ({loop_status})"
+        lines.append(loop_line)
+    elif loop_iteration is not None:
+        lines.append(f"Loop: {loop_iteration}")
+    lines.extend(
+        [
+            f"Target jobs: {metrics.get('target_job_count', 0)}",
+            f"Found by search: {metrics.get('jobs_found_by_search', metrics.get('unique_leads_discovered', 0))}",
+            f"Kept after validation: {metrics.get('jobs_kept_after_validation', metrics.get('qualifying_jobs', 0))}",
+            f"Jobs with messages: {metrics.get('jobs_with_any_messages', 0)}",
+            f"Current company: {metrics.get('current_company', '') or 'n/a'}",
+            f"Current role: {metrics.get('current_role', '') or 'n/a'}",
+        ]
+    )
+    return lines
+
+
 def _scorecard_detail_lines(scorecard: dict[str, Any] | None) -> list[str]:
     if not scorecard:
         return ["Run scorecard: unavailable"]
@@ -471,15 +497,7 @@ def run_dashboard() -> None:  # pragma: no cover - GUI-only
         current_updated_var.set(f"Last updated: {_format_timestamp(live_status.get('updated_at'))}")
 
         metrics = live_status.get("metrics", {})
-        metrics_lines = [
-            f"Target jobs: {metrics.get('target_job_count', 0)}",
-            f"Found by search: {metrics.get('jobs_found_by_search', metrics.get('unique_leads_discovered', 0))}",
-            f"Kept after validation: {metrics.get('jobs_kept_after_validation', metrics.get('qualifying_jobs', 0))}",
-            f"Jobs with messages: {metrics.get('jobs_with_any_messages', 0)}",
-            f"Current company: {metrics.get('current_company', '') or 'n/a'}",
-            f"Current role: {metrics.get('current_role', '') or 'n/a'}",
-        ]
-        current_metrics_var.set("\n".join(metrics_lines))
+        current_metrics_var.set("\n".join(_format_live_metrics_lines(metrics)))
         history_counts_var.set(
             f"Historical runs logged: {len(run_history)}\n"
             f"Unique jobs archived: {len(job_history)}\n"
