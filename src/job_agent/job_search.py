@@ -3903,6 +3903,13 @@ def _lead_confidence(lead: JobLead) -> float:
     score = 0.0
     if lead.direct_job_url and _is_allowed_direct_job_url(lead.direct_job_url):
         score += 0.45
+    elif (
+        not lead.direct_job_url
+        and lead.source_type in {"direct_ats", "company_site"}
+        and _is_allowed_direct_job_url(lead.source_url)
+        and _lead_is_replay_source_trustworthy(lead)
+    ):
+        score += 0.45
     if lead.source_type in {"direct_ats", "company_site"}:
         score += 0.2
     elif _is_supported_discovery_source_url(lead.source_url):
@@ -6053,7 +6060,6 @@ async def _refine_local_leads_with_ollama(
         refinement_mode == "forced_seed_triage"
         and len(candidate_pool) == 1
         and (pre_refinement_average_confidence or 0.0) >= 0.9
-        and bool(candidate_pool[0].direct_job_url)
         and _lead_is_replay_source_trustworthy(candidate_pool[0])
     )
     allow_clean_seed_bundle_triage_without_cleanup = (
@@ -6263,10 +6269,7 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         and low_trust_source_count == 0
         and (
             trustworthy_direct_url_count >= 1
-            or (
-                bool(seed_window[0].direct_job_url)
-                and _lead_is_replay_source_trustworthy(seed_window[0])
-            )
+            or _lead_is_replay_source_trustworthy(seed_window[0])
         )
     ):
         FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
