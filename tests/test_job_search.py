@@ -1659,6 +1659,39 @@ def test_local_query_rounds_prune_cross_run_timeout_cooldown_families_before_exe
     assert len(flattened) < settings.max_search_rounds * settings.search_round_query_limit
 
 
+def test_local_query_rounds_reactivate_stale_cross_run_cooldowns() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    history = {
+        "structured_ats": {
+            "consecutive_timeout_heavy_runs": 2,
+            "last_updated_at": "2000-01-01T00:00:00+00:00",
+        },
+        "startup_workatastartup": {
+            "consecutive_timeout_heavy_runs": 2,
+            "last_updated_at": "2000-01-01T00:00:00+00:00",
+        },
+        "startup_ycombinator": {
+            "consecutive_timeout_heavy_runs": 2,
+            "last_updated_at": "2000-01-01T00:00:00+00:00",
+        },
+        "startup_generic": {
+            "consecutive_timeout_heavy_runs": 2,
+            "last_updated_at": "2000-01-01T00:00:00+00:00",
+        },
+    }
+
+    rounds = _build_query_rounds(
+        settings,
+        SearchTuning(attempt_number=1),
+        query_family_history=history,
+    )
+    flattened = [query for query_round in rounds for query in query_round]
+
+    assert flattened
+    assert any(_query_family_key(query) == "structured_ats" for query in flattened)
+
+
 def test_builtin_search_terms_expand_brittle_queries() -> None:
     assert _builtin_search_terms_for_query("AI/ML product manager") == [
         "ai ml product manager",
@@ -2437,6 +2470,26 @@ def test_query_timeout_skip_reason_respects_structured_ats_family_cooldown() -> 
     assert reason is not None
     assert "structured ats" in reason.lower()
     assert "cooling down" in reason.lower()
+
+
+def test_query_timeout_skip_reason_ignores_stale_family_cooldown() -> None:
+    diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
+    history = {
+        "structured_ats": {
+            "consecutive_timeout_heavy_runs": 2,
+            "consecutive_zero_yield_runs": 2,
+            "last_updated_at": "2000-01-01T00:00:00+00:00",
+        }
+    }
+
+    reason = _query_timeout_skip_reason(
+        diagnostics,
+        'site:jobs.lever.co "staff product manager" "AI" remote',
+        attempt_number=1,
+        query_family_history=history,
+    )
+
+    assert reason is None
 
 
 def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -> None:

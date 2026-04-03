@@ -416,6 +416,7 @@ QUERY_FAMILY_COOLDOWN_ELIGIBLE = {
     "startup_workatastartup",
     "startup_ycombinator",
 }
+QUERY_FAMILY_COOLDOWN_MAX_AGE = timedelta(hours=48)
 TRACKING_QUERY_PARAM_NAMES = {
     "gh_src",
     "gh_sid",
@@ -3222,6 +3223,19 @@ def _query_family_is_timeout_cooldown_eligible(family: str) -> bool:
     return family in QUERY_FAMILY_COOLDOWN_ELIGIBLE
 
 
+def _query_family_cooldown_is_stale(metrics: dict[str, object]) -> bool:
+    raw_timestamp = str(metrics.get("last_updated_at") or "").strip()
+    if not raw_timestamp:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    return datetime.now(UTC) - updated_at.astimezone(UTC) > QUERY_FAMILY_COOLDOWN_MAX_AGE
+
+
 def _query_family_cooldown_reason(
     query: str,
     *,
@@ -3233,6 +3247,8 @@ def _query_family_cooldown_reason(
     if not _query_family_is_timeout_cooldown_eligible(family):
         return None
     metrics = query_family_history.get(family) or {}
+    if _query_family_cooldown_is_stale(metrics):
+        return None
     timeout_streak = int(metrics.get("consecutive_timeout_heavy_runs") or 0)
     zero_yield_streak = int(metrics.get("consecutive_zero_yield_runs") or 0)
     if timeout_streak >= 2:
