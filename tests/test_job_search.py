@@ -2160,6 +2160,20 @@ def test_should_force_ollama_refinement_sample_requires_actual_cleanup_signals()
     )
 
 
+def test_should_force_ollama_refinement_sample_allows_clean_trusted_direct_bundle() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+
+    assert _should_force_ollama_refinement_sample(
+        settings,
+        sample_size=5,
+        average_confidence=0.94,
+        cleanup_signal_count=0,
+        low_trust_source_count=0,
+        trustworthy_direct_url_count=5,
+    )
+
+
 def test_should_accept_trusted_source_fallback_on_fetch_failure_for_strong_company_hosted_role(monkeypatch) -> None:
     settings = build_settings()
     settings.posted_within_days = 14

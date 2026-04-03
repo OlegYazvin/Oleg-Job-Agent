@@ -3878,16 +3878,30 @@ def _should_force_ollama_refinement_sample(
         return False
     if cleanup_signal_count <= 0:
         return (
-            query is not None
-            and sample_size >= 5
-            and _is_trusted_company_careers_bundle(
-                query=query,
-                candidate_pool_count=sample_size,
-                average_confidence=average_confidence,
-                cleanup_signal_count=cleanup_signal_count,
-                low_trust_source_count=low_trust_source_count,
-                trustworthy_direct_url_count=trustworthy_direct_url_count,
-                min_candidate_pool_count=5,
+            (
+                sample_size >= 5
+                and _is_clean_high_confidence_direct_bundle(
+                    candidate_pool_count=sample_size,
+                    average_confidence=average_confidence,
+                    cleanup_signal_count=cleanup_signal_count,
+                    low_trust_source_count=low_trust_source_count,
+                    trustworthy_direct_url_count=trustworthy_direct_url_count,
+                    min_candidate_pool_count=5,
+                    min_trustworthy_direct_url_count=sample_size,
+                )
+            )
+            or (
+                query is not None
+                and sample_size >= 5
+                and _is_trusted_company_careers_bundle(
+                    query=query,
+                    candidate_pool_count=sample_size,
+                    average_confidence=average_confidence,
+                    cleanup_signal_count=cleanup_signal_count,
+                    low_trust_source_count=low_trust_source_count,
+                    trustworthy_direct_url_count=trustworthy_direct_url_count,
+                    min_candidate_pool_count=5,
+                )
             )
         )
     if cleanup_signal_count > 0 or low_trust_source_count > 0:
