@@ -5,7 +5,7 @@ from pathlib import Path
 import json
 
 from .history import record_successful_run
-from .models import JobOutreachBundle, RunManifest, SearchDiagnostics
+from .models import JobOutreachBundle, JobPosting, RunManifest, SearchDiagnostics
 from .scorecard import build_run_scorecard, save_run_scorecard
 
 
@@ -17,8 +17,10 @@ def save_json_snapshot(path: Path, payload: dict) -> None:
 def save_run_artifacts(
     data_dir: Path,
     bundles: list[JobOutreachBundle],
+    reacquired_jobs: list[JobPosting],
     manifest: RunManifest,
     live_outreach_payload: dict | None = None,
+    reacquired_jobs_payload: dict | None = None,
     near_miss_payload: dict | None = None,
     ollama_summary_payload: dict | None = None,
     search_diagnostics: SearchDiagnostics | None = None,
@@ -28,10 +30,14 @@ def save_run_artifacts(
     payload = {
         "manifest": manifest.model_dump(mode="json"),
         "bundles": [bundle.model_dump(mode="json") for bundle in bundles],
+        "reacquired_jobs": [job.model_dump(mode="json") for job in reacquired_jobs],
     }
     if live_outreach_payload is not None:
         payload["live_outreach"] = live_outreach_payload
         save_json_snapshot(data_dir / "live-outreach.json", live_outreach_payload)
+    if reacquired_jobs_payload is not None:
+        payload["reacquired_jobs_payload"] = reacquired_jobs_payload
+        save_json_snapshot(data_dir / "reacquired-jobs-latest.json", reacquired_jobs_payload)
     if near_miss_payload is not None:
         payload["near_misses"] = near_miss_payload
         save_json_snapshot(data_dir / "near-misses-latest.json", near_miss_payload)
@@ -49,6 +55,7 @@ def save_run_artifacts(
         run_id=manifest.run_id,
         status="completed",
         manifest=manifest,
+        reacquired_jobs_payload=reacquired_jobs_payload,
         search_diagnostics=search_diagnostics,
         near_miss_payload=near_miss_payload,
         ollama_summary_payload=ollama_summary_payload,
@@ -61,6 +68,7 @@ def save_run_artifacts(
         run_id=manifest.run_id,
         manifest=manifest,
         bundles=bundles,
+        reacquired_jobs=reacquired_jobs,
         status_payload=status_payload,
     )
 

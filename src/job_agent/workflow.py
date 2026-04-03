@@ -23,6 +23,7 @@ from .reports import (
     build_message_document,
     build_near_miss_document,
     build_near_miss_payload,
+    build_reacquired_jobs_payload,
     build_summary_document,
 )
 from .scorecard import save_failed_run_scorecard
@@ -73,7 +74,11 @@ async def _run_daily_workflow_body(
                     ollama_degraded_for_run=False,
                 )
 
-    jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(settings, status=status, run_id=run_id)
+    jobs, reacquired_jobs, jobs_found_by_search, search_diagnostics = await find_matching_jobs(
+        settings,
+        status=status,
+        run_id=run_id,
+    )
     linkedin = LinkedInClient(settings)
     bundles: list[JobOutreachBundle] = []
 
@@ -167,10 +172,20 @@ async def _run_daily_workflow_body(
         status.emit("reporting", "Building Word documents and saving run artifacts.", qualifying_jobs=len(jobs))
     generated_at = datetime.now(UTC)
     message_docx_path = build_message_document(bundles, settings.output_dir, generated_at=generated_at)
-    summary_docx_path = build_summary_document(bundles, settings.output_dir, generated_at=generated_at)
+    summary_docx_path = build_summary_document(
+        bundles,
+        settings.output_dir,
+        reacquired_jobs=reacquired_jobs,
+        generated_at=generated_at,
+    )
     near_miss_docx_path = build_near_miss_document(
         search_diagnostics.near_misses,
         settings.output_dir,
+        generated_at=generated_at,
+    )
+    reacquired_jobs_payload = build_reacquired_jobs_payload(
+        reacquired_jobs,
+        run_id=run_id,
         generated_at=generated_at,
     )
     near_miss_payload = build_near_miss_payload(
@@ -192,9 +207,11 @@ async def _run_daily_workflow_body(
     manifest = build_manifest(
         run_id=run_id,
         bundles=bundles,
+        reacquired_jobs=reacquired_jobs,
         jobs_found_by_search=jobs_found_by_search,
         message_docx_path=message_docx_path,
         summary_docx_path=summary_docx_path,
+        reacquired_jobs_json_path=settings.data_dir / "reacquired-jobs-latest.json",
         near_misses=search_diagnostics.near_misses,
         near_miss_docx_path=near_miss_docx_path,
         near_miss_json_path=settings.data_dir / "near-misses-latest.json",
@@ -209,8 +226,10 @@ async def _run_daily_workflow_body(
     save_run_artifacts(
         settings.data_dir,
         bundles,
+        reacquired_jobs,
         manifest,
         live_outreach_payload=live_outreach_payload,
+        reacquired_jobs_payload=reacquired_jobs_payload,
         near_miss_payload=near_miss_payload,
         ollama_summary_payload=ollama_summary_payload,
         search_diagnostics=search_diagnostics,

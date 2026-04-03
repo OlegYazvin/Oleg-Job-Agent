@@ -129,6 +129,7 @@ def build_settings() -> Settings:
         search_round_query_limit=6,
         max_leads_per_query=8,
         max_leads_to_resolve_per_pass=40,
+        reacquisition_attempt_cap=10,
         per_query_timeout_seconds=45,
         per_lead_timeout_seconds=30,
         workflow_timeout_seconds=3600,
@@ -4399,6 +4400,66 @@ def test_maybe_force_seed_lead_refinement_with_ollama_samples_large_clean_truste
 
     assert refined == seed_leads
     assert forced_calls == [(2, "forced_seed_triage", "seed replay triage")]
+
+
+def test_maybe_force_seed_lead_refinement_with_ollama_skips_already_clean_small_replay_bundle(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    seed_leads = [
+        JobLead(
+            company_name="Hopper",
+            role_title="Principal Product Manager - AI Travel",
+            source_url="https://jobs.ashbyhq.com/hopper/123",
+            source_type="direct_ats",
+            direct_job_url="https://jobs.ashbyhq.com/hopper/123",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=200000,
+            evidence_notes="Direct ATS role.",
+        ),
+        JobLead(
+            company_name="January",
+            role_title="Staff Product Manager, AI Agents",
+            source_url="https://jobs.ashbyhq.com/january/456",
+            source_type="direct_ats",
+            direct_job_url="https://jobs.ashbyhq.com/january/456",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=190000,
+            evidence_notes="Direct ATS role.",
+        ),
+        JobLead(
+            company_name="Quorum Software",
+            role_title="Senior Product Manager - AI Strategy (USA - Remote)",
+            source_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+            source_type="direct_ats",
+            direct_job_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=200000,
+            evidence_notes="Replay ATS role with one remaining cleanup issue.",
+        ),
+    ]
+
+    async def fail_refine(*args, **kwargs):
+        raise AssertionError("Ollama seed triage should not run for an already-clean small replay bundle.")
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fail_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_SEED_REFINEMENT_RUNS.clear()
+
+    refined = asyncio.run(
+        _maybe_force_seed_lead_refinement_with_ollama(
+            settings,
+            seed_leads,
+            run_id="run-clean-small-seed-bundle",
+        )
+    )
+
+    assert refined == seed_leads
 
 
 def test_ensure_lazy_ollama_prewarm_only_runs_once_per_run(monkeypatch) -> None:

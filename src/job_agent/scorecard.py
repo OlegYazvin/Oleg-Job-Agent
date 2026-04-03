@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from .history import load_run_history_entries
 from .models import (
+    JobOutreachBundle,
     OllamaRunSummary,
     RunDiscoveryMetrics,
     RunManifest,
@@ -129,6 +130,31 @@ def _ollama_summary_dict(summary: OllamaRunSummary | Mapping[str, Any] | None) -
     return dict(summary)
 
 
+def _reacquired_job_items(payload: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return []
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    return [dict(item) for item in items if isinstance(item, Mapping)]
+
+
+def _bundle_jobs(bundles: list[JobOutreachBundle] | list[Mapping[str, Any]] | None) -> list[dict[str, Any]]:
+    if not bundles:
+        return []
+    items: list[dict[str, Any]] = []
+    for bundle in bundles:
+        if isinstance(bundle, JobOutreachBundle):
+            items.append(bundle.job.model_dump(mode="json"))
+            continue
+        if not isinstance(bundle, Mapping):
+            continue
+        job = bundle.get("job")
+        if isinstance(job, Mapping):
+            items.append(dict(job))
+    return items
+
+
 def _near_miss_items(
     near_miss_payload: Mapping[str, Any] | None,
     search_diagnostics: SearchDiagnostics | Mapping[str, Any] | None,
@@ -219,6 +245,8 @@ def build_run_scorecard(
     run_id: str,
     status: str,
     manifest: RunManifest | Mapping[str, Any] | None = None,
+    bundles: list[JobOutreachBundle] | list[Mapping[str, Any]] | None = None,
+    reacquired_jobs_payload: Mapping[str, Any] | None = None,
     search_diagnostics: SearchDiagnostics | Mapping[str, Any] | None = None,
     near_miss_payload: Mapping[str, Any] | None = None,
     ollama_summary_payload: OllamaRunSummary | Mapping[str, Any] | None = None,
@@ -229,6 +257,8 @@ def build_run_scorecard(
     diagnostics_payload = _diagnostics_dict(search_diagnostics)
     ollama_payload = _ollama_summary_dict(ollama_summary_payload)
     near_miss_items = _near_miss_items(near_miss_payload, search_diagnostics)
+    bundle_jobs = _bundle_jobs(bundles)
+    reacquired_items = _reacquired_job_items(reacquired_jobs_payload)
     failure_counts = _failure_counts(search_diagnostics)
     false_negative_counts = _false_negative_counts(search_diagnostics)
 
@@ -240,12 +270,29 @@ def build_run_scorecard(
         or 0
     )
     replayed_seed_leads_count = int(diagnostics_payload.get("seed_replayed_lead_count") or 0)
-    fresh_new_leads_count = max(0, unique_leads_discovered - replayed_seed_leads_count)
-    validated_jobs_count = int(
-        manifest_payload.get("jobs_kept_after_validation")
+    reacquisition_attempt_count = int(diagnostics_payload.get("reacquisition_attempt_count") or 0)
+    reacquired_jobs_suppressed_count = int(diagnostics_payload.get("reacquired_jobs_suppressed_count") or 0)
+    novel_validated_jobs_count = int(
+        manifest_payload.get("novel_validated_jobs_count")
+        or manifest_payload.get("jobs_kept_after_validation")
+        or len(bundle_jobs)
         or (status_payload or {}).get("metrics", {}).get("jobs_kept_after_validation")
         or (status_payload or {}).get("metrics", {}).get("qualifying_jobs")
         or 0
+    )
+    reacquired_validated_jobs_count = int(
+        manifest_payload.get("reacquired_validated_jobs_count")
+        or len(reacquired_items)
+        or 0
+    )
+    total_current_validated_jobs_count = int(
+        manifest_payload.get("total_current_validated_jobs_count")
+        or (novel_validated_jobs_count + reacquired_validated_jobs_count)
+    )
+    validated_jobs_count = novel_validated_jobs_count
+    fresh_new_leads_count = max(
+        0,
+        unique_leads_discovered - replayed_seed_leads_count - reacquisition_attempt_count - reacquired_jobs_suppressed_count,
     )
     jobs_with_messages_count = int(
         manifest_payload.get("jobs_with_any_messages")
@@ -294,6 +341,9 @@ def build_run_scorecard(
         status=status,
         outcome=RunOutcomeMetrics(
             validated_jobs_count=validated_jobs_count,
+            novel_validated_jobs_count=novel_validated_jobs_count,
+            reacquired_validated_jobs_count=reacquired_validated_jobs_count,
+            total_current_validated_jobs_count=total_current_validated_jobs_count,
             jobs_with_messages_count=jobs_with_messages_count,
             unique_leads_discovered_count=unique_leads_discovered,
             fresh_new_leads_count=fresh_new_leads_count,
@@ -304,6 +354,8 @@ def build_run_scorecard(
             unique_leads_discovered_count=unique_leads_discovered,
             fresh_new_leads_count=fresh_new_leads_count,
             replayed_seed_leads_count=replayed_seed_leads_count,
+            reacquisition_attempt_count=reacquisition_attempt_count,
+            reacquired_jobs_suppressed_count=reacquired_jobs_suppressed_count,
             repeated_failed_leads_suppressed_count=int(failure_counts.get("repeated_failed_lead") or 0),
             executed_query_count=executed_query_count,
             query_timeout_count=int(failure_counts.get("query_timeout") or 0),
@@ -314,6 +366,14 @@ def build_run_scorecard(
         validation=RunValidationMetrics(
             validated_jobs_count=validated_jobs_count,
             validated_yield=round(validated_jobs_count / fresh_new_leads_count, 3) if fresh_new_leads_count else 0.0,
+            novel_validated_jobs_count=novel_validated_jobs_count,
+            novel_validated_yield=round(novel_validated_jobs_count / fresh_new_leads_count, 3) if fresh_new_leads_count else 0.0,
+            reacquired_validated_jobs_count=reacquired_validated_jobs_count,
+            total_current_validated_jobs_count=total_current_validated_jobs_count,
+            reacquisition_attempt_count=reacquisition_attempt_count,
+            reacquired_jobs_suppressed_count=reacquired_jobs_suppressed_count,
+            reacquisition_yield=round(reacquired_validated_jobs_count / reacquisition_attempt_count, 3) if reacquisition_attempt_count else 0.0,
+            coverage_retention_rate=None,
             jobs_with_messages_count=jobs_with_messages_count,
             message_coverage_rate=round(jobs_with_messages_count / validated_jobs_count, 3) if validated_jobs_count else 0.0,
             raw_near_miss_count=raw_near_miss_count,
@@ -415,6 +475,8 @@ def _bootstrap_run_scorecards(data_dir: Path) -> list[RunScorecard]:
             run_id=run_id,
             status=str(entry.get("status") or "completed"),
             manifest=manifest_payload,
+            bundles=artifact.get("bundles") if isinstance(artifact.get("bundles"), list) else None,
+            reacquired_jobs_payload=artifact.get("reacquired_jobs_payload") if isinstance(artifact.get("reacquired_jobs_payload"), Mapping) else None,
             search_diagnostics=artifact.get("search_diagnostics") if isinstance(artifact.get("search_diagnostics"), Mapping) else None,
             near_miss_payload=artifact.get("near_misses") if isinstance(artifact.get("near_misses"), Mapping) else None,
             ollama_summary_payload=artifact.get("ollama_summary") if isinstance(artifact.get("ollama_summary"), Mapping) else None,
@@ -490,6 +552,7 @@ def save_failed_run_scorecard(
     scorecard = build_run_scorecard(
         run_id=run_id,
         status="failed",
+        reacquired_jobs_payload=_load_json(data_dir / "reacquired-jobs-latest.json", default=None),
         search_diagnostics=search_diagnostics,
         near_miss_payload=near_miss_payload,
         ollama_summary_payload=ollama_summary_payload,

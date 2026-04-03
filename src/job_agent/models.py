@@ -127,6 +127,8 @@ class SearchDiagnostics(BaseModel):
     minimum_qualifying_jobs: int
     unique_leads_discovered: int = 0
     seed_replayed_lead_count: int = 0
+    reacquisition_attempt_count: int = 0
+    reacquired_jobs_suppressed_count: int = 0
     failures: list[SearchFailure] = Field(default_factory=list)
     passes: list[SearchPassSummary] = Field(default_factory=list)
     near_misses: list[NearMissJob] = Field(default_factory=list)
@@ -178,6 +180,11 @@ class JobPosting(BaseModel):
     validation_evidence: list[str] = Field(default_factory=list)
     lead_refined_by_ollama: bool = Field(default=False)
     source_quality_score: int | None = Field(default=None)
+    is_reacquired: bool = Field(default=False)
+    canonical_job_key: str | None = Field(default=None)
+    first_reported_at: str | None = Field(default=None)
+    last_reported_at: str | None = Field(default=None)
+    report_count: int | None = Field(default=None)
 
     @field_validator("direct_job_url", "resolved_job_url")
     @classmethod
@@ -298,6 +305,10 @@ class RunManifest(BaseModel):
     jobs_found_by_search: int
     jobs_kept_after_validation: int
     jobs_with_any_messages: int
+    novel_validated_jobs_count: int = 0
+    reacquired_validated_jobs_count: int = 0
+    total_current_validated_jobs_count: int = 0
+    reacquired_jobs_json_path: str | None = None
     near_miss_docx_path: str | None = None
     near_miss_json_path: str | None = None
     ollama_summary_json_path: str | None = None
@@ -338,6 +349,9 @@ class OllamaRunSummary(BaseModel):
 
 class RunOutcomeMetrics(BaseModel):
     validated_jobs_count: int = 0
+    novel_validated_jobs_count: int = 0
+    reacquired_validated_jobs_count: int = 0
+    total_current_validated_jobs_count: int = 0
     jobs_with_messages_count: int = 0
     unique_leads_discovered_count: int = 0
     fresh_new_leads_count: int = 0
@@ -349,6 +363,8 @@ class RunDiscoveryMetrics(BaseModel):
     unique_leads_discovered_count: int = 0
     fresh_new_leads_count: int = 0
     replayed_seed_leads_count: int = 0
+    reacquisition_attempt_count: int = 0
+    reacquired_jobs_suppressed_count: int = 0
     repeated_failed_leads_suppressed_count: int = 0
     executed_query_count: int = 0
     query_timeout_count: int = 0
@@ -360,6 +376,14 @@ class RunDiscoveryMetrics(BaseModel):
 class RunValidationMetrics(BaseModel):
     validated_jobs_count: int = 0
     validated_yield: float = 0.0
+    novel_validated_jobs_count: int = 0
+    novel_validated_yield: float = 0.0
+    reacquired_validated_jobs_count: int = 0
+    total_current_validated_jobs_count: int = 0
+    reacquisition_attempt_count: int = 0
+    reacquired_jobs_suppressed_count: int = 0
+    reacquisition_yield: float = 0.0
+    coverage_retention_rate: float | None = None
     jobs_with_messages_count: int = 0
     message_coverage_rate: float = 0.0
     raw_near_miss_count: int = 0

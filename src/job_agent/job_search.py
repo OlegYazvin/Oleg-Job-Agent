@@ -22,6 +22,7 @@ from .history import (
     load_company_watchlist_entries,
     load_previously_reported_company_keys,
     load_previously_reported_job_keys,
+    load_validated_job_history_index,
 )
 from .job_pages import USER_AGENT, JobPageSnapshot, fetch_job_page
 from .llm_provider import LLMProviderError, OllamaStructuredProvider
@@ -114,6 +115,15 @@ LINKEDIN_RESOLUTION_BLOCKED_HOST_FRAGMENTS = (
     "thatstartupjob.com",
     "tangerinefeed.net",
     "cari.me.uk",
+    "tracxn.com",
+)
+LOW_TRUST_REACQUISITION_HOST_FRAGMENTS = (
+    "mediabistro.com",
+    "smartrecruiterscareers.com",
+    "remotejobshive.com",
+    "thatstartupjob.com",
+    "remoterocketship.com",
+    "jobgether.com",
     "tracxn.com",
 )
 
@@ -845,6 +855,47 @@ def _job_history_primary_key(url: str | None) -> str:
     if canonical:
         return canonical
     return _normalize_direct_job_url(str(url or ""))
+
+
+def _validated_job_history_entry_for_url(
+    url: str | None,
+    validated_job_history_index: dict[str, dict[str, object]],
+) -> dict[str, object] | None:
+    for candidate in sorted(_job_history_key_candidates(url)):
+        entry = validated_job_history_index.get(candidate)
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _reacquisition_history_metadata(entry: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(entry, dict):
+        return {}
+    return {
+        "canonical_job_key": str(entry.get("canonical_job_key") or entry.get("job_key") or "").strip() or None,
+        "first_reported_at": str(entry.get("first_reported_at") or "").strip() or None,
+        "last_reported_at": str(entry.get("last_reported_at") or "").strip() or None,
+        "report_count": max(1, int(entry.get("report_count") or 0) + 1),
+    }
+
+
+def _lead_is_reacquisition_eligible(
+    lead: JobLead,
+    settings: Settings,
+    *,
+    direct_job_url: str | None,
+) -> bool:
+    normalized_direct_url = _normalize_direct_job_url(direct_job_url or "")
+    if not normalized_direct_url or not _is_allowed_direct_job_url(normalized_direct_url):
+        return False
+    host = (urlparse(normalized_direct_url).netloc or urlparse(str(lead.source_url)).netloc or "").lower()
+    if not host or any(fragment in host for fragment in LOW_TRUST_REACQUISITION_HOST_FRAGMENTS):
+        return False
+    if lead.source_type in {"direct_ats", "company_site"}:
+        return True
+    if _lead_has_trusted_source_fallback_evidence(lead, settings):
+        return True
+    return (lead.source_quality_score_hint or 0) >= 8
 
 
 def _failed_lead_history_key_candidates(
@@ -5344,8 +5395,12 @@ async def _replay_seed_leads(
     company_watchlist: dict[str, dict[str, object]],
     failed_lead_history: dict[str, dict[str, object]],
     jobs_by_url: dict[str, JobPosting],
+    reacquired_jobs_by_url: dict[str, JobPosting],
     previously_reported_company_keys: set[str],
     previously_reported_job_keys: set[str],
+    validated_job_history_index: dict[str, dict[str, object]],
+    reacquisition_attempted_keys: set[str],
+    reacquisition_suppressed_keys: set[str],
     seen_lead_keys: set[str],
     total_unique_leads: int,
     resolved_leads_this_attempt: int,
@@ -5469,22 +5524,55 @@ async def _replay_seed_leads(
             )
             continue
 
-        if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(lead.direct_job_url)):
-            _record_failure_live(
-                settings,
-                diagnostics,
-                _make_failure(
-                    stage="filter",
-                    reason_code="already_reported",
-                    detail="Skipping a previously reported job from an earlier run.",
-                    lead=lead,
-                    direct_job_url=lead.direct_job_url,
-                    attempt_number=attempt_number,
-                    round_number=0,
-                ),
-                unique_leads_discovered=total_unique_leads,
-            )
-            continue
+        reacquisition_entry = _validated_job_history_entry_for_url(lead.direct_job_url, validated_job_history_index)
+        reacquisition_key = str((reacquisition_entry or {}).get("canonical_job_key") or (reacquisition_entry or {}).get("job_key") or "").strip()
+        if reacquisition_entry is not None:
+            if not _lead_is_reacquisition_eligible(lead, settings, direct_job_url=lead.direct_job_url):
+                if reacquisition_key and reacquisition_key not in reacquisition_suppressed_keys:
+                    reacquisition_suppressed_keys.add(reacquisition_key)
+                    diagnostics.reacquired_jobs_suppressed_count += 1
+                _record_failure_live(
+                    settings,
+                    diagnostics,
+                    _make_failure(
+                        stage="filter",
+                        reason_code="reacquisition_suppressed",
+                        detail="Skipping a previously validated job because the repeat hit came from a low-trust or non-direct source.",
+                        lead=lead,
+                        direct_job_url=lead.direct_job_url,
+                        attempt_number=attempt_number,
+                        round_number=0,
+                    ),
+                    unique_leads_discovered=total_unique_leads,
+                )
+                continue
+            if len(reacquisition_attempted_keys) >= settings.reacquisition_attempt_cap and (
+                not reacquisition_key or reacquisition_key not in reacquisition_attempted_keys
+            ):
+                if reacquisition_key and reacquisition_key not in reacquisition_suppressed_keys:
+                    reacquisition_suppressed_keys.add(reacquisition_key)
+                    diagnostics.reacquired_jobs_suppressed_count += 1
+                _record_failure_live(
+                    settings,
+                    diagnostics,
+                    _make_failure(
+                        stage="filter",
+                        reason_code="reacquisition_suppressed",
+                        detail=(
+                            "Skipping a previously validated job because the per-run reacquisition cap "
+                            f"({settings.reacquisition_attempt_cap}) was reached."
+                        ),
+                        lead=lead,
+                        direct_job_url=lead.direct_job_url,
+                        attempt_number=attempt_number,
+                        round_number=0,
+                    ),
+                    unique_leads_discovered=total_unique_leads,
+                )
+                continue
+            if reacquisition_key and reacquisition_key not in reacquisition_attempted_keys:
+                reacquisition_attempted_keys.add(reacquisition_key)
+                diagnostics.reacquisition_attempt_count += 1
 
         if status:
             status.emit(
@@ -5583,32 +5671,33 @@ async def _replay_seed_leads(
             continue
 
         validated_key = _job_posting_dedupe_key(validated)
-        if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(validated.resolved_job_url or validated.direct_job_url)):
-            _record_failure_live(
-                settings,
-                diagnostics,
-                _make_failure(
-                    stage="filter",
-                    reason_code="already_reported",
-                    detail="Skipping a previously reported job from an earlier run.",
-                    lead=lead,
-                    direct_job_url=str(validated.direct_job_url),
-                    candidate=validated,
-                    attempt_number=attempt_number,
-                    round_number=0,
-                ),
-                unique_leads_discovered=total_unique_leads,
-            )
-            continue
-
-        jobs_by_url.setdefault(validated_key, validated)
+        post_validation_reacquisition_entry = reacquisition_entry or _validated_job_history_entry_for_url(
+            validated.resolved_job_url or validated.direct_job_url,
+            validated_job_history_index,
+        )
+        if post_validation_reacquisition_entry is not None:
+            metadata = _reacquisition_history_metadata(post_validation_reacquisition_entry)
+            validated = validated.model_copy(update={"is_reacquired": True, **metadata})
+            reacquired_jobs_by_url.setdefault(validated_key, validated)
+        else:
+            jobs_by_url.setdefault(validated_key, validated)
         diagnostics.unique_leads_discovered = total_unique_leads
         _persist_search_diagnostics(settings, diagnostics)
-        _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
+        _persist_validated_jobs_checkpoint(
+            settings,
+            jobs_by_url,
+            reacquired_jobs_by_url=reacquired_jobs_by_url,
+            run_id=run_id,
+            diagnostics=diagnostics,
+        )
         if status:
             status.emit(
                 "search",
-                f"Accepted job {len(jobs_by_url)}/{stop_goal}: {validated.company_name} | {validated.role_title}",
+                (
+                    f"Reacquired still-open job {len(reacquired_jobs_by_url)}: {validated.company_name} | {validated.role_title}"
+                    if validated.is_reacquired
+                    else f"Accepted job {len(jobs_by_url)}/{stop_goal}: {validated.company_name} | {validated.role_title}"
+                ),
                 attempt_number=attempt_number,
                 round_number=0,
                 unique_leads_discovered=total_unique_leads,
@@ -6164,6 +6253,14 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
             pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
             run_id=run_id,
         )
+    # Skip forced seed cleanup for already-clean replay bundles with only a single cleanup signal.
+    # This keeps seed triage focused on noisier replay windows.
+    if (
+        cleanup_signal_count <= 1
+        and average_confidence >= 0.9
+        and trustworthy_direct_url_count >= max(1, len(seed_window) - 1)
+    ):
+        return seed_leads
     if cleanup_signal_count <= 0:
         return seed_leads
     if not _should_force_ollama_refinement_sample(
@@ -7191,16 +7288,24 @@ def _persist_validated_jobs_checkpoint(
     settings: Settings,
     jobs_by_url: dict[str, JobPosting],
     *,
+    reacquired_jobs_by_url: dict[str, JobPosting] | None = None,
     run_id: str | None,
     diagnostics: SearchDiagnostics,
 ) -> None:
     jobs = sorted(jobs_by_url.values(), key=lambda item: (item.company_name.lower(), item.role_title.lower()))
+    reacquired_jobs = sorted(
+        (reacquired_jobs_by_url or {}).values(),
+        key=lambda item: (item.company_name.lower(), item.role_title.lower()),
+    )
     payload = {
         "run_id": run_id,
         "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "qualifying_job_count": len(jobs),
+        "reacquired_validated_job_count": len(reacquired_jobs),
+        "total_current_validated_job_count": len(jobs) + len(reacquired_jobs),
         "unique_leads_discovered": diagnostics.unique_leads_discovered,
         "jobs": [job.model_dump(mode="json") for job in jobs],
+        "reacquired_jobs": [job.model_dump(mode="json") for job in reacquired_jobs],
     }
     save_json_snapshot(settings.data_dir / "validated-jobs-checkpoint-latest.json", payload)
     if run_id:
@@ -8085,19 +8190,29 @@ async def find_matching_jobs(
     status: StatusReporter | None = None,
     *,
     run_id: str | None = None,
-) -> tuple[list[JobPosting], int, SearchDiagnostics]:
+) -> tuple[list[JobPosting], list[JobPosting], int, SearchDiagnostics]:
     stop_goal = max(1, settings.minimum_qualifying_jobs, settings.target_job_count)
     diagnostics = SearchDiagnostics(run_id=run_id, minimum_qualifying_jobs=stop_goal)
     _persist_search_diagnostics(settings, diagnostics)
     jobs_by_url: dict[str, JobPosting] = {}
-    _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
+    reacquired_jobs_by_url: dict[str, JobPosting] = {}
+    _persist_validated_jobs_checkpoint(
+        settings,
+        jobs_by_url,
+        reacquired_jobs_by_url=reacquired_jobs_by_url,
+        run_id=run_id,
+        diagnostics=diagnostics,
+    )
     previously_reported_job_keys = load_previously_reported_job_keys(settings.data_dir)
+    validated_job_history_index = load_validated_job_history_index(settings.data_dir)
     previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
     company_watchlist = load_company_watchlist_entries(settings.data_dir)
     failed_lead_history = _load_failed_lead_history(settings)
     query_family_history = _load_query_family_history(settings)
     query_family_metrics: dict[str, dict[str, int]] = {}
     seen_lead_keys: set[str] = set()
+    reacquisition_attempted_keys: set[str] = set()
+    reacquisition_suppressed_keys: set[str] = set()
     total_unique_leads = 0
 
     openai_agents_enabled = settings.llm_provider == "openai" or settings.use_openai_fallback
@@ -8144,8 +8259,12 @@ async def find_matching_jobs(
                 company_watchlist=company_watchlist,
                 failed_lead_history=failed_lead_history,
                 jobs_by_url=jobs_by_url,
+                reacquired_jobs_by_url=reacquired_jobs_by_url,
                 previously_reported_company_keys=previously_reported_company_keys,
                 previously_reported_job_keys=previously_reported_job_keys,
+                validated_job_history_index=validated_job_history_index,
+                reacquisition_attempted_keys=reacquisition_attempted_keys,
+                reacquisition_suppressed_keys=reacquisition_suppressed_keys,
                 seen_lead_keys=seen_lead_keys,
                 total_unique_leads=total_unique_leads,
                 resolved_leads_this_attempt=resolved_leads_this_attempt,
@@ -8564,22 +8683,58 @@ async def find_matching_jobs(
                     continue
 
                 normalized_resolution_url = _normalize_direct_job_url(resolution.direct_job_url or "")
-                if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(normalized_resolution_url)):
-                    _record_failure_live(
-                        settings,
-                        diagnostics,
-                        _make_failure(
-                            stage="filter",
-                            reason_code="already_reported",
-                            detail="Skipping a previously reported job from an earlier run.",
-                            lead=lead,
-                            direct_job_url=normalized_resolution_url,
-                            attempt_number=attempt_number,
-                            round_number=round_number,
-                        ),
-                        unique_leads_discovered=total_unique_leads,
-                    )
-                    continue
+                reacquisition_entry = _validated_job_history_entry_for_url(
+                    normalized_resolution_url,
+                    validated_job_history_index,
+                )
+                reacquisition_key = str((reacquisition_entry or {}).get("canonical_job_key") or (reacquisition_entry or {}).get("job_key") or "").strip()
+                if reacquisition_entry is not None:
+                    if not _lead_is_reacquisition_eligible(lead, settings, direct_job_url=normalized_resolution_url):
+                        if reacquisition_key and reacquisition_key not in reacquisition_suppressed_keys:
+                            reacquisition_suppressed_keys.add(reacquisition_key)
+                            diagnostics.reacquired_jobs_suppressed_count += 1
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="filter",
+                                reason_code="reacquisition_suppressed",
+                                detail="Skipping a previously validated job because the repeat hit came from a low-trust or non-direct source.",
+                                lead=lead,
+                                direct_job_url=normalized_resolution_url,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        continue
+                    if len(reacquisition_attempted_keys) >= settings.reacquisition_attempt_cap and (
+                        not reacquisition_key or reacquisition_key not in reacquisition_attempted_keys
+                    ):
+                        if reacquisition_key and reacquisition_key not in reacquisition_suppressed_keys:
+                            reacquisition_suppressed_keys.add(reacquisition_key)
+                            diagnostics.reacquired_jobs_suppressed_count += 1
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="filter",
+                                reason_code="reacquisition_suppressed",
+                                detail=(
+                                    "Skipping a previously validated job because the per-run reacquisition cap "
+                                    f"({settings.reacquisition_attempt_cap}) was reached."
+                                ),
+                                lead=lead,
+                                direct_job_url=normalized_resolution_url,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        continue
+                    if reacquisition_key and reacquisition_key not in reacquisition_attempted_keys:
+                        reacquisition_attempted_keys.add(reacquisition_key)
+                        diagnostics.reacquisition_attempt_count += 1
 
                 candidate = _build_candidate_job(lead, resolution)
                 try:
@@ -8676,30 +8831,60 @@ async def find_matching_jobs(
                     continue
 
                 validated_key = _job_posting_dedupe_key(validated)
-                if any(candidate in previously_reported_job_keys for candidate in _job_history_key_candidates(validated.resolved_job_url or validated.direct_job_url)):
-                    failure = _make_failure(
-                        stage="filter",
-                        reason_code="already_reported",
-                        detail="Skipping a previously reported job from an earlier run.",
-                        lead=lead,
-                        direct_job_url=str(validated.direct_job_url),
-                        candidate=validated,
-                        attempt_number=attempt_number,
-                        round_number=round_number,
-                    )
-                    _record_failure_with_followups(
-                        settings,
-                        diagnostics,
-                        failure,
-                        unique_leads_discovered=total_unique_leads,
-                        lead=lead,
-                        candidate=validated,
-                        run_id=run_id,
-                    )
-                    continue
-
+                post_validation_reacquisition_entry = reacquisition_entry or _validated_job_history_entry_for_url(
+                    validated.resolved_job_url or validated.direct_job_url,
+                    validated_job_history_index,
+                )
+                if post_validation_reacquisition_entry is not None and reacquisition_entry is None:
+                    post_key = str(
+                        post_validation_reacquisition_entry.get("canonical_job_key")
+                        or post_validation_reacquisition_entry.get("job_key")
+                        or ""
+                    ).strip()
+                    if len(reacquisition_attempted_keys) >= settings.reacquisition_attempt_cap and (
+                        not post_key or post_key not in reacquisition_attempted_keys
+                    ):
+                        if post_key and post_key not in reacquisition_suppressed_keys:
+                            reacquisition_suppressed_keys.add(post_key)
+                            diagnostics.reacquired_jobs_suppressed_count += 1
+                        _record_failure_live(
+                            settings,
+                            diagnostics,
+                            _make_failure(
+                                stage="filter",
+                                reason_code="reacquisition_suppressed",
+                                detail=(
+                                    "Validated a previously reported job, but skipped coverage credit because the per-run "
+                                    f"reacquisition cap ({settings.reacquisition_attempt_cap}) was reached."
+                                ),
+                                lead=lead,
+                                direct_job_url=str(validated.direct_job_url),
+                                candidate=validated,
+                                attempt_number=attempt_number,
+                                round_number=round_number,
+                            ),
+                            unique_leads_discovered=total_unique_leads,
+                        )
+                        continue
+                    if post_key and post_key not in reacquisition_attempted_keys:
+                        reacquisition_attempted_keys.add(post_key)
+                        diagnostics.reacquisition_attempt_count += 1
+                if post_validation_reacquisition_entry is not None:
+                    metadata = _reacquisition_history_metadata(post_validation_reacquisition_entry)
+                    validated = validated.model_copy(update={"is_reacquired": True, **metadata})
                 accepted_before = len(jobs_by_url)
-                jobs_by_url.setdefault(validated_key, validated)
+                if validated.is_reacquired:
+                    reacquired_before = len(reacquired_jobs_by_url)
+                    reacquired_jobs_by_url.setdefault(validated_key, validated)
+                    if len(reacquired_jobs_by_url) > reacquired_before:
+                        _update_query_family_run_metrics(
+                            query_family_metrics,
+                            validated.source_query or lead.source_query or "",
+                            count_execution=False,
+                            validated_jobs=1,
+                        )
+                else:
+                    jobs_by_url.setdefault(validated_key, validated)
                 if len(jobs_by_url) > accepted_before:
                     _update_query_family_run_metrics(
                         query_family_metrics,
@@ -8709,11 +8894,21 @@ async def find_matching_jobs(
                     )
                 diagnostics.unique_leads_discovered = total_unique_leads
                 _persist_search_diagnostics(settings, diagnostics)
-                _persist_validated_jobs_checkpoint(settings, jobs_by_url, run_id=run_id, diagnostics=diagnostics)
+                _persist_validated_jobs_checkpoint(
+                    settings,
+                    jobs_by_url,
+                    reacquired_jobs_by_url=reacquired_jobs_by_url,
+                    run_id=run_id,
+                    diagnostics=diagnostics,
+                )
                 if status:
                     status.emit(
                         "search",
-                        f"Accepted job {len(jobs_by_url)}/{stop_goal}: {validated.company_name} | {validated.role_title}",
+                        (
+                            f"Reacquired still-open job {len(reacquired_jobs_by_url)}: {validated.company_name} | {validated.role_title}"
+                            if validated.is_reacquired
+                            else f"Accepted job {len(jobs_by_url)}/{stop_goal}: {validated.company_name} | {validated.role_title}"
+                        ),
                         attempt_number=attempt_number,
                         round_number=round_number,
                         unique_leads_discovered=total_unique_leads,

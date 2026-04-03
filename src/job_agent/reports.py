@@ -6,7 +6,7 @@ import shutil
 
 from docx import Document
 
-from .models import JobOutreachBundle, NearMissJob, RunManifest
+from .models import JobOutreachBundle, JobPosting, NearMissJob, RunManifest
 
 
 def _add_paragraph_block(document: Document, lines: list[str]) -> None:
@@ -88,9 +88,11 @@ def build_summary_document(
     bundles: list[JobOutreachBundle],
     output_dir: Path,
     *,
+    reacquired_jobs: list[JobPosting] | None = None,
     generated_at: datetime | None = None,
 ) -> Path:
     generated_at = generated_at or datetime.now(UTC)
+    reacquired_jobs = list(reacquired_jobs or [])
     document = Document()
     document.add_heading("Job Summary", level=0)
     document.add_paragraph(f"Generated at: {generated_at.isoformat(timespec='seconds')}")
@@ -119,6 +121,24 @@ def build_summary_document(
         row[5].text = str(len(bundle.first_order_contacts))
         row[6].text = str(len(bundle.second_order_contacts))
         row[7].text = str(_count_second_order_targets_with_messages(bundle))
+
+    if reacquired_jobs:
+        document.add_heading("Still Open Again", level=1)
+        document.add_paragraph(
+            "These jobs were successfully validated again in this run, but they were already reported in a prior run."
+        )
+        for job in reacquired_jobs:
+            document.add_heading(f"{job.company_name} | {job.role_title}", level=2)
+            document.add_paragraph(f"Canonical URL: {job.resolved_job_url or job.direct_job_url}")
+            if job.first_reported_at:
+                document.add_paragraph(f"First reported: {job.first_reported_at}")
+            if job.last_reported_at:
+                document.add_paragraph(f"Previously reported most recently: {job.last_reported_at}")
+            if job.report_count is not None:
+                document.add_paragraph(f"Times reacquired/reported: {job.report_count}")
+            evidence_summary = job.evidence_notes or (job.validation_evidence[0] if job.validation_evidence else "")
+            if evidence_summary:
+                document.add_paragraph(f"Current validation evidence: {evidence_summary}")
 
     path = output_dir / f"job_summary-{_timestamp_slug(generated_at)}.docx"
     document.save(path)
@@ -273,30 +293,54 @@ def build_near_miss_payload(
     }
 
 
+def build_reacquired_jobs_payload(
+    jobs: list[JobPosting],
+    *,
+    run_id: str,
+    generated_at: datetime | None = None,
+) -> dict[str, object]:
+    generated_at = generated_at or datetime.now(UTC)
+    return {
+        "run_id": run_id,
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "reacquired_validated_jobs_count": len(jobs),
+        "items": [job.model_dump(mode="json") for job in jobs],
+    }
+
+
 def build_manifest(
     *,
     run_id: str,
     bundles: list[JobOutreachBundle],
+    reacquired_jobs: list[JobPosting] | None = None,
     jobs_found_by_search: int,
     message_docx_path: Path,
     summary_docx_path: Path,
     near_misses: list[NearMissJob] | None = None,
+    reacquired_jobs_json_path: Path | None = None,
     near_miss_docx_path: Path | None = None,
     near_miss_json_path: Path | None = None,
     ollama_summary_json_path: Path | None = None,
     generated_at: datetime | None = None,
 ) -> RunManifest:
     generated_at = generated_at or datetime.now(UTC)
+    reacquired_jobs = list(reacquired_jobs or [])
+    novel_validated_jobs_count = len(bundles)
+    reacquired_validated_jobs_count = len(reacquired_jobs)
     return RunManifest(
         run_id=run_id,
         generated_at=generated_at,
         message_docx_path=str(message_docx_path),
         summary_docx_path=str(summary_docx_path),
         jobs_found_by_search=jobs_found_by_search,
-        jobs_kept_after_validation=len(bundles),
+        jobs_kept_after_validation=novel_validated_jobs_count,
         jobs_with_any_messages=sum(
             1 for bundle in bundles if bundle.first_order_messages or bundle.second_order_messages
         ),
+        novel_validated_jobs_count=novel_validated_jobs_count,
+        reacquired_validated_jobs_count=reacquired_validated_jobs_count,
+        total_current_validated_jobs_count=novel_validated_jobs_count + reacquired_validated_jobs_count,
+        reacquired_jobs_json_path=str(reacquired_jobs_json_path) if reacquired_jobs_json_path else None,
         near_miss_docx_path=str(near_miss_docx_path) if near_miss_docx_path else None,
         near_miss_json_path=str(near_miss_json_path) if near_miss_json_path else None,
         ollama_summary_json_path=str(ollama_summary_json_path) if ollama_summary_json_path else None,

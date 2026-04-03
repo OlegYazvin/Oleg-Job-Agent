@@ -43,6 +43,7 @@ class Settings:
     search_round_query_limit: int
     max_leads_per_query: int
     max_leads_to_resolve_per_pass: int
+    reacquisition_attempt_cap: int
     per_query_timeout_seconds: int
     per_lead_timeout_seconds: int
     workflow_timeout_seconds: int
@@ -210,6 +211,7 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         search_round_query_limit=int(os.getenv("SEARCH_ROUND_QUERY_LIMIT", "6")),
         max_leads_per_query=int(os.getenv("MAX_LEADS_PER_QUERY", "6")),
         max_leads_to_resolve_per_pass=int(os.getenv("MAX_LEADS_TO_RESOLVE_PER_PASS", "60")),
+        reacquisition_attempt_cap=int(os.getenv("REACQUISITION_ATTEMPT_CAP", "10")),
         per_query_timeout_seconds=int(os.getenv("PER_QUERY_TIMEOUT_SECONDS", "35")),
         per_lead_timeout_seconds=int(os.getenv("PER_LEAD_TIMEOUT_SECONDS", "25")),
         workflow_timeout_seconds=max(0, int(os.getenv("WORKFLOW_TIMEOUT_SECONDS", "3600"))),

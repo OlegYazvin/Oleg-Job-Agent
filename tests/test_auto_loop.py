@@ -58,6 +58,7 @@ def build_settings(tmp_path: Path) -> Settings:
         search_round_query_limit=6,
         max_leads_per_query=10,
         max_leads_to_resolve_per_pass=80,
+        reacquisition_attempt_cap=10,
         per_query_timeout_seconds=45,
         per_lead_timeout_seconds=30,
         workflow_timeout_seconds=3600,

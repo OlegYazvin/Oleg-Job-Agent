@@ -471,6 +471,22 @@ def load_previously_reported_job_keys(data_dir: Path) -> set[str]:
     return keys
 
 
+def load_validated_job_history_index(data_dir: Path) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for job_key, entry in load_job_history_entries(data_dir).items():
+        if not isinstance(entry, Mapping):
+            continue
+        keys = {
+            str(job_key).strip(),
+            str(entry.get("canonical_job_key") or "").strip(),
+            str(entry.get("normalized_job_url") or "").strip(),
+        }
+        for key in keys:
+            if key:
+                index[key] = dict(entry)
+    return index
+
+
 def load_previously_reported_company_keys(data_dir: Path) -> set[str]:
     return {
         str(company_key).strip()
@@ -494,6 +510,7 @@ def record_successful_run(
     run_id: str,
     manifest: RunManifest,
     bundles: list[JobOutreachBundle],
+    reacquired_jobs: list[Any] | None = None,
     status_payload: Mapping[str, Any] | None = None,
 ) -> None:
     generated_at_iso = manifest.generated_at.isoformat()
@@ -507,6 +524,9 @@ def record_successful_run(
             "message": "Workflow completed successfully.",
             "jobs_found_by_search": manifest.jobs_found_by_search,
             "jobs_kept_after_validation": manifest.jobs_kept_after_validation,
+            "novel_validated_jobs_count": manifest.novel_validated_jobs_count,
+            "reacquired_validated_jobs_count": manifest.reacquired_validated_jobs_count,
+            "total_current_validated_jobs_count": manifest.total_current_validated_jobs_count,
             "jobs_with_any_messages": manifest.jobs_with_any_messages,
             "message_docx_path": manifest.message_docx_path,
             "summary_docx_path": manifest.summary_docx_path,
@@ -515,8 +535,9 @@ def record_successful_run(
 
     job_history = load_job_history_entries(data_dir)
     company_history = load_company_history_entries(data_dir)
-    for bundle in bundles:
-        job = bundle.job
+    successful_jobs = [bundle.job for bundle in bundles]
+    successful_jobs.extend(list(reacquired_jobs or []))
+    for job in successful_jobs:
         job_key = _normalize_job_history_key(job.resolved_job_url or job.direct_job_url)
         if not job_key:
             continue

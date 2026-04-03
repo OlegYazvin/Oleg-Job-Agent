@@ -42,6 +42,7 @@ def build_settings(tmp_path: Path) -> Settings:
         search_round_query_limit=6,
         max_leads_per_query=10,
         max_leads_to_resolve_per_pass=80,
+        reacquisition_attempt_cap=10,
         per_query_timeout_seconds=45,
         per_lead_timeout_seconds=30,
         workflow_timeout_seconds=3600,
@@ -71,7 +72,7 @@ def test_run_daily_workflow_marks_status_failed_when_timeout_elapses(
 
     async def slow_find_matching_jobs(*args, **kwargs):
         await asyncio.sleep(0.05)
-        return [], 0, None
+        return [], [], 0, None
 
     monkeypatch.setattr("job_agent.workflow.find_matching_jobs", slow_find_matching_jobs)
 
@@ -126,7 +127,7 @@ def test_run_daily_workflow_writes_near_miss_and_ollama_summary_artifacts(
     )
 
     async def fake_find_matching_jobs(*args, **kwargs):
-        return [job], 12, diagnostics
+        return [job], [], 12, diagnostics
 
     async def fake_draft_outreach_bundle(*args, **kwargs):
         return JobOutreachBundle(job=job)
@@ -174,7 +175,7 @@ def test_run_daily_workflow_defers_ollama_prewarm_until_needed(
     )
 
     async def fake_find_matching_jobs(*args, **kwargs):
-        return [], 0, diagnostics
+        return [], [], 0, diagnostics
 
     monkeypatch.setattr("job_agent.workflow.find_matching_jobs", fake_find_matching_jobs)
     monkeypatch.setattr("job_agent.workflow.auto_tune_ollama_settings", lambda configured, run_id=None: (configured, profile))
