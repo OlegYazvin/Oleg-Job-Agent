@@ -6081,7 +6081,6 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         or run_id in FORCED_OLLAMA_SEED_REFINEMENT_RUNS
     ):
         return seed_leads
-    FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
     seed_window = seed_leads[:5]
     confidences = [_lead_confidence(lead) for lead in seed_window]
     average_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0
@@ -6098,6 +6097,7 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         and low_trust_source_count == 0
         and trustworthy_direct_url_count >= 1
     ):
+        FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
         return await _refine_local_leads_with_ollama(
             settings,
             "seed replay triage",
@@ -6116,6 +6116,7 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         and low_trust_source_count == 0
         and trustworthy_direct_url_count >= len(seed_window)
     ):
+        FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
         return await _refine_local_leads_with_ollama(
             settings,
             "seed replay triage",
@@ -6138,6 +6139,7 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         trustworthy_direct_url_count=trustworthy_direct_url_count,
     ):
         return seed_leads
+    FORCED_OLLAMA_SEED_REFINEMENT_RUNS.add(run_id)
     return await _refine_local_leads_with_ollama(
         settings,
         "seed replay triage",
