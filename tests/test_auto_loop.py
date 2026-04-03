@@ -8,6 +8,7 @@ from job_agent.auto_loop import (
     build_run_improvement_analysis,
     ensure_baseline_commit,
     invoke_codex_iteration,
+    render_codex_prompt,
     run_autonomous_loop,
 )
 from job_agent.config import Settings
@@ -90,6 +91,10 @@ def _make_scorecard(
     query_timeout_count: int = 0,
     query_skipped_timeout_budget_count: int = 0,
     discovery_efficiency: float = 0.0,
+    missing_salary_count: int = 0,
+    fetch_non_200_count: int = 0,
+    not_remote_count: int = 0,
+    stale_posting_count: int = 0,
     request_count: int = 0,
     useful_actions_per_request: float = 0.0,
 ) -> RunScorecard:
@@ -126,10 +131,10 @@ def _make_scorecard(
             actionable_near_miss_yield=0.0,
             company_mismatch_count=0,
             not_specific_job_page_count=0,
-            missing_salary_count=0,
-            fetch_non_200_count=0,
-            stale_posting_count=0,
-            not_remote_count=0,
+            missing_salary_count=missing_salary_count,
+            fetch_non_200_count=fetch_non_200_count,
+            stale_posting_count=stale_posting_count,
+            not_remote_count=not_remote_count,
             false_negative_fixable_count=0,
             false_negative_near_miss_count=0,
             false_negative_correct_rejection_count=0,
@@ -218,6 +223,102 @@ def test_build_run_improvement_analysis_prioritizes_query_timeout_burden(tmp_pat
 
     assert analysis.selected_theme == "query_timeout_burden"
     assert analysis.metric_deltas["query_timeout_delta"] > 0
+
+
+def test_build_run_improvement_analysis_detects_plateau_breaker_after_repeated_ollama_idle_streak(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(5):
+        scorecard = _make_scorecard(
+            run_id=f"run-{index + 1}",
+            status="completed",
+            generated_at=datetime(2026, 3, 30, 12, index, tzinfo=UTC),
+            fresh_new_leads_count=11,
+            request_count=0,
+        )
+        save_run_scorecard(settings.data_dir, scorecard)
+
+    auto_loop_state_payload = {
+        "enabled": True,
+        "status": "running",
+        "target_attempts": 20,
+        "completed_attempts": 5,
+        "current_iteration": 6,
+        "current_run_id": "run-5",
+        "codex_session_id": "session-1",
+        "baseline_commit_hash": "baseline123",
+        "latest_commit_hash": "latest123",
+        "latest_validation_result": "passed",
+        "last_failure_summary": None,
+        "started_at": "2026-03-30T12:00:00Z",
+        "updated_at": "2026-03-30T12:05:00Z",
+        "iterations": [
+            {
+                "iteration_number": idx + 1,
+                "run_id": f"run-{idx + 1}",
+                "run_status": "completed",
+                "started_at": f"2026-03-30T12:0{idx}:00Z",
+                "completed_at": f"2026-03-30T12:0{idx}:30Z",
+                "selected_theme": "ollama_idle",
+                "analysis_path": None,
+                "prompt_path": None,
+                "result_path": None,
+                "codex_log_path": None,
+                "codex_last_message_path": None,
+                "commit_hash": f"commit-{idx + 1}",
+                "validation_passed": True,
+            }
+            for idx in range(5)
+        ],
+    }
+    settings.auto_loop_state_path.write_text(json.dumps(auto_loop_state_payload), encoding="utf-8")
+
+    analysis = build_run_improvement_analysis(
+        settings,
+        iteration_number=6,
+        run_id="run-5",
+    )
+
+    assert analysis.selected_theme == "plateau_breaker"
+    assert analysis.recent_selected_themes[:3] == ["ollama_idle", "ollama_idle", "ollama_idle"]
+    prompt = render_codex_prompt(analysis, iteration_number=6)
+    assert "Recent selected themes:" in prompt
+    assert "Recent theme streak: `ollama_idle` x5." in prompt
+    assert "Do not spend this iteration on another micro-tweak in that same area" in prompt
+
+
+def test_build_run_improvement_analysis_prioritizes_validation_hard_filter_burden(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    older = _make_scorecard(
+        run_id="run-older",
+        status="completed",
+        generated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        fresh_new_leads_count=10,
+    )
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
+        fresh_new_leads_count=11,
+        not_remote_count=2,
+        stale_posting_count=1,
+        missing_salary_count=1,
+        request_count=0,
+    )
+    save_run_scorecard(settings.data_dir, older)
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(
+        settings,
+        iteration_number=2,
+        run_id="run-current",
+    )
+
+    assert analysis.selected_theme == "validation_hard_filter_burden"
+    assert analysis.current_metrics["not_remote_count"] == 2
+    assert analysis.current_metrics["stale_posting_count"] == 1
+    assert analysis.current_metrics["missing_salary_count"] == 1
 
 
 def test_ensure_baseline_commit_commits_dirty_main(tmp_path: Path) -> None:

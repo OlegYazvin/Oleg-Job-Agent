@@ -38,10 +38,12 @@ THEME_COMMIT_SUMMARIES = {
     "query_timeout_burden": "reduce timeout-heavy discovery families",
     "low_fresh_discovery": "improve fresh ATS-first discovery",
     "validation_resolution_quality": "tighten validation and resolution quality",
+    "validation_hard_filter_burden": "reduce hard-filter validation waste",
     "linkedin_message_gap": "restore LinkedIn message generation",
     "ollama_idle": "increase bounded Ollama utilization",
     "near_miss_noise": "improve near-miss quality filters",
     "salary_extraction_gap": "improve salary extraction",
+    "plateau_breaker": "break repeated-theme plateau",
     "general_iterative_improvement": "apply bounded iterative improvement",
 }
 
@@ -450,6 +452,35 @@ def _average_metric(entries: list[RunScorecard], accessor) -> float:
     return round(sum(values) / len(values), 3) if values else 0.0
 
 
+def _recent_selected_themes(settings: Settings, *, limit: int = 5) -> list[str]:
+    state = load_auto_loop_state(settings)
+    if state is None:
+        return []
+    themes = [
+        str(iteration.selected_theme or "").strip()
+        for iteration in reversed(state.iterations)
+        if str(iteration.selected_theme or "").strip()
+    ]
+    return themes[:limit]
+
+
+def _theme_streak(themes: list[str]) -> tuple[str | None, int]:
+    if not themes:
+        return None, 0
+    current = themes[0]
+    streak = 0
+    for theme in themes:
+        if theme != current:
+            break
+        streak += 1
+    return current, streak
+
+
+def _fresh_lead_range(entries: list[RunScorecard]) -> int:
+    values = [int(entry.outcome.fresh_new_leads_count) for entry in entries]
+    return max(values) - min(values) if values else 0
+
+
 def _pattern(
     key: str,
     summary: str,
@@ -464,12 +495,20 @@ def _pattern(
     )
 
 
-def _build_patterns(window: list[RunScorecard], *, current_failure_message: str | None = None) -> list[ImprovementPattern]:
+def _build_patterns(
+    window: list[RunScorecard],
+    *,
+    current_failure_message: str | None = None,
+    recent_selected_themes: list[str] | None = None,
+) -> list[ImprovementPattern]:
     if not window:
         return [_pattern("general_iterative_improvement", "No scorecard history was available; apply one bounded improvement batch.", 1.0)]
     current = window[0]
     previous_entries = window[1:]
     patterns: list[ImprovementPattern] = []
+    recent_selected_themes = recent_selected_themes or []
+    repeated_theme, repeated_theme_streak = _theme_streak(recent_selected_themes)
+    recent_window = window[:5]
 
     if current.status == "failed":
         patterns.append(
@@ -491,6 +530,23 @@ def _build_patterns(window: list[RunScorecard], *, current_failure_message: str 
                 query_timeout_count=current.discovery.query_timeout_count,
                 skipped_timeout_budget=current.discovery.query_skipped_timeout_budget_count,
                 discovery_efficiency=current.discovery.discovery_efficiency,
+            )
+        )
+
+    validation_hard_filter_burden = (
+        current.validation.not_remote_count
+        + current.validation.stale_posting_count
+        + current.validation.missing_salary_count
+    )
+    if current.outcome.validated_jobs_count == 0 and validation_hard_filter_burden >= 3:
+        patterns.append(
+            _pattern(
+                "validation_hard_filter_burden",
+                "Runs are consistently dying on remote, staleness, or salary hard filters after discovery; improve prevalidation or trusted-source evidence before another model-only tweak.",
+                max(28.0, validation_hard_filter_burden * 7.0),
+                not_remote_count=current.validation.not_remote_count,
+                stale_posting_count=current.validation.stale_posting_count,
+                missing_salary_count=current.validation.missing_salary_count,
             )
         )
 
@@ -530,6 +586,33 @@ def _build_patterns(window: list[RunScorecard], *, current_failure_message: str 
                 35.0,
                 validated_jobs_count=current.outcome.validated_jobs_count,
                 jobs_with_messages_count=current.outcome.jobs_with_messages_count,
+            )
+        )
+
+    if (
+        repeated_theme
+        and repeated_theme_streak >= 3
+        and len(recent_window) >= 4
+        and all(entry.outcome.validated_jobs_count == 0 for entry in recent_window)
+        and all(entry.outcome.actionable_near_miss_count == 0 for entry in recent_window)
+        and _fresh_lead_range(recent_window) <= 1
+    ):
+        repeated_theme_summary = (
+            "The loop has plateaued on repeated Ollama-focused fixes without improving validated jobs; switch this iteration to discovery, replay, or validation work instead of another Ollama-only tweak."
+            if repeated_theme == "ollama_idle"
+            else "The loop has plateaued on the same theme without improving validated jobs; switch to a different subsystem instead of another micro-tweak in the same area."
+        )
+        patterns.append(
+            _pattern(
+                "plateau_breaker",
+                repeated_theme_summary,
+                60.0,
+                repeated_theme=repeated_theme,
+                repeated_theme_streak=repeated_theme_streak,
+                stagnant_run_count=len(recent_window),
+                fresh_lead_range=_fresh_lead_range(recent_window),
+                latest_fresh_new_leads=current.outcome.fresh_new_leads_count,
+                latest_validated_jobs=current.outcome.validated_jobs_count,
             )
         )
 
@@ -616,7 +699,12 @@ def build_run_improvement_analysis(
 ) -> RunImprovementAnalysis:
     window = _scorecard_window(settings, run_id, limit=20)
     current = window[0] if window else None
-    patterns = _build_patterns(window, current_failure_message=failure_message)
+    recent_selected_themes = _recent_selected_themes(settings, limit=5)
+    patterns = _build_patterns(
+        window,
+        current_failure_message=failure_message,
+        recent_selected_themes=recent_selected_themes,
+    )
     selected = patterns[0]
     current_metrics = {}
     if current is not None:
@@ -630,6 +718,10 @@ def build_run_improvement_analysis(
             "replayed_seed_leads_count": current.discovery.replayed_seed_leads_count,
             "discovery_efficiency": current.discovery.discovery_efficiency,
             "validated_yield": current.validation.validated_yield,
+            "missing_salary_count": current.validation.missing_salary_count,
+            "fetch_non_200_count": current.validation.fetch_non_200_count,
+            "not_remote_count": current.validation.not_remote_count,
+            "stale_posting_count": current.validation.stale_posting_count,
             "ollama_request_count": current.ollama.request_count,
             "ollama_useful_actions_per_request": current.ollama.useful_actions_per_request,
         }
@@ -644,6 +736,7 @@ def build_run_improvement_analysis(
         generated_at=_utc_now(),
         target_run_id=run_id,
         analyzed_run_ids=[entry.run_id for entry in window],
+        recent_selected_themes=recent_selected_themes,
         current_run_status=current.status if current is not None else "unknown",
         current_metrics=current_metrics,
         metric_deltas=_metric_deltas(window),
@@ -660,8 +753,14 @@ def render_codex_prompt(
     *,
     iteration_number: int,
 ) -> str:
+    def _render_pattern_line(pattern: ImprovementPattern) -> str:
+        if not pattern.evidence:
+            return f"- `{pattern.key}` ({pattern.severity_score}): {pattern.summary}"
+        evidence_text = ", ".join(f"{key}={value}" for key, value in sorted(pattern.evidence.items()))
+        return f"- `{pattern.key}` ({pattern.severity_score}): {pattern.summary} Evidence: {evidence_text}"
+
     top_pattern_lines = [
-        f"- `{pattern.key}` ({pattern.severity_score}): {pattern.summary}"
+        _render_pattern_line(pattern)
         for pattern in analysis.top_patterns
     ]
     artifact_lines = [
@@ -677,6 +776,15 @@ def render_codex_prompt(
         for key, value in sorted(analysis.current_metrics.items())
     ]
     acceptance_lines = [f"- {item}" for item in analysis.acceptance_checks]
+    recent_theme_lines = [f"- `{theme}`" for theme in analysis.recent_selected_themes]
+    repeated_theme, repeated_theme_streak = _theme_streak(analysis.recent_selected_themes)
+    plateau_guardrails: list[str] = []
+    if repeated_theme and repeated_theme_streak >= 3:
+        plateau_guardrails = [
+            f"- Recent theme streak: `{repeated_theme}` x{repeated_theme_streak}.",
+            "- Do not spend this iteration on another micro-tweak in that same area unless you can directly change a primary metric trend.",
+            "- Prefer a different subsystem with measurable upside, such as discovery, replay quality, validation, or message generation.",
+        ]
     return "\n".join(
         [
             f"# Autonomous Loop Iteration {iteration_number:02d}",
@@ -692,9 +800,13 @@ def render_codex_prompt(
             "Metric deltas versus recent history:",
             *(delta_lines or ["- No metric deltas were available."]),
             "",
+            "Recent selected themes:",
+            *(recent_theme_lines or ["- No recent theme history was available."]),
+            "",
             "Top learned patterns from the latest run plus the previous 19 runs:",
             *(top_pattern_lines or ["- No ranked patterns were available."]),
             "",
+            *(["Plateau guardrails:", *plateau_guardrails, ""] if plateau_guardrails else []),
             "Relevant artifacts:",
             *(artifact_lines or ["- No artifact paths were available."]),
             "",

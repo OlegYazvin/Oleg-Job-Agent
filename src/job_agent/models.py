@@ -426,6 +426,7 @@ class RunImprovementAnalysis(BaseModel):
     generated_at: datetime
     target_run_id: str | None = None
     analyzed_run_ids: list[str] = Field(default_factory=list)
+    recent_selected_themes: list[str] = Field(default_factory=list)
     current_run_status: str
     current_metrics: dict[str, float | int | str | None] = Field(default_factory=dict)
     metric_deltas: dict[str, float] = Field(default_factory=dict)
