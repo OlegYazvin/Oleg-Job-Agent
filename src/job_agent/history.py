@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 from typing import Any
@@ -50,10 +50,27 @@ AGGREGATOR_HOST_FRAGMENTS = (
     "glassdoor.com",
     "indeed.com",
 )
+PREVIOUSLY_REPORTED_JOB_COOLDOWN_DAYS = 7
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return _utc_now().isoformat(timespec="seconds")
+
+
+def _parse_history_timestamp(raw_value: object) -> datetime | None:
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw_value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _load_json(path: Path, *, default: Any) -> Any:
@@ -433,7 +450,14 @@ def load_company_watchlist_entries(data_dir: Path) -> dict[str, dict[str, Any]]:
 
 def load_previously_reported_job_keys(data_dir: Path) -> set[str]:
     keys: set[str] = set()
+    cutoff = _utc_now() - timedelta(days=PREVIOUSLY_REPORTED_JOB_COOLDOWN_DAYS)
     for job_key, entry in load_job_history_entries(data_dir).items():
+        if isinstance(entry, Mapping):
+            reported_at = _parse_history_timestamp(entry.get("last_reported_at")) or _parse_history_timestamp(
+                entry.get("first_reported_at")
+            )
+            if reported_at is not None and reported_at < cutoff:
+                continue
         normalized = str(job_key).strip()
         if normalized:
             keys.add(normalized)

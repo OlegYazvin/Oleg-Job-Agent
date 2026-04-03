@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 
@@ -32,7 +32,8 @@ def _build_bundle() -> JobOutreachBundle:
     )
 
 
-def test_record_successful_run_updates_run_and_job_history(tmp_path: Path) -> None:
+def test_record_successful_run_updates_run_and_job_history(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("job_agent.history._utc_now", lambda: datetime(2026, 3, 26, 0, 0, 0, tzinfo=UTC))
     bundle = _build_bundle()
     manifest = RunManifest(
         run_id="run-123",
@@ -129,7 +130,8 @@ def test_record_company_watchlist_tracks_promising_companies(tmp_path: Path) -> 
     assert load_company_watchlist_entries(tmp_path)["tinyai"]["company_name"] == "Tiny AI"
 
 
-def test_record_successful_run_normalizes_job_history_tracking_urls(tmp_path: Path) -> None:
+def test_record_successful_run_normalizes_job_history_tracking_urls(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("job_agent.history._utc_now", lambda: datetime(2026, 3, 27, 0, 0, 0, tzinfo=UTC))
     bundle = JobOutreachBundle(
         job=JobPosting(
             company_name="Dropbox",
@@ -161,3 +163,21 @@ def test_record_successful_run_normalizes_job_history_tracking_urls(tmp_path: Pa
     normalized_key = "https://www.dropbox.jobs/en/jobs/7729233/staff-product-manager-ai-organization-workflows"
     assert normalized_key in job_history
     assert load_previously_reported_job_keys(tmp_path) == {normalized_key}
+
+
+def test_load_previously_reported_job_keys_expires_old_entries(tmp_path: Path, monkeypatch) -> None:
+    bundle = _build_bundle()
+    manifest = RunManifest(
+        run_id="run-old",
+        generated_at=datetime(2026, 3, 20, 12, 0, 0),
+        message_docx_path=str(tmp_path / "output" / "linkedin_outreach_messages-20260320-120000.docx"),
+        summary_docx_path=str(tmp_path / "output" / "job_summary-20260320-120000.docx"),
+        jobs_found_by_search=10,
+        jobs_kept_after_validation=1,
+        jobs_with_any_messages=0,
+    )
+
+    record_successful_run(tmp_path, run_id="run-old", manifest=manifest, bundles=[bundle])
+    monkeypatch.setattr("job_agent.history._utc_now", lambda: datetime(2026, 4, 2, 0, 0, 0, tzinfo=UTC))
+
+    assert load_previously_reported_job_keys(tmp_path) == set()
