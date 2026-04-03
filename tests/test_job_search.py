@@ -42,6 +42,7 @@ from job_agent.job_search import (
     _extract_linkedin_guest_search_leads,
     _extract_mojeek_search_results,
     _extract_followup_resolution_urls,
+    _extract_geo_limited_remote_region,
     _extract_posted_hint,
     _extract_startpage_search_results,
     _extract_role_company_from_title,
@@ -278,7 +279,7 @@ def test_weak_company_hints_do_not_trigger_mismatch_rejection(monkeypatch) -> No
         direct_job_url="https://job-boards.greenhouse.io/hs/jobs/7580489",
         resolved_job_url="https://job-boards.greenhouse.io/hs/jobs/7580489",
         ats_platform="Greenhouse",
-        location_text="Remote - New York City, NY",
+        location_text="Remote - United States",
         is_fully_remote=True,
         posted_date_text="2026-03-20",
         posted_date_iso="2026-03-20",
@@ -560,6 +561,12 @@ def test_collect_replay_seed_leads_ignores_non_dict_run_artifacts(tmp_path: Path
 
 def test_extract_posted_hint_parses_absolute_month_dates() -> None:
     assert _extract_posted_hint("Mar 14, 2026 · Senior PM role") == "2026-03-14"
+
+
+def test_extract_geo_limited_remote_region_reads_title_style_remote_markets() -> None:
+    assert _extract_geo_limited_remote_region("Principal Product Manager - AI Travel (100% Remote - Ireland)") == "ireland"
+    assert _extract_geo_limited_remote_region("Staff AI Product Manager (Remote - UK)") == "uk"
+    assert _extract_geo_limited_remote_region("Principal Product Manager, AI (Remote - United States)") is None
 
 
 def test_resolve_greenhouse_board_job_url_from_generic_board(monkeypatch) -> None:
@@ -1027,6 +1034,53 @@ def test_evaluate_merged_job_rejects_geo_limited_remote_role(monkeypatch) -> Non
         expected_company_name="Linktree",
         expected_role_title="Staff AI Product Manager",
         allow_trusted_source_role_fallback=True,
+    )
+
+    assert reason_code == "not_remote"
+    assert "geographically restricted" in detail
+
+
+def test_evaluate_merged_job_rejects_title_only_geo_limited_remote_role(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 29))
+    job = JobPosting(
+        company_name="Hopper",
+        role_title="Principal Product Manager - AI Travel (100% Remote - Ireland)",
+        direct_job_url="https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377",
+        resolved_job_url="https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377",
+        ats_platform="Ashby",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-20",
+        posted_date_iso="2026-03-20",
+        base_salary_min_usd=220000,
+        base_salary_max_usd=260000,
+        salary_text="$220,000 - $260,000",
+        evidence_notes="Discovered via official Ashby board enumeration.",
+        validation_evidence=[],
+    )
+    snapshot = JobPageSnapshot(
+        requested_url=job.direct_job_url,
+        resolved_url=job.direct_job_url,
+        ats_platform="Ashby",
+        status_code=200,
+        company_name="Hopper",
+        role_title=job.role_title,
+        page_title="Principal Product Manager - AI Travel (100% Remote - Ireland) | Hopper",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-20",
+        posted_date_iso="2026-03-20",
+        text_excerpt="Lead AI product strategy across Hopper's travel intelligence platform.",
+        evidence_snippets=[],
+    )
+
+    reason_code, detail = _evaluate_merged_job(
+        job,
+        snapshot,
+        settings,
+        expected_company_name="Hopper",
+        expected_role_title=job.role_title,
     )
 
     assert reason_code == "not_remote"
@@ -2119,6 +2173,27 @@ def test_precheck_lead_hints_fast_rejects_stale_non_remote_and_low_salary() -> N
     location_failure = _precheck_lead_hints(location_specific_workday_lead, settings, attempt_number=1, round_number=1)
     assert location_failure is not None
     assert location_failure.reason_code == "not_remote"
+
+
+def test_precheck_lead_hints_rejects_title_only_geo_limited_remote_role(monkeypatch) -> None:
+    settings = build_settings()
+    monkeypatch.setattr("job_agent.job_search._today_for_timezone", lambda timezone_name: date(2026, 3, 24))
+    lead = JobLead(
+        company_name="Hopper",
+        role_title="Principal Product Manager - AI Travel (100% Remote - Ireland)",
+        source_url="https://jobs.ashbyhq.com/hopper",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/hopper/94b5bfa7-53f0-4649-9799-a03c3ccd3377",
+        posted_date_hint="2026-03-20",
+        is_remote_hint=True,
+        evidence_notes="Discovered via official Ashby board enumeration.",
+    )
+
+    failure = _precheck_lead_hints(lead, settings, attempt_number=1, round_number=1)
+
+    assert failure is not None
+    assert failure.reason_code == "not_remote"
+    assert "geographically restricted" in failure.detail
 
 
 def test_precheck_lead_hints_rejects_mismatched_direct_job_url_company() -> None:

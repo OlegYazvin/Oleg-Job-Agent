@@ -2215,7 +2215,7 @@ def _lead_has_strong_override_hints(lead: JobLead, settings: Settings) -> bool:
         return False
     if lead.is_remote_hint is not True:
         return False
-    combined_location_hint = " ".join(part for part in (lead.location_hint, lead.evidence_notes) if part)
+    combined_location_hint = _join_remote_restriction_context(lead.location_hint, lead.evidence_notes)
     if _extract_geo_limited_remote_region(combined_location_hint):
         return False
     if lead.posted_date_hint and _hint_is_recent(lead.posted_date_hint, settings) is False:
@@ -4153,6 +4153,10 @@ def _normalize_remote_region_hint(value: str | None) -> str | None:
     return normalized
 
 
+def _join_remote_restriction_context(*parts: str | None) -> str:
+    return ". ".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
+
+
 def _extract_geo_limited_remote_region(text: str | None) -> str | None:
     normalized_text = " ".join(str(text or "").split()).lower()
     if "remote" not in normalized_text:
@@ -4161,6 +4165,7 @@ def _extract_geo_limited_remote_region(text: str | None) -> str | None:
         r"\bonly considering candidates who reside in (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
         r"\bmust (?:reside|live|be based|be located|work) in (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
         r"\bremote (?:within|from|in) (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
+        r"\b(?:100%\s*)?remote\s*[-\u2013\u2014/,]\s*(?P<region>[a-z][a-z ,/&-]{1,80}?)(?:\bonly\b|[.;)]|$)",
         r"\bcandidates must be located in (?P<region>[a-z][a-z ,/&-]{1,80}?)(?:[.;)]|$)",
         r"\b(?P<region>california|new york|washington|texas|illinois|massachusetts|florida|san francisco(?: bay)?|new york city|los angeles|seattle|boston|chicago)\s+only\b",
     )
@@ -6431,7 +6436,7 @@ def _extract_builtin_remote_hint(
 
 
 def _remote_restriction_note(*texts: str | None) -> str | None:
-    region = _extract_geo_limited_remote_region(" ".join(part for part in texts if part))
+    region = _extract_geo_limited_remote_region(_join_remote_restriction_context(*texts))
     if not region:
         return None
     return f"Remote restriction: {region.title()} only."
@@ -9077,15 +9082,11 @@ def _precheck_lead_hints(
             attempt_number=attempt_number,
             round_number=round_number,
         )
-    combined_location_hint = " ".join(
-        part
-        for part in (
-            lead.role_title,
-            lead.location_hint,
-            lead.evidence_notes,
-            _unwrap_direct_job_url(lead.direct_job_url or ""),
-        )
-        if part
+    combined_location_hint = _join_remote_restriction_context(
+        lead.role_title,
+        lead.location_hint,
+        lead.evidence_notes,
+        _unwrap_direct_job_url(lead.direct_job_url or ""),
     )
     if lead.is_remote_hint is False or any(token in combined_location_hint.lower() for token in ("hybrid", "on-site", "onsite", "in office")):
         return _make_failure(
@@ -9411,15 +9412,11 @@ def _lead_has_trusted_source_fallback_evidence(
     remote_hint = lead.is_remote_hint if lead.is_remote_hint is not None else (candidate.is_fully_remote if candidate else None)
     if remote_hint is not True:
         return False
-    geo_hint_text = " ".join(
-        part
-        for part in (
-            lead.location_hint,
-            candidate.location_text if candidate else "",
-            lead.evidence_notes,
-            candidate.evidence_notes if candidate else "",
-        )
-        if part
+    geo_hint_text = _join_remote_restriction_context(
+        lead.location_hint,
+        candidate.location_text if candidate else "",
+        lead.evidence_notes,
+        candidate.evidence_notes if candidate else "",
     )
     if _extract_geo_limited_remote_region(geo_hint_text):
         return False
@@ -9504,16 +9501,16 @@ def _job_has_geo_limited_remote_restriction(
     job: JobPosting,
     snapshot: JobPageSnapshot,
 ) -> bool:
-    combined_text = " ".join(
-        part
-        for part in (
-            job.location_text,
-            job.evidence_notes,
-            snapshot.location_text,
-            snapshot.text_excerpt[:1600],
-            " ".join(snapshot.evidence_snippets[:4]),
-        )
-        if part
+    combined_text = _join_remote_restriction_context(
+        job.role_title,
+        job.location_text,
+        job.job_page_title,
+        job.evidence_notes,
+        snapshot.role_title,
+        snapshot.page_title,
+        snapshot.location_text,
+        snapshot.text_excerpt[:1600],
+        " ".join(snapshot.evidence_snippets[:4]),
     )
     return _extract_geo_limited_remote_region(combined_text) is not None
 
