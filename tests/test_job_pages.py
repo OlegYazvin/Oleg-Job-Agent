@@ -89,6 +89,27 @@ ASHBY_HTML = """
 </html>
 """
 
+ASHBY_COMPENSATION_HTML = """
+<html>
+  <body>
+    <script>
+      window.__appData = {
+        "organization": {"name": "Hopper"},
+        "posting": {
+          "title": "Principal Product Manager - AI Travel (100% Remote - USA)",
+          "locationName": "Remote - US",
+          "publishedAt": "2026-03-20T19:07:17.783Z",
+          "compensation": {
+            "compensationTierSummary": "$200K - $300K"
+          },
+          "descriptionHtml": "<p>You need to enable JavaScript to run this app.</p>"
+        }
+      }
+    </script>
+  </body>
+</html>
+"""
+
 RECRUITEE_HTML = """
 <html>
   <body>
@@ -139,6 +160,12 @@ def test_extract_salary_range_ignores_percent_ranges() -> None:
     assert _extract_salary_range("Travel requirement is 75-80% for field visits.") == (None, None, None)
 
 
+def test_extract_salary_range_ignores_non_usd_currency_ranges() -> None:
+    assert _extract_salary_range("Salary: CA$150K - CA$350K") == (None, None, None)
+    assert _extract_salary_range("Compensation: €150K - €220K") == (None, None, None)
+    assert _extract_salary_range("Salary: EUR 140K - 210K") == (None, None, None)
+
+
 def test_extract_lever_fields_reads_salary_posted_and_remote() -> None:
     values = _extract_lever_fields(BeautifulSoup(LEVER_HTML, "html.parser"), LEVER_HTML, [])
     assert values["base_salary_min_usd"] == 210000
@@ -169,6 +196,17 @@ def test_extract_ashby_fields_reads_embedded_app_data() -> None:
     assert values["posted_date_iso"] == "2026-03-26"
     assert values["base_salary_min_usd"] == 210000
     assert values["base_salary_max_usd"] == 260000
+    assert values["is_fully_remote"] is True
+
+
+def test_extract_ashby_fields_reads_structured_compensation_summary() -> None:
+    values = _extract_ashby_fields(ASHBY_COMPENSATION_HTML, [])
+    assert values["company_name"] == "Hopper"
+    assert values["role_title"] == "Principal Product Manager - AI Travel (100% Remote - USA)"
+    assert values["posted_date_iso"] == "2026-03-20"
+    assert values["base_salary_min_usd"] == 200000
+    assert values["base_salary_max_usd"] == 300000
+    assert values["salary_text"] == "$200K - $300K"
     assert values["is_fully_remote"] is True
 
 

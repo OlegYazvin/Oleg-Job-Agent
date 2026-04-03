@@ -211,6 +211,7 @@ User request:
             record_ollama_event(
                 self.settings,
                 "request_outer_timeout",
+                request_id=request_id,
                 run_id=run_id,
                 caller=caller,
                 prompt_category=prompt_category,
@@ -218,6 +219,8 @@ User request:
                 schema_name=schema.__name__,
                 model=self.model,
                 timeout_seconds=self.timeout_seconds + 15,
+                error_type="TimeoutError",
+                error_message=f"Ollama request exceeded the outer timeout of {self.timeout_seconds + 15} seconds.",
                 output_used="discarded",
             )
             raise LLMProviderError(

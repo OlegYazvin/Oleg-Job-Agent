@@ -31,6 +31,10 @@ def _build_ollama_provider(settings: Settings) -> OllamaStructuredProvider:
     return OllamaStructuredProvider(settings)
 
 
+def _ollama_drafting_enabled(settings: Settings) -> bool:
+    return settings.llm_provider == "ollama" and settings.ollama_drafting_enabled
+
+
 def _message_lint_score(message_body: str) -> tuple[int, bool]:
     score = 100
     body = message_body.strip()
@@ -426,7 +430,30 @@ Job:
 Contacts:
 {json.dumps([contact.model_dump(mode="json") for contact in contacts], indent=2)}
 """.strip()
-    if settings.llm_provider == "ollama":
+    if settings.llm_provider == "ollama" and not settings.ollama_drafting_enabled:
+        if settings.use_openai_fallback and settings.openai_api_key:
+            agent = build_first_order_message_agent()
+            result = await Runner.run(agent, prompt)
+            messages = _finalize_first_order_messages(job, contacts, result.final_output.messages)
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="first_order_messages",
+                strategy="openai",
+                messages=messages,
+            )
+            return messages
+        messages = _finalize_first_order_messages(job, contacts, _template_first_order_messages(job, contacts))
+        _record_drafting_outcome(
+            settings,
+            run_id=run_id,
+            prompt_category="first_order_messages",
+            strategy="template",
+            messages=messages,
+        )
+        return messages
+
+    if _ollama_drafting_enabled(settings):
         if settings.ollama_degraded_for_run:
             messages = _finalize_first_order_messages(job, contacts, _template_first_order_messages(job, contacts))
             record_ollama_event(
@@ -536,7 +563,36 @@ Connector groups:
 Write exactly one message per first-degree connector group.
 Each message must cover every second-degree target listed for that connector group.
 """.strip()
-    if settings.llm_provider == "ollama":
+    if settings.llm_provider == "ollama" and not settings.ollama_drafting_enabled:
+        if settings.use_openai_fallback and settings.openai_api_key:
+            agent = build_second_order_message_agent()
+            result = await Runner.run(agent, prompt)
+            messages = _finalize_second_order_messages(
+                job,
+                first_order_contacts,
+                second_order_contacts,
+                result.final_output.messages,
+            )
+            _record_drafting_outcome(
+                settings,
+                run_id=run_id,
+                prompt_category="second_order_messages",
+                strategy="openai",
+                messages=messages,
+            )
+            return messages
+        templated = _template_second_order_messages(job, first_order_contacts, second_order_contacts)
+        messages = _finalize_second_order_messages(job, first_order_contacts, second_order_contacts, templated)
+        _record_drafting_outcome(
+            settings,
+            run_id=run_id,
+            prompt_category="second_order_messages",
+            strategy="template",
+            messages=messages,
+        )
+        return messages
+
+    if _ollama_drafting_enabled(settings):
         if settings.ollama_degraded_for_run:
             templated = _template_second_order_messages(job, first_order_contacts, second_order_contacts)
             messages = _finalize_second_order_messages(job, first_order_contacts, second_order_contacts, templated)

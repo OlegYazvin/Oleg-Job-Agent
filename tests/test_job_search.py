@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 
-from job_agent.company_discovery import load_company_discovery_entries
+from job_agent.company_discovery import load_company_discovery_entries, load_company_discovery_frontier, save_company_discovery_frontier
 from job_agent.config import Settings
 from job_agent.history import load_validated_job_history_index
 from job_agent.job_search import (
@@ -11,6 +11,7 @@ from job_agent.job_search import (
     _annotate_and_filter_resolution_leads,
     _apply_salary_inference,
     _apply_company_novelty_quota,
+    _ashby_board_job_to_lead,
     _build_candidate_job,
     _build_lead_from_search_result,
     _build_near_miss,
@@ -73,6 +74,7 @@ from job_agent.job_search import (
     _normalize_company_key,
     _normalize_role_title_to_focus_queries,
     _normalize_direct_job_url,
+    _merge_query_family_history,
     _precheck_lead_hints,
     _query_family_key,
     _query_is_broad_generic,
@@ -146,6 +148,7 @@ def build_settings() -> Settings:
         daily_run_minute=0,
         status_heartbeat_seconds=120,
         enable_progress_gui=False,
+        ollama_inline_lead_refinement_enabled=True,
     )
 
 
@@ -1585,6 +1588,56 @@ def test_build_candidate_job_hydrates_numeric_salary_from_hint() -> None:
     assert candidate.base_salary_max_usd == 265080
 
 
+def test_build_candidate_job_preserves_non_usd_salary_hint_without_usd_parse() -> None:
+    lead = JobLead(
+        company_name="Hopper",
+        role_title="Principal Product Manager - AI Travel (100% Remote - Canada)",
+        source_url="https://jobs.ashbyhq.com/hopper",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/hopper/f68575ea-4e09-4a9a-a703-4737114a8fa4",
+        location_hint="Toronto, Ontario, Canada",
+        posted_date_hint="2026-03-20",
+        is_remote_hint=True,
+        salary_text_hint="CA$150K - CA$350K",
+        evidence_notes="Official Ashby board salary hint.",
+    )
+
+    candidate = _build_candidate_job(
+        lead,
+        DirectJobResolution(
+            accepted=True,
+            direct_job_url="https://jobs.ashbyhq.com/hopper/f68575ea-4e09-4a9a-a703-4737114a8fa4",
+            ats_platform="Ashby",
+            evidence_notes="Resolved from official Ashby board.",
+        ),
+    )
+
+    assert candidate.base_salary_min_usd is None
+    assert candidate.base_salary_max_usd is None
+    assert candidate.salary_text == "CA$150K - CA$350K"
+
+
+def test_ashby_board_job_to_lead_reads_alternate_compensation_summary() -> None:
+    lead = _ashby_board_job_to_lead(
+        "hopper",
+        "Hopper",
+        {
+            "title": "Principal Product Manager - AI Travel (100% Remote - USA)",
+            "jobUrl": "https://jobs.ashbyhq.com/hopper/9a3d0809-326b-4ca5-ae60-bae9a835234c",
+            "descriptionPlain": "Lead AI product strategy across Hopper's travel platform.",
+            "location": "Remote - US",
+            "isRemote": True,
+            "publishedAt": "2026-03-20T19:07:17.783Z",
+            "compensation": {"compensationTierSummary": "$200K - $300K"},
+        },
+    )
+
+    assert lead is not None
+    assert lead.salary_text_hint == "$200K - $300K"
+    assert lead.is_remote_hint is True
+    assert lead.posted_date_hint == "2026-03-20"
+
+
 def test_is_ai_related_product_manager_ignores_discovery_snippet_noise() -> None:
     job = JobPosting(
         company_name="Jobgether",
@@ -1728,6 +1781,12 @@ def test_extract_salary_hint_ignores_experience_ranges() -> None:
     assert _extract_salary_hint("Compensation: $175,000 - $225,000 base salary.") == (175000, 225000, "$175,000 - $225,000")
 
 
+def test_extract_salary_hint_ignores_non_usd_currency_ranges() -> None:
+    assert _extract_salary_hint("Salary: CA$150K - CA$350K") == (None, None, None)
+    assert _extract_salary_hint("Compensation: €150K - €220K") == (None, None, None)
+    assert _extract_salary_hint("Salary: EUR 140K - 210K") == (None, None, None)
+
+
 def test_query_bank_includes_direct_and_aggregator_discovery_sources() -> None:
     settings = build_settings()
     query_bank = _build_search_query_bank(settings, SearchTuning(attempt_number=2))
@@ -1836,6 +1895,28 @@ def test_local_query_rounds_reactivate_stale_cross_run_cooldowns() -> None:
 
     assert flattened
     assert any(_query_family_key(query) == "structured_ats" for query in flattened)
+
+
+def test_local_query_rounds_prune_same_run_timeout_heavy_families_between_attempts() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    history = {
+        "structured_ats": {
+            "consecutive_timeout_heavy_runs": 1,
+            "last_run_id": "run-1",
+        }
+    }
+
+    rounds = _build_query_rounds(
+        settings,
+        SearchTuning(attempt_number=2),
+        query_family_history=history,
+        run_id="run-1",
+    )
+    flattened = [query for query_round in rounds for query in query_round]
+
+    assert flattened
+    assert all(_query_family_key(query) != "structured_ats" for query in flattened)
 
 
 def test_builtin_search_terms_expand_brittle_queries() -> None:
@@ -2472,6 +2553,46 @@ def test_query_timeout_skip_reason_repeats_and_broad_circuit_breaker() -> None:
     assert targeted_reason is None
 
 
+def test_query_timeout_skip_reason_keeps_productive_broad_family_open_longer() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            *[
+                SearchFailure(
+                    stage="discovery",
+                    reason_code="query_timeout",
+                    detail="timed out",
+                    source_query=f"principal product manager AI remote {index}",
+                    attempt_number=1,
+                    round_number=1,
+                )
+                for index in range(1, 7)
+            ],
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        "senior product manager AI remote healthcare",
+        attempt_number=1,
+        attempt_query_family_metrics={
+            "broad_generic": {
+                "executed_queries": 8,
+                "timeout_count": 6,
+                "zero_yield_queries": 2,
+                "fresh_lead_count": 4,
+                "validated_job_count": 0,
+                "new_company_count": 2,
+                "new_board_count": 0,
+                "official_board_lead_count": 0,
+                "frontier_expansion_count": 0,
+            }
+        },
+    )
+
+    assert skip_reason is None
+
+
 def test_query_timeout_skip_reason_opens_startup_board_family_circuit_breaker() -> None:
     diagnostics = SearchDiagnostics(
         minimum_qualifying_jobs=5,
@@ -2565,6 +2686,97 @@ def test_query_timeout_skip_reason_skips_company_careers_variant_after_single_ti
     assert "vercel" in skip_reason.lower()
 
 
+def test_query_timeout_skip_reason_skips_company_year_variant_after_single_timeout() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Instagram" "AI Product Manager" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Instagram" "AI Product Manager" remote 2026',
+        attempt_number=1,
+    )
+
+    assert skip_reason is not None
+    assert "timeout-prone company query variant" in skip_reason.lower()
+    assert "instagram" in skip_reason.lower()
+
+
+def test_query_timeout_skip_reason_skips_company_salary_variant_after_single_timeout() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Hopper" principal product manager AI remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Hopper" principal product manager AI remote "$200,000"',
+        attempt_number=1,
+    )
+
+    assert skip_reason is not None
+    assert "timeout-prone company query variant" in skip_reason.lower()
+    assert "hopper" in skip_reason.lower()
+
+
+def test_query_timeout_skip_reason_suppresses_late_pass_company_open_web_queries() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Hopper" principal product manager AI remote',
+                attempt_number=2,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Hopper" staff product manager AI remote',
+        attempt_number=2,
+        attempt_query_family_metrics={
+            "broad_generic": {
+                "executed_queries": 3,
+                "timeout_count": 1,
+                "zero_yield_queries": 3,
+                "fresh_lead_count": 0,
+                "validated_job_count": 0,
+                "new_company_count": 0,
+                "new_board_count": 0,
+                "official_board_lead_count": 0,
+                "frontier_expansion_count": 0,
+            }
+        },
+    )
+
+    assert skip_reason is not None
+    assert "late-pass company-specific open-web" in skip_reason.lower()
+    assert "hopper" in skip_reason.lower()
+
+
 def test_query_timeout_skip_reason_suppresses_late_pass_getro_and_voice_ai_queries() -> None:
     diagnostics = SearchDiagnostics(minimum_qualifying_jobs=5)
 
@@ -2644,6 +2856,35 @@ def test_query_timeout_skip_reason_ignores_stale_family_cooldown() -> None:
     )
 
     assert reason is None
+
+
+def test_merge_query_family_history_enables_same_run_cooldown_after_timeout_heavy_attempt() -> None:
+    history = _merge_query_family_history(
+        {},
+        run_id="run-1",
+        query_family_metrics={
+            "structured_ats": {
+                "executed_queries": 4,
+                "timeout_count": 4,
+                "zero_yield_queries": 4,
+                "fresh_lead_count": 0,
+                "validated_job_count": 0,
+            }
+        },
+    )
+
+    reason = _query_timeout_skip_reason(
+        SearchDiagnostics(minimum_qualifying_jobs=5),
+        'site:jobs.lever.co "staff product manager" "AI" remote',
+        attempt_number=2,
+        query_family_history=history,
+        run_id="run-1",
+    )
+
+    assert history["structured_ats"]["consecutive_timeout_heavy_runs"] == 1
+    assert history["structured_ats"]["last_run_id"] == "run-1"
+    assert reason is not None
+    assert "rest of this run" in reason.lower()
 
 
 def test_should_refine_local_leads_with_ollama_uses_broad_borderline_queries() -> None:
@@ -5450,3 +5691,96 @@ def test_collect_company_discovery_seed_leads_discovers_embedded_ashby_board(mon
     assert (settings.data_dir / "company-discovery-frontier.json").exists()
     assert (settings.data_dir / "company-discovery-crawl-history.json").exists()
     assert (settings.data_dir / "company-discovery-audit.json").exists()
+
+
+def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandard_careers_links(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.llm_provider = "ollama"
+    settings.ollama_inline_lead_refinement_enabled = False
+    settings.ollama_sidecar_discovery_enabled = True
+    settings.ollama_sidecar_max_requests_per_run = 1
+    settings.company_discovery_frontier_budget_per_run = 1
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 0
+
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "company_page:https://acme.example",
+                "task_type": "company_page",
+                "url": "https://acme.example",
+                "company_name": "Acme AI",
+                "company_key": "acmeai",
+                "source_kind": "company_page",
+                "source_trust": 7,
+                "priority": 8,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "test",
+            }
+        ],
+    )
+
+    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: [])
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return """
+        <html>
+          <body>
+            <a href="/join-the-team">Open roles</a>
+            <a href="/about">About us</a>
+          </body>
+        </html>
+        """
+
+    async def fake_suggest_frontier_urls(*_args, **_kwargs) -> list[dict[str, object]]:
+        return [
+            {
+                "url": "https://acme.example/join-the-team",
+                "task_type": "careers_root",
+                "priority_boost": 2,
+                "reason": "Non-standard careers link surfaced by sidecar.",
+            }
+        ]
+
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+    monkeypatch.setattr("job_agent.job_search._suggest_frontier_urls_with_ollama_sidecar", fake_suggest_frontier_urls)
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-sidecar",
+        )
+    )
+
+    assert leads == []
+    assert metrics["source_adapter_yields"]["ollama_sidecar"] == 1
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    assert any(task["url"] == "https://acme.example/join-the-team" for task in frontier)
+
+
+def test_should_force_ollama_refinement_sample_respects_inline_refinement_flag() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    settings.ollama_inline_lead_refinement_enabled = False
+
+    assert not _should_force_ollama_refinement_sample(
+        settings,
+        sample_size=5,
+        average_confidence=0.7,
+        cleanup_signal_count=3,
+        low_trust_source_count=2,
+        trustworthy_direct_url_count=1,
+        query="AI product manager remote",
+    )

@@ -104,6 +104,8 @@ def _make_scorecard(
     not_remote_count: int = 0,
     stale_posting_count: int = 0,
     request_count: int = 0,
+    success_count: int | None = None,
+    failure_count: int | None = None,
     useful_actions_per_request: float = 0.0,
 ) -> RunScorecard:
     novel_validated_jobs_count = validated_jobs_count if novel_validated_jobs_count is None else novel_validated_jobs_count
@@ -112,6 +114,8 @@ def _make_scorecard(
         if total_current_validated_jobs_count is None
         else total_current_validated_jobs_count
     )
+    success_count = request_count if success_count is None else success_count
+    failure_count = max(0, request_count - success_count) if failure_count is None else failure_count
     return RunScorecard(
         run_id=run_id,
         generated_at=generated_at,
@@ -168,8 +172,8 @@ def _make_scorecard(
             model="qwen2.5:7b-instruct",
             degraded=False,
             request_count=request_count,
-            success_count=request_count,
-            failure_count=0,
+            success_count=success_count,
+            failure_count=failure_count,
             outer_timeout_count=0,
             warm_hit_rate=0.0,
             median_wall_duration_seconds=None,
@@ -250,6 +254,49 @@ def test_build_run_improvement_analysis_prioritizes_query_timeout_burden(tmp_pat
     assert analysis.metric_deltas["query_timeout_delta"] > 0
 
 
+def test_build_run_improvement_analysis_does_not_prioritize_productive_timeout_scouting(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 4, 3, 12, 0, tzinfo=UTC),
+        validated_jobs_count=1,
+        fresh_new_leads_count=12,
+        query_timeout_count=8,
+        query_skipped_timeout_budget_count=1,
+    ).model_copy(
+        update={
+            "discovery": RunDiscoveryMetrics(
+                unique_leads_discovered_count=12,
+                fresh_new_leads_count=12,
+                replayed_seed_leads_count=0,
+                repeated_failed_leads_suppressed_count=0,
+                executed_query_count=18,
+                query_timeout_count=8,
+                query_skipped_timeout_budget_count=1,
+                zero_yield_pass_count=0,
+                discovery_efficiency=0.667,
+                new_companies_discovered_count=2,
+                new_boards_discovered_count=1,
+                official_board_leads_count=3,
+                companies_with_ai_pm_leads_count=3,
+                company_discovery_yield=0.5,
+            )
+        }
+    )
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(
+        settings,
+        iteration_number=1,
+        run_id="run-current",
+    )
+
+    assert analysis.selected_theme != "query_timeout_burden"
+    assert all(pattern.key != "query_timeout_burden" for pattern in analysis.top_patterns)
+
+
 def test_build_run_improvement_analysis_detects_plateau_breaker_after_repeated_ollama_idle_streak(tmp_path: Path) -> None:
     settings = build_settings(tmp_path)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +357,40 @@ def test_build_run_improvement_analysis_detects_plateau_breaker_after_repeated_o
     assert "Recent selected themes:" in prompt
     assert "Recent theme streak: `ollama_idle` x5." in prompt
     assert "Do not spend this iteration on another micro-tweak in that same area" in prompt
+
+
+def test_build_run_improvement_analysis_does_not_prioritize_ollama_without_recent_successes(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    older = _make_scorecard(
+        run_id="run-older",
+        status="completed",
+        generated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        fresh_new_leads_count=4,
+        request_count=2,
+        success_count=0,
+        failure_count=2,
+    )
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
+        fresh_new_leads_count=4,
+        request_count=2,
+        success_count=0,
+        failure_count=2,
+    )
+    save_run_scorecard(settings.data_dir, older)
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(
+        settings,
+        iteration_number=2,
+        run_id="run-current",
+    )
+
+    assert analysis.selected_theme != "ollama_idle"
+    assert all(pattern.key != "ollama_idle" for pattern in analysis.top_patterns)
 
 
 def test_build_run_improvement_analysis_prioritizes_validation_hard_filter_burden(tmp_path: Path) -> None:

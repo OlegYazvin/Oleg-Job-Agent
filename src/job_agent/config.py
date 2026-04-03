@@ -85,6 +85,11 @@ class Settings:
     ollama_enable_auto_tune: bool = True
     ollama_degraded_for_run: bool = False
     ollama_degraded_reason: str | None = None
+    ollama_inline_lead_refinement_enabled: bool = False
+    ollama_drafting_enabled: bool = False
+    ollama_sidecar_discovery_enabled: bool = True
+    ollama_sidecar_max_requests_per_run: int = 1
+    ollama_sidecar_timeout_seconds: float = 20.0
     auto_loop_max_workflow_reruns_per_iteration: int = 2
     company_discovery_indexer_enabled: bool = True
     company_discovery_frontier_budget_per_run: int = 12
@@ -270,6 +275,28 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         firefox_extension_profile_dir=firefox_extension_profile_dir,
         ollama_degraded_model=os.getenv("OLLAMA_DEGRADED_MODEL", "qwen2.5:7b-instruct"),
         ollama_enable_auto_tune=os.getenv("OLLAMA_ENABLE_AUTO_TUNE", "true").lower() == "true",
+        ollama_inline_lead_refinement_enabled=os.getenv(
+            "OLLAMA_INLINE_LEAD_REFINEMENT_ENABLED",
+            "false",
+        ).lower()
+        == "true",
+        ollama_drafting_enabled=os.getenv(
+            "OLLAMA_DRAFTING_ENABLED",
+            "false",
+        ).lower()
+        == "true",
+        ollama_sidecar_discovery_enabled=os.getenv(
+            "OLLAMA_SIDECAR_DISCOVERY_ENABLED",
+            "true",
+        ).lower()
+        == "true",
+        ollama_sidecar_max_requests_per_run=max(
+            0,
+            int(os.getenv("OLLAMA_SIDECAR_MAX_REQUESTS_PER_RUN", "1")),
+        ),
+        ollama_sidecar_timeout_seconds=float(
+            os.getenv("OLLAMA_SIDECAR_TIMEOUT_SECONDS", "20")
+        ),
         auto_loop_max_workflow_reruns_per_iteration=max(
             0,
             int(os.getenv("AUTO_LOOP_MAX_WORKFLOW_RERUNS_PER_ITERATION", "2")),

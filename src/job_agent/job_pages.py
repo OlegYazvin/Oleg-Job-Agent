@@ -49,6 +49,24 @@ ATS_HOST_MAP = {
     "jobscore.com": "JobScore",
     "portal.dynamicsats.com": "DynamicsATS",
 }
+NON_USD_CURRENCY_MARKERS = (
+    "ca$",
+    "c$",
+    "cad",
+    "aud",
+    "a$",
+    "nzd",
+    "nz$",
+    "eur",
+    "€",
+    "gbp",
+    "£",
+    "chf",
+    "jpy",
+    "¥",
+    "inr",
+    "₹",
+)
 
 
 class JobPageSnapshot(BaseModel):
@@ -346,7 +364,16 @@ def _extract_ashby_fields(html: str, evidence: list[str]) -> dict[str, Any]:
     description_html = str(posting.get("descriptionHtml") or "")
     description_text = _html_to_text(description_html)
     structured_text = " ".join(part for part in (description_text, str(posting.get("locationName") or "")) if part)
-    salary_min, salary_max, salary_text = _extract_salary_range(description_text or structured_text)
+    compensation_text = _extract_ashby_compensation_text(posting)
+    salary_min = salary_max = None
+    salary_text = None
+    for candidate_text in (compensation_text, description_text or structured_text):
+        parsed_min, parsed_max, parsed_text = _extract_salary_range(candidate_text or "")
+        if parsed_min is not None or parsed_max is not None or parsed_text is not None:
+            salary_min, salary_max, salary_text = parsed_min, parsed_max, parsed_text
+            break
+    if salary_text is None and compensation_text:
+        salary_text = compensation_text
     location = str(posting.get("locationName") or posting.get("locationExternalName") or "").strip() or None
     published_at = posting.get("publishedAt") or posting.get("publishedDate")
     values = {
@@ -366,7 +393,44 @@ def _extract_ashby_fields(html: str, evidence: list[str]) -> dict[str, Any]:
         evidence.append(f"Ashby posting title: {values['role_title']}")
     if values["location_text"]:
         evidence.append(f"Ashby location: {values['location_text']}")
+    if values["salary_text"]:
+        evidence.append(f"Ashby compensation: {values['salary_text']}")
     return values
+
+
+def _extract_ashby_compensation_text(posting: dict[str, Any]) -> str | None:
+    candidate_nodes: list[dict[str, Any]] = [posting]
+    for key in ("compensation", "compensationData"):
+        value = posting.get(key)
+        if isinstance(value, dict):
+            candidate_nodes.append(value)
+    summary_keys = (
+        "scrapeableCompensationSalarySummary",
+        "compensationTierSummary",
+        "compensationSummary",
+        "salarySummary",
+        "payRangeSummary",
+        "displayCompensation",
+        "summary",
+    )
+    for node in candidate_nodes:
+        for key in summary_keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for node in candidate_nodes:
+        for key in ("tiers", "compensationTiers"):
+            value = node.get(key)
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                for summary_key in summary_keys:
+                    summary = item.get(summary_key)
+                    if isinstance(summary, str) and summary.strip():
+                        return summary.strip()
+    return None
 
 
 def _extract_recruitee_fields(html: str, evidence: list[str]) -> dict[str, Any]:
@@ -701,45 +765,63 @@ def _extract_salary_range(text: str) -> tuple[int | None, int | None, str | None
     range_pattern = re.compile(
         r"(?P<min>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)\s*(?:-|to)\s*(?P<max>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)"
     )
-    match = range_pattern.search(text)
-    if not match:
-        # Handle explicit single-value salary statements like:
-        # "base salary ... up to $180,000" or "base salary ... $210,000"
-        single_patterns = (
-            re.compile(
-                r"(?:annual\s+)?base\s+salary[^$]{0,120}?(?:up to|maximum(?:\s+of)?|max(?:imum)?(?:\s+of)?)\s*(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
-                re.I,
-            ),
-            re.compile(
-                r"(?:annual\s+)?base\s+salary[^$]{0,120}(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
-                re.I,
-            ),
-            re.compile(
-                r"(?:salary|compensation|pay range)[^$]{0,60}(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
-                re.I,
-            ),
-        )
-        for pattern in single_patterns:
-            single_match = pattern.search(text)
-            if not single_match:
+    for match in range_pattern.finditer(text):
+        if not _salary_match_uses_supported_currency(text, match.start("min"), match.end("max")):
+            continue
+        min_value = _parse_money(match.group("min"))
+        max_value = _parse_money(match.group("max"))
+        if (
+            min_value is None
+            or max_value is None
+            or not _money_token_looks_salary(match.group("min"), min_value)
+            or not _money_token_looks_salary(match.group("max"), max_value)
+        ):
+            continue
+        return min_value, max_value, match.group(0).replace("  ", " ").strip()
+
+    # Handle explicit single-value salary statements like:
+    # "base salary ... up to $180,000" or "base salary ... $210,000"
+    single_patterns = (
+        re.compile(
+            r"(?:annual\s+)?base\s+salary[^$]{0,120}?(?:up to|maximum(?:\s+of)?|max(?:imum)?(?:\s+of)?)\s*(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
+            re.I,
+        ),
+        re.compile(
+            r"(?:annual\s+)?base\s+salary[^$]{0,120}(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
+            re.I,
+        ),
+        re.compile(
+            r"(?:salary|compensation|pay range)[^$]{0,60}(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
+            re.I,
+        ),
+    )
+    for pattern in single_patterns:
+        for single_match in pattern.finditer(text):
+            if not _salary_match_uses_supported_currency(
+                text,
+                single_match.start("value"),
+                single_match.end("value"),
+            ):
                 continue
             value_raw = single_match.group("value")
             parsed = _parse_money(value_raw)
             if parsed is None:
                 continue
             return parsed, parsed, value_raw.replace("  ", " ").strip()
-        return None, None, None
+    return None, None, None
 
-    min_value = _parse_money(match.group("min"))
-    max_value = _parse_money(match.group("max"))
-    if (
-        min_value is None
-        or max_value is None
-        or not _money_token_looks_salary(match.group("min"), min_value)
-        or not _money_token_looks_salary(match.group("max"), max_value)
-    ):
-        return None, None, None
-    return min_value, max_value, match.group(0).replace("  ", " ").strip()
+
+def _salary_match_uses_supported_currency(text: str, start: int, end: int) -> bool:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if start > 0 and re.match(r"[A-Za-z0-9$€£¥₹]", text[start - 1]):
+        return False
+    if end < len(text) and re.match(r"[A-Za-z0-9]", text[end]):
+        return False
+    snippet = text[max(0, start - 8) : min(len(text), end + 8)].lower()
+    return not any(marker in snippet for marker in NON_USD_CURRENCY_MARKERS)
 
 
 def _money_token_looks_salary(value: str, parsed_value: int | None = None) -> bool:

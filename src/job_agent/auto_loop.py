@@ -541,15 +541,36 @@ def _build_patterns(
         )
 
     timeout_burden = current.discovery.query_timeout_count + current.discovery.query_skipped_timeout_budget_count
-    if timeout_burden >= 5:
+    timeout_discovery_yield = (
+        current.outcome.fresh_new_leads_count
+        + current.discovery.official_board_leads_count
+        + current.discovery.new_companies_discovered_count * 2
+        + current.discovery.new_boards_discovered_count * 2
+    )
+    timeout_yield_ratio = timeout_discovery_yield / max(timeout_burden, 1)
+    if timeout_burden >= 5 and (
+        timeout_yield_ratio < 0.9
+        or (
+            current.discovery.new_companies_discovered_count == 0
+            and current.discovery.new_boards_discovered_count == 0
+            and current.discovery.official_board_leads_count == 0
+            and current.outcome.fresh_new_leads_count <= 6
+        )
+        or timeout_burden >= 10
+    ):
         patterns.append(
             _pattern(
                 "query_timeout_burden",
                 "Discovery is still losing too much budget to timeout-heavy query families.",
-                timeout_burden * 3.0,
+                max(12.0, timeout_burden * 3.0 - timeout_discovery_yield * 1.5),
                 query_timeout_count=current.discovery.query_timeout_count,
                 skipped_timeout_budget=current.discovery.query_skipped_timeout_budget_count,
                 discovery_efficiency=current.discovery.discovery_efficiency,
+                timeout_discovery_yield=timeout_discovery_yield,
+                timeout_yield_ratio=round(timeout_yield_ratio, 3),
+                new_companies_discovered_count=current.discovery.new_companies_discovered_count,
+                new_boards_discovered_count=current.discovery.new_boards_discovered_count,
+                official_board_leads_count=current.discovery.official_board_leads_count,
             )
         )
 
@@ -746,26 +767,31 @@ def _build_patterns(
             )
         )
 
-    if current.ollama.request_count == 0 and window[:3] and all(entry.ollama.request_count == 0 for entry in window[:3]):
-        patterns.append(
-            _pattern(
-                "ollama_idle",
-                "Ollama has stayed idle across recent runs; the bounded utilization path is not being exercised enough to provide value.",
-                24.0,
-                recent_request_count=sum(entry.ollama.request_count for entry in window[:3]),
-                useful_actions_per_request=current.ollama.useful_actions_per_request,
+    recent_ollama_requests = sum(entry.ollama.request_count for entry in window[:5])
+    recent_ollama_successes = sum(entry.ollama.success_count for entry in window[:5])
+    if recent_ollama_successes > 0:
+        if current.ollama.request_count == 0 and window[:3] and all(entry.ollama.request_count == 0 for entry in window[:3]):
+            patterns.append(
+                _pattern(
+                    "ollama_idle",
+                    "Ollama has stayed idle across recent runs even though it has shown basic viability; the bounded sidecar path is no longer being exercised.",
+                    20.0,
+                    recent_request_count=recent_ollama_requests,
+                    recent_success_count=recent_ollama_successes,
+                    useful_actions_per_request=current.ollama.useful_actions_per_request,
+                )
             )
-        )
-    elif current.ollama.request_count > 0 and current.ollama.useful_actions_per_request < 0.2:
-        patterns.append(
-            _pattern(
-                "ollama_idle",
-                "Ollama is being invoked, but its useful actions per request remain too low.",
-                18.0,
-                request_count=current.ollama.request_count,
-                useful_actions_per_request=current.ollama.useful_actions_per_request,
+        elif current.ollama.request_count > 0 and current.ollama.useful_actions_per_request < 0.2:
+            patterns.append(
+                _pattern(
+                    "ollama_idle",
+                    "Ollama is being invoked, but its useful actions per request remain too low.",
+                    16.0,
+                    request_count=current.ollama.request_count,
+                    success_count=current.ollama.success_count,
+                    useful_actions_per_request=current.ollama.useful_actions_per_request,
+                )
             )
-        )
 
     if current.outcome.raw_near_miss_count > 0 and current.outcome.actionable_near_miss_count == 0:
         patterns.append(

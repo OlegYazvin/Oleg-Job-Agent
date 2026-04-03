@@ -50,6 +50,7 @@ _USEFUL_OLLAMA_COUNTER_KEYS = (
     "assisted_validated_jobs_count",
     "assisted_actionable_near_misses_count",
     "schema_valid_count",
+    "used_suggestion_count",
 )
 
 

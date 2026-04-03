@@ -27,6 +27,7 @@ _QUALITY_EVENT_TYPES = {
     "lead_refinement_outcome",
     "lead_refinement_rejection",
     "lead_refinement_skip",
+    "discovery_sidecar_outcome",
     "drafting_outcome",
     "drafting_template_fallback",
     "drafting_openai_fallback",
@@ -213,6 +214,19 @@ def _quantile(values: list[float], percentile: float) -> float | None:
     fraction = position - lower
     interpolated = ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
     return round(interpolated, 3)
+
+
+def _failure_breakdown_key(entry: dict[str, Any]) -> str:
+    error_type = str(entry.get("error_type") or "").strip()
+    if error_type:
+        return error_type
+    event = str(entry.get("event") or "").strip()
+    if event == "request_outer_timeout":
+        return "TimeoutError"
+    error_message = str(entry.get("error_message") or "").strip()
+    if error_message:
+        return error_message[:120]
+    return event or "unknown"
 
 
 def _current_profile_from_settings(settings: Settings) -> OllamaTuningProfile:
@@ -610,10 +624,7 @@ def build_ollama_run_summary(
         for entry in success_entries
         if entry.get("cold_start") is False and isinstance(entry.get("wall_duration_seconds"), (int, float))
     ]
-    failure_breakdown = Counter(
-        str(entry.get("error_type") or entry.get("event") or "unknown")
-        for entry in failure_entries
-    )
+    failure_breakdown = Counter(_failure_breakdown_key(entry) for entry in failure_entries)
     caller_breakdown = Counter(str(entry.get("caller") or "unknown") for entry in request_entries)
     prompt_category_breakdown = Counter(str(entry.get("prompt_category") or "unknown") for entry in request_entries)
     quality_counters: Counter[str] = Counter()

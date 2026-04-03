@@ -40,6 +40,24 @@ class JobLeadSearchResult(BaseModel):
     leads: list[JobLead]
 
 
+class DiscoveryFrontierSuggestion(BaseModel):
+    url: str
+    task_type: Literal["careers_root", "board_url"]
+    priority_boost: int = 0
+    reason: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def validate_discovery_suggestion_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return value
+
+
+class DiscoveryFrontierSuggestionResult(BaseModel):
+    suggestions: list[DiscoveryFrontierSuggestion]
+
+
 class SearchFailure(BaseModel):
     stage: Literal["discovery", "resolution", "validation", "filter"]
     reason_code: str

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from html import unescape
 import json
@@ -17,6 +17,8 @@ from bs4 import BeautifulSoup
 import httpx
 
 from .company_discovery import (
+    KNOWN_BOARD_HOST_FRAGMENTS,
+    LOW_TRUST_SCOUT_HOST_FRAGMENTS,
     append_company_discovery_audit_entry,
     board_identifier_from_url,
     board_url_ats_type,
@@ -55,6 +57,7 @@ from .history import (
 from .job_pages import USER_AGENT, JobPageSnapshot, fetch_job_page
 from .llm_provider import LLMProviderError, OllamaStructuredProvider
 from .models import (
+    DiscoveryFrontierSuggestionResult,
     DirectJobResolution,
     FalseNegativeAuditEntry,
     JobLead,
@@ -3073,13 +3076,19 @@ def _filter_query_bank_for_cross_run_cooldowns(
     queries: list[str],
     *,
     query_family_history: dict[str, dict[str, object]] | None = None,
+    run_id: str | None = None,
 ) -> list[str]:
     if not query_family_history:
         return queries
     return [
         query
         for query in queries
-        if _query_family_cooldown_reason(query, query_family_history=query_family_history) is None
+        if _query_family_cooldown_reason(
+            query,
+            query_family_history=query_family_history,
+            run_id=run_id,
+        )
+        is None
     ]
 
 
@@ -3088,9 +3097,15 @@ def _build_query_rounds(
     tuning: SearchTuning | None = None,
     *,
     query_family_history: dict[str, dict[str, object]] | None = None,
+    run_id: str | None = None,
 ) -> list[list[str]]:
     if settings.llm_provider == "ollama":
-        return _build_local_query_rounds(settings, tuning=tuning, query_family_history=query_family_history)
+        return _build_local_query_rounds(
+            settings,
+            tuning=tuning,
+            query_family_history=query_family_history,
+            run_id=run_id,
+        )
 
     tuning = tuning or SearchTuning(attempt_number=1)
     targeted_queries = _build_targeted_attempt_queries(settings, tuning)
@@ -3099,6 +3114,7 @@ def _build_query_rounds(
     query_bank = _filter_query_bank_for_cross_run_cooldowns(
         query_bank,
         query_family_history=query_family_history,
+        run_id=run_id,
     )
     max_queries = settings.max_search_rounds * settings.search_round_query_limit
     limited_bank = query_bank[:max_queries]
@@ -3113,6 +3129,7 @@ def _build_local_query_rounds(
     tuning: SearchTuning | None = None,
     *,
     query_family_history: dict[str, dict[str, object]] | None = None,
+    run_id: str | None = None,
 ) -> list[list[str]]:
     tuning = tuning or SearchTuning(attempt_number=1)
     local_role_queries = _build_local_role_queries()
@@ -3154,6 +3171,7 @@ def _build_local_query_rounds(
     query_bank = _filter_query_bank_for_cross_run_cooldowns(
         query_bank,
         query_family_history=query_family_history,
+        run_id=run_id,
     )
     limited_bank = query_bank[:per_attempt_budget]
     return [
@@ -3280,6 +3298,7 @@ def _query_family_cooldown_reason(
     query: str,
     *,
     query_family_history: dict[str, dict[str, object]] | None = None,
+    run_id: str | None = None,
 ) -> str | None:
     if not query_family_history:
         return None
@@ -3291,6 +3310,11 @@ def _query_family_cooldown_reason(
         return None
     timeout_streak = int(metrics.get("consecutive_timeout_heavy_runs") or 0)
     zero_yield_streak = int(metrics.get("consecutive_zero_yield_runs") or 0)
+    if run_id and str(metrics.get("last_run_id") or "").strip() == run_id and timeout_streak >= 1:
+        return (
+            f"The {family.replace('_', ' ')} query family is cooling down for the rest of this run "
+            "after an earlier timeout-heavy pass."
+        )
     if timeout_streak >= 2:
         return (
             f"The {family.replace('_', ' ')} query family is cooling down after "
@@ -3311,6 +3335,10 @@ def _query_family_metrics_template() -> dict[str, int]:
         "zero_yield_queries": 0,
         "fresh_lead_count": 0,
         "validated_job_count": 0,
+        "new_company_count": 0,
+        "new_board_count": 0,
+        "official_board_lead_count": 0,
+        "frontier_expansion_count": 0,
     }
 
 
@@ -3322,6 +3350,10 @@ def _update_query_family_run_metrics(
     timed_out: bool = False,
     fresh_leads: int = 0,
     validated_jobs: int = 0,
+    new_companies: int = 0,
+    new_boards: int = 0,
+    official_board_leads: int = 0,
+    frontier_expansion: int = 0,
 ) -> None:
     family = _query_family_key(query)
     metrics = query_family_metrics.setdefault(family, _query_family_metrics_template())
@@ -3335,6 +3367,116 @@ def _update_query_family_run_metrics(
         metrics["fresh_lead_count"] += fresh_leads
     if validated_jobs > 0:
         metrics["validated_job_count"] += validated_jobs
+    if new_companies > 0:
+        metrics["new_company_count"] += new_companies
+    if new_boards > 0:
+        metrics["new_board_count"] += new_boards
+    if official_board_leads > 0:
+        metrics["official_board_lead_count"] += official_board_leads
+    if frontier_expansion > 0:
+        metrics["frontier_expansion_count"] += frontier_expansion
+
+
+def _update_query_family_metric_sets(
+    metric_sets: tuple[dict[str, dict[str, int]], ...],
+    query: str,
+    *,
+    count_execution: bool = True,
+    timed_out: bool = False,
+    fresh_leads: int = 0,
+    validated_jobs: int = 0,
+    new_companies: int = 0,
+    new_boards: int = 0,
+    official_board_leads: int = 0,
+    frontier_expansion: int = 0,
+) -> None:
+    for metrics in metric_sets:
+        _update_query_family_run_metrics(
+            metrics,
+            query,
+            count_execution=count_execution,
+            timed_out=timed_out,
+            fresh_leads=fresh_leads,
+            validated_jobs=validated_jobs,
+            new_companies=new_companies,
+            new_boards=new_boards,
+            official_board_leads=official_board_leads,
+            frontier_expansion=frontier_expansion,
+        )
+
+
+def _query_family_has_meaningful_discovery_yield(metrics: dict[str, object] | None) -> bool:
+    if not metrics:
+        return False
+    return (
+        int(metrics.get("validated_job_count") or 0) > 0
+        or int(metrics.get("official_board_lead_count") or 0) > 0
+        or int(metrics.get("new_company_count") or 0) > 0
+        or int(metrics.get("new_board_count") or 0) > 0
+        or int(metrics.get("frontier_expansion_count") or 0) >= 2
+        or int(metrics.get("fresh_lead_count") or 0) >= 2
+    )
+
+
+def _query_family_run_is_zero_yield(run_metrics: dict[str, int]) -> bool:
+    executed_queries = int(run_metrics.get("executed_queries") or 0)
+    return executed_queries > 0 and not _query_family_has_meaningful_discovery_yield(run_metrics)
+
+
+def _query_family_run_is_timeout_heavy(run_metrics: dict[str, int]) -> bool:
+    executed_queries = int(run_metrics.get("executed_queries") or 0)
+    timeout_count = int(run_metrics.get("timeout_count") or 0)
+    return (
+        _query_family_run_is_zero_yield(run_metrics)
+        and executed_queries > 0
+        and timeout_count >= max(2, executed_queries // 2)
+    )
+
+
+def _merge_query_family_history(
+    query_family_history: dict[str, dict[str, object]],
+    *,
+    run_id: str | None,
+    query_family_metrics: dict[str, dict[str, int]],
+) -> dict[str, dict[str, object]]:
+    if not query_family_metrics:
+        return query_family_history
+    history = {family: dict(metrics) for family, metrics in query_family_history.items()}
+    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    for family, run_metrics in query_family_metrics.items():
+        previous = dict(history.get(family) or {})
+        zero_yield_run = _query_family_run_is_zero_yield(run_metrics)
+        timeout_heavy_run = _query_family_run_is_timeout_heavy(run_metrics)
+        history[family] = {
+            "run_count": int(previous.get("run_count") or 0) + 1,
+            "executed_queries_total": int(previous.get("executed_queries_total") or 0)
+            + int(run_metrics.get("executed_queries") or 0),
+            "timeout_count_total": int(previous.get("timeout_count_total") or 0)
+            + int(run_metrics.get("timeout_count") or 0),
+            "zero_yield_queries_total": int(previous.get("zero_yield_queries_total") or 0)
+            + int(run_metrics.get("zero_yield_queries") or 0),
+            "fresh_lead_count_total": int(previous.get("fresh_lead_count_total") or 0)
+            + int(run_metrics.get("fresh_lead_count") or 0),
+            "validated_job_count_total": int(previous.get("validated_job_count_total") or 0)
+            + int(run_metrics.get("validated_job_count") or 0),
+            "new_company_count_total": int(previous.get("new_company_count_total") or 0)
+            + int(run_metrics.get("new_company_count") or 0),
+            "new_board_count_total": int(previous.get("new_board_count_total") or 0)
+            + int(run_metrics.get("new_board_count") or 0),
+            "official_board_lead_count_total": int(previous.get("official_board_lead_count_total") or 0)
+            + int(run_metrics.get("official_board_lead_count") or 0),
+            "frontier_expansion_count_total": int(previous.get("frontier_expansion_count_total") or 0)
+            + int(run_metrics.get("frontier_expansion_count") or 0),
+            "consecutive_zero_yield_runs": int(previous.get("consecutive_zero_yield_runs") or 0) + 1
+            if zero_yield_run
+            else 0,
+            "consecutive_timeout_heavy_runs": int(previous.get("consecutive_timeout_heavy_runs") or 0) + 1
+            if timeout_heavy_run
+            else 0,
+            "last_run_id": run_id,
+            "last_updated_at": updated_at,
+        }
+    return history
 
 
 def _persist_query_family_history(
@@ -3345,33 +3487,11 @@ def _persist_query_family_history(
 ) -> None:
     if not query_family_metrics:
         return
-    history = _load_query_family_history(settings)
-    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
-    for family, run_metrics in query_family_metrics.items():
-        previous = dict(history.get(family) or {})
-        executed_queries = int(run_metrics.get("executed_queries") or 0)
-        timeout_count = int(run_metrics.get("timeout_count") or 0)
-        fresh_lead_count = int(run_metrics.get("fresh_lead_count") or 0)
-        validated_job_count = int(run_metrics.get("validated_job_count") or 0)
-        zero_yield_run = executed_queries > 0 and fresh_lead_count == 0
-        timeout_heavy_run = executed_queries > 0 and timeout_count >= max(2, executed_queries // 2) and fresh_lead_count == 0
-        history[family] = {
-            "run_count": int(previous.get("run_count") or 0) + 1,
-            "executed_queries_total": int(previous.get("executed_queries_total") or 0) + executed_queries,
-            "timeout_count_total": int(previous.get("timeout_count_total") or 0) + timeout_count,
-            "zero_yield_queries_total": int(previous.get("zero_yield_queries_total") or 0)
-            + int(run_metrics.get("zero_yield_queries") or 0),
-            "fresh_lead_count_total": int(previous.get("fresh_lead_count_total") or 0) + fresh_lead_count,
-            "validated_job_count_total": int(previous.get("validated_job_count_total") or 0) + validated_job_count,
-            "consecutive_zero_yield_runs": int(previous.get("consecutive_zero_yield_runs") or 0) + 1
-            if zero_yield_run
-            else 0,
-            "consecutive_timeout_heavy_runs": int(previous.get("consecutive_timeout_heavy_runs") or 0) + 1
-            if timeout_heavy_run
-            else 0,
-            "last_run_id": run_id,
-            "last_updated_at": updated_at,
-        }
+    history = _merge_query_family_history(
+        _load_query_family_history(settings),
+        run_id=run_id,
+        query_family_metrics=query_family_metrics,
+    )
     _save_query_family_history(settings, history)
 
 
@@ -3515,6 +3635,21 @@ def _company_focused_query_marker(query: str) -> str | None:
                 "jobs",
                 "remote",
                 "posted this week",
+                "series a",
+                "series b",
+                "series c",
+                "seed stage",
+                "growth stage",
+                "early stage",
+                "venture backed",
+                "vc backed",
+                "portfolio company",
+                "founding team",
+                "startup",
+                "vertical ai",
+                "voice ai",
+                "conversational ai",
+                "applied intelligence",
             )
         ):
             continue
@@ -3540,19 +3675,59 @@ def _company_focused_query_timeout_count(
     )
 
 
+def _company_focused_query_is_timeout_prone_variant(query: str) -> bool:
+    lowered = " ".join(query.lower().split())
+    if not lowered:
+        return False
+    if " careers " in lowered:
+        return False
+    if re.search(r"\b20\d{2}\b", lowered):
+        return True
+    if "$" in query:
+        return True
+    return any(
+        token in lowered
+        for token in (
+            "salary",
+            "base salary",
+            "compensation",
+            "annual salary",
+            "posted this week",
+            "this week",
+            "past week",
+            "today",
+        )
+    )
+
+
+def _query_is_company_named_open_web_query(query: str) -> bool:
+    normalized_query = " ".join(query.lower().split())
+    if not normalized_query or "site:" in normalized_query:
+        return False
+    if _company_focused_query_marker(query) is None:
+        return False
+    return _query_is_broad_generic(normalized_query)
+
+
 def _query_timeout_skip_reason(
     diagnostics: SearchDiagnostics,
     query: str,
     *,
     attempt_number: int,
     query_family_history: dict[str, dict[str, object]] | None = None,
+    attempt_query_family_metrics: dict[str, dict[str, int]] | None = None,
+    run_id: str | None = None,
 ) -> str | None:
     normalized_query = " ".join(query.split())
     if not normalized_query:
         return None
+    family = _query_family_key(normalized_query)
+    current_family_metrics = (attempt_query_family_metrics or {}).get(family) or {}
+    family_has_productive_yield = _query_family_has_meaningful_discovery_yield(current_family_metrics)
     family_cooldown_reason = _query_family_cooldown_reason(
         normalized_query,
         query_family_history=query_family_history,
+        run_id=run_id,
     )
     if family_cooldown_reason is not None:
         return family_cooldown_reason
@@ -3576,18 +3751,34 @@ def _query_timeout_skip_reason(
                 "The company-specific timeout circuit breaker is open for "
                 f"{company_marker} after {company_timeout_count} timeouts in this pass."
             )
+        if company_timeout_count >= 1 and _company_focused_query_is_timeout_prone_variant(normalized_query):
+            return (
+                "The timeout-prone company query variant is being skipped for "
+                f"{company_marker} after an earlier timeout in this pass."
+            )
+        if (
+            attempt_number >= 2
+            and company_timeout_count >= 1
+            and _query_is_company_named_open_web_query(normalized_query)
+            and not family_has_productive_yield
+        ):
+            return (
+                "Late-pass company-specific open-web discovery queries are being suppressed for "
+                f"{company_marker} after an earlier timeout in this pass."
+            )
     if attempt_number >= 3 and "site:getro.com/companies" in lowered_query:
         return "Late-pass Getro company-board queries are being suppressed after repeated low-yield timeout behavior."
     if attempt_number >= 3 and '"voice ai"' in lowered_query:
         return "Late-pass voice-AI scout queries are being suppressed because they have been low-yield timeout sinks."
     timeout_sensitive_marker = _query_timeout_sensitive_marker(normalized_query)
     if timeout_sensitive_marker is not None:
+        timeout_sensitive_threshold = TIMEOUT_SENSITIVE_QUERY_SKIP_THRESHOLD + (2 if family_has_productive_yield else 0)
         timeout_sensitive_count = _timeout_sensitive_query_timeout_count(
             diagnostics,
             attempt_number=attempt_number,
             marker=timeout_sensitive_marker,
         )
-        if timeout_sensitive_count >= TIMEOUT_SENSITIVE_QUERY_SKIP_THRESHOLD:
+        if timeout_sensitive_count >= timeout_sensitive_threshold:
             return (
                 "The startup-board timeout circuit breaker is open for "
                 f"{timeout_sensitive_marker} after {timeout_sensitive_count} timeouts in this pass."
@@ -3595,7 +3786,8 @@ def _query_timeout_skip_reason(
     if not _query_is_broad_generic(normalized_query):
         return None
     broad_timeout_count = _broad_generic_query_timeout_count(diagnostics, attempt_number=attempt_number)
-    if broad_timeout_count >= BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD:
+    broad_timeout_threshold = BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD + (3 if family_has_productive_yield else 0)
+    if broad_timeout_count >= broad_timeout_threshold:
         return (
             "The broad-query timeout circuit breaker is open after "
             f"{broad_timeout_count} broad discovery query timeouts in this pass."
@@ -3871,12 +4063,12 @@ def _money_token_looks_salary(value: str | None) -> bool:
 
 
 def _extract_salary_hint(text: str) -> tuple[int | None, int | None, str | None]:
-    range_match = re.search(
+    range_pattern = re.compile(
         r"(?P<min>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)\s*(?:-|to)\s*(?P<max>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
-        text,
-        re.I,
     )
-    if range_match:
+    for range_match in range_pattern.finditer(text):
+        if not _salary_match_uses_supported_currency(text, range_match.start("min"), range_match.end("max")):
+            continue
         min_token = range_match.group("min")
         max_token = range_match.group("max")
         if _money_token_looks_salary(min_token) and _money_token_looks_salary(max_token):
@@ -3884,12 +4076,13 @@ def _extract_salary_hint(text: str) -> tuple[int | None, int | None, str | None]
             max_value = _parse_money_token(max_token)
             return min_value, max_value, range_match.group(0).replace("  ", " ").strip()
 
-    single_match = re.search(
+    single_pattern = re.compile(
         r"(?:base salary|salary|compensation|pay range)[^$]{0,80}(?P<value>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)",
-        text,
         re.I,
     )
-    if single_match:
+    for single_match in single_pattern.finditer(text):
+        if not _salary_match_uses_supported_currency(text, single_match.start("value"), single_match.end("value")):
+            continue
         token = single_match.group("value")
         if _money_token_looks_salary(token):
             value = _parse_money_token(token)
@@ -3910,6 +4103,39 @@ def _hydrate_salary_hint_values(
         if parsed_min is not None or parsed_max is not None:
             return parsed_min, parsed_max, salary_text or parsed_text
     return min_value, max_value, salary_text
+
+
+NON_USD_CURRENCY_MARKERS = (
+    "ca$",
+    "c$",
+    "cad",
+    "aud",
+    "a$",
+    "nzd",
+    "nz$",
+    "eur",
+    "€",
+    "gbp",
+    "£",
+    "chf",
+    "jpy",
+    "¥",
+    "inr",
+    "₹",
+)
+
+
+def _salary_match_uses_supported_currency(text: str, start: int, end: int) -> bool:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if start > 0 and re.match(r"[A-Za-z0-9$€£¥₹]", text[start - 1]):
+        return False
+    if end < len(text) and re.match(r"[A-Za-z0-9]", text[end]):
+        return False
+    snippet = text[max(0, start - 8) : min(len(text), end + 8)].lower()
+    return not any(marker in snippet for marker in NON_USD_CURRENCY_MARKERS)
 
 
 def _normalize_remote_region_hint(value: str | None) -> str | None:
@@ -4203,6 +4429,10 @@ def _lead_needs_local_cleanup(lead: JobLead) -> bool:
     return _looks_like_generic_job_url(normalized_direct_url)
 
 
+def _ollama_inline_refinement_enabled(settings: Settings) -> bool:
+    return settings.llm_provider == "ollama" and settings.ollama_inline_lead_refinement_enabled
+
+
 def _should_force_ollama_refinement_sample(
     settings: Settings,
     *,
@@ -4213,7 +4443,7 @@ def _should_force_ollama_refinement_sample(
     trustworthy_direct_url_count: int,
     query: str | None = None,
 ) -> bool:
-    if settings.llm_provider != "ollama" or sample_size < 2:
+    if not _ollama_inline_refinement_enabled(settings) or sample_size < 2:
         return False
     if cleanup_signal_count <= 0:
         return (
@@ -4306,7 +4536,9 @@ def _ollama_refinement_mode_for_local_leads(
         and trustworthy_direct_url_count >= 1
         and average_confidence >= 0.9
     )
-    if settings.llm_provider != "ollama" or (candidate_pool_count < 3 and not single_high_confidence_direct_candidate):
+    if not _ollama_inline_refinement_enabled(settings) or (
+        candidate_pool_count < 3 and not single_high_confidence_direct_candidate
+    ):
         return None
     if average_confidence < min(settings.local_confidence_threshold + 0.1, 0.9):
         return "low_confidence"
@@ -5098,8 +5330,7 @@ def _ashby_board_job_to_lead(
     location_text = str(job.get("location") or "").strip()
     if not _is_ai_related_product_manager_text(" ".join(part for part in (title, description_text) if part)):
         return None
-    compensation = job.get("compensation") if isinstance(job.get("compensation"), dict) else {}
-    salary_text_hint = str(compensation.get("scrapeableCompensationSalarySummary") or "").strip() or None
+    salary_text_hint = _extract_ashby_compensation_summary(job)
     is_remote = job.get("isRemote")
     is_remote_hint = True if is_remote is True else ("remote" in location_text.lower() if location_text else None)
     published_at = str(job.get("publishedAt") or "").strip()
@@ -5117,6 +5348,41 @@ def _ashby_board_job_to_lead(
         evidence_notes="Discovered via official Ashby board enumeration.",
         source_quality_score_hint=10,
     )
+
+
+def _extract_ashby_compensation_summary(job: dict[str, object]) -> str | None:
+    candidate_nodes: list[dict[str, object]] = [job]
+    for key in ("compensation", "compensationData"):
+        value = job.get(key)
+        if isinstance(value, dict):
+            candidate_nodes.append(value)
+    summary_keys = (
+        "scrapeableCompensationSalarySummary",
+        "compensationTierSummary",
+        "compensationSummary",
+        "salarySummary",
+        "payRangeSummary",
+        "displayCompensation",
+        "summary",
+    )
+    for node in candidate_nodes:
+        for key in summary_keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for node in candidate_nodes:
+        for key in ("tiers", "compensationTiers"):
+            value = node.get(key)
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                for summary_key in summary_keys:
+                    summary = item.get(summary_key)
+                    if isinstance(summary, str) and summary.strip():
+                        return summary.strip()
+    return None
 
 
 def _lever_board_job_to_lead(
@@ -5283,6 +5549,147 @@ async def _fetch_page_html(url: str) -> str | None:
     return response.text
 
 
+def _ollama_discovery_sidecar_enabled(settings: Settings) -> bool:
+    return (
+        settings.llm_provider == "ollama"
+        and settings.ollama_sidecar_discovery_enabled
+        and settings.ollama_sidecar_max_requests_per_run > 0
+    )
+
+
+def _extract_discovery_sidecar_link_candidates(page_url: str, html: str, *, limit: int = 10) -> list[dict[str, object]]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    page_host = (urlparse(page_url).netloc or "").lower()
+    ranked: list[tuple[int, dict[str, object]]] = []
+    seen_urls: set[str] = set()
+
+    def maybe_add(raw_url: str | None, link_text: str = "", tag_name: str = "a") -> None:
+        normalized = str(raw_url or "").strip()
+        if not normalized:
+            return
+        resolved = _normalize_direct_job_url(urljoin(page_url, normalized))
+        if not resolved.startswith(("http://", "https://")) or resolved in seen_urls:
+            return
+        parsed = urlparse(resolved)
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return
+        lower_text = " ".join(link_text.lower().split())
+        lower_path = (parsed.path or "").lower()
+        lower_url = resolved.lower()
+        score = 0
+        if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
+            score += 8
+        if host == page_host:
+            score += 3
+        if any(token in lower_text for token in ("career", "careers", "jobs", "join us", "join-us", "hiring")):
+            score += 5
+        if any(token in lower_path for token in ("career", "careers", "jobs", "join-us", "joinus")):
+            score += 4
+        if any(fragment in host for fragment in LOW_TRUST_SCOUT_HOST_FRAGMENTS):
+            score -= 8
+        if "mailto:" in lower_url or "javascript:" in lower_url:
+            score -= 10
+        if score <= 0:
+            return
+        seen_urls.add(resolved)
+        ranked.append(
+            (
+                score,
+                {
+                    "url": resolved,
+                    "link_text": link_text[:120],
+                    "tag_name": tag_name,
+                    "same_host": host == page_host,
+                    "looks_like_board_host": any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS),
+                },
+            )
+        )
+
+    for tag in soup.find_all(["a", "iframe", "script"]):
+        maybe_add(tag.get("href") or tag.get("src"), tag.get_text(" ", strip=True), tag.name)
+
+    ranked.sort(key=lambda item: (-item[0], str(item[1].get("url") or "")))
+    return [payload for _score, payload in ranked[:limit]]
+
+
+async def _suggest_frontier_urls_with_ollama_sidecar(
+    settings: Settings,
+    *,
+    page_url: str,
+    company_name: str,
+    link_candidates: list[dict[str, object]],
+    run_id: str | None,
+) -> list[dict[str, object]]:
+    if not _ollama_discovery_sidecar_enabled(settings) or settings.ollama_degraded_for_run:
+        return []
+    if len(link_candidates) < 2:
+        return []
+
+    provider_settings = replace(
+        settings,
+        ollama_timeout_seconds=max(8.0, min(settings.ollama_sidecar_timeout_seconds, settings.ollama_timeout_seconds)),
+        ollama_num_ctx=min(settings.ollama_num_ctx, 384),
+        ollama_num_batch=1,
+        ollama_num_predict=min(settings.ollama_num_predict, 96),
+    )
+    provider = OllamaStructuredProvider(provider_settings)
+    candidate_urls = {str(item.get("url") or "").strip() for item in link_candidates}
+    prompt = f"""
+Page URL: {page_url}
+Company: {company_name}
+
+Pick only exact URLs from the candidate list below that look like likely official careers roots or official ATS board pages for this company.
+Prefer official board hosts and company careers pages.
+Do not invent or rewrite URLs.
+Return at most 4 suggestions.
+
+Candidates:
+{json.dumps(link_candidates, indent=2)}
+""".strip()
+    try:
+        output = await provider.generate_structured(
+            system_prompt=(
+                "You triage discovery links for a job-hunting pipeline. "
+                "Return only exact candidate URLs that are likely official careers roots or official ATS board pages."
+            ),
+            user_prompt=prompt,
+            schema=DiscoveryFrontierSuggestionResult,
+            run_id=run_id,
+            caller="discovery_sidecar",
+            prompt_category="discovery_frontier_triage",
+        )
+    except LLMProviderError:
+        return []
+
+    suggestions: list[dict[str, object]] = []
+    for item in output.suggestions[:4]:
+        normalized_url = _normalize_direct_job_url(item.url)
+        if normalized_url not in candidate_urls:
+            continue
+        suggestions.append(
+            {
+                "url": normalized_url,
+                "task_type": item.task_type,
+                "priority_boost": max(0, min(int(item.priority_boost or 0), 4)),
+                "reason": (item.reason or "").strip() or None,
+            }
+        )
+    record_ollama_event(
+        settings,
+        "discovery_sidecar_outcome",
+        run_id=run_id,
+        caller="discovery_sidecar",
+        prompt_category="discovery_frontier_triage",
+        page_url=page_url,
+        candidate_link_count=len(link_candidates),
+        suggested_count=len(output.suggestions),
+        used_suggestion_count=len(suggestions),
+        priority_boost_count=sum(int(item.get("priority_boost") or 0) for item in suggestions),
+    )
+    return suggestions
+
+
 async def _collect_company_discovery_seed_leads(
     settings: Settings,
     *,
@@ -5302,6 +5709,7 @@ async def _collect_company_discovery_seed_leads(
     official_board_crawl_attempt_count = 0
     official_board_crawl_success_count = 0
     source_adapter_yields: Counter[str] = Counter()
+    ollama_sidecar_requests_remaining = max(0, settings.ollama_sidecar_max_requests_per_run)
 
     query_leads: list[JobLead] = []
     official_board_leads: list[JobLead] = []
@@ -5313,16 +5721,16 @@ async def _collect_company_discovery_seed_leads(
         discovered_from: str | None,
         priority: int,
         preferred_task_type: str | None = None,
-    ) -> None:
+    ) -> bool:
         normalized_url = str(url or "").strip()
         if not normalized_url.startswith(("http://", "https://")):
-            return
+            return False
         source_trust = trust_score_for_url(normalized_url, explicit_task_type=preferred_task_type)
         if source_trust <= 0 or source_trust > settings.company_discovery_source_max_trust:
-            return
+            return False
         board_identifier = board_identifier_from_url(normalized_url)
         if board_identifier:
-            upsert_frontier_task(
+            return upsert_frontier_task(
                 frontier,
                 task_type="board_url",
                 url=normalized_url,
@@ -5334,9 +5742,9 @@ async def _collect_company_discovery_seed_leads(
                 priority=max(priority, 9),
                 discovered_from=discovered_from,
             )
-            return
+            
         task_type = preferred_task_type or ("careers_root" if "/careers" in normalized_url.lower() or normalized_url.lower().endswith("/jobs") else "company_page")
-        upsert_frontier_task(
+        return upsert_frontier_task(
             frontier,
             task_type=task_type,
             url=normalized_url,
@@ -5347,6 +5755,45 @@ async def _collect_company_discovery_seed_leads(
             priority=priority,
             discovered_from=discovered_from,
         )
+
+    async def _maybe_apply_ollama_discovery_sidecar(
+        *,
+        task_type: str,
+        task_url: str,
+        company_name: str,
+        html: str,
+    ) -> int:
+        nonlocal ollama_sidecar_requests_remaining
+        if ollama_sidecar_requests_remaining <= 0 or not _ollama_discovery_sidecar_enabled(settings):
+            return 0
+        if task_type not in {"company_page", "careers_root"}:
+            return 0
+        link_candidates = _extract_discovery_sidecar_link_candidates(task_url, html)
+        if len(link_candidates) < 2:
+            return 0
+        ollama_sidecar_requests_remaining -= 1
+        suggestions = await _suggest_frontier_urls_with_ollama_sidecar(
+            settings,
+            page_url=task_url,
+            company_name=company_name,
+            link_candidates=link_candidates,
+            run_id=run_id,
+        )
+        applied = 0
+        for suggestion in suggestions:
+            preferred_task_type = str(suggestion.get("task_type") or "").strip() or None
+            priority_boost = int(suggestion.get("priority_boost") or 0)
+            if _queue_frontier_url(
+                url=str(suggestion.get("url") or "").strip(),
+                company_name=company_name,
+                discovered_from=f"ollama_sidecar:{task_url}",
+                priority=10 + priority_boost if preferred_task_type == "board_url" else 8 + priority_boost,
+                preferred_task_type=preferred_task_type,
+            ):
+                applied += 1
+        if applied > 0:
+            _increment_metric_count(source_adapter_yields, "ollama_sidecar", applied)
+        return applied
 
     def _record_company_discovery_lead(lead: JobLead, *, source_adapter: str) -> None:
         was_new_company, new_board_count = _upsert_company_discovery_from_lead(
@@ -5650,11 +6097,27 @@ async def _collect_company_discovery_seed_leads(
                 )
                 continue
 
+            default_careers_candidates = set(default_careers_candidate_urls(task_url)) if task_type == "company_page" else set()
             extracted_careers = extract_careers_page_urls(task_url, html)
             if task_type == "company_page":
                 extracted_careers = _dedupe_queries([*extracted_careers, *default_careers_candidate_urls(task_url)])
             board_urls = extract_embedded_board_urls(task_url, html)
             discovered_count = 0
+            needs_sidecar_help = not board_urls and (
+                len(extracted_careers) <= 1
+                or (
+                    task_type == "company_page"
+                    and extracted_careers
+                    and all(url in default_careers_candidates for url in extracted_careers)
+                )
+            )
+            if needs_sidecar_help:
+                discovered_count += await _maybe_apply_ollama_discovery_sidecar(
+                    task_type=task_type,
+                    task_url=task_url,
+                    company_name=company_name,
+                    html=html,
+                )
             if task_type == "careers_root":
                 was_new_company, new_board_count = upsert_company_discovery_entry(
                     entries,
@@ -5747,11 +6210,27 @@ async def _collect_company_discovery_seed_leads(
                 )
                 continue
 
+            default_careers_candidates = set(default_careers_candidate_urls(task_url)) if task_type == "company_page" else set()
             extracted_careers = extract_careers_page_urls(task_url, html)
             if task_type == "company_page":
                 extracted_careers = _dedupe_queries([*extracted_careers, *default_careers_candidate_urls(task_url)])
             board_urls = extract_embedded_board_urls(task_url, html)
             discovered_count = 0
+            needs_sidecar_help = not board_urls and (
+                len(extracted_careers) <= 1
+                or (
+                    task_type == "company_page"
+                    and extracted_careers
+                    and all(url in default_careers_candidates for url in extracted_careers)
+                )
+            )
+            if needs_sidecar_help:
+                discovered_count += await _maybe_apply_ollama_discovery_sidecar(
+                    task_type=task_type,
+                    task_url=task_url,
+                    company_name=company_name,
+                    html=html,
+                )
             if task_type == "careers_root":
                 was_new_company, new_board_count = upsert_company_discovery_entry(
                     entries,
@@ -7135,7 +7614,7 @@ async def _cleanup_local_leads_with_ollama(
     *,
     run_id: str | None = None,
 ) -> list[JobLead]:
-    if not leads or settings.llm_provider != "ollama":
+    if not leads or not _ollama_inline_refinement_enabled(settings):
         return leads
     if settings.ollama_degraded_for_run:
         record_ollama_event(
@@ -7245,7 +7724,7 @@ async def _refine_local_leads_with_ollama(
     pre_refinement_trustworthy_direct_url_count: int | None = None,
     run_id: str | None = None,
 ) -> list[JobLead]:
-    if not candidate_pool or settings.llm_provider != "ollama" or settings.ollama_degraded_for_run:
+    if not candidate_pool or not _ollama_inline_refinement_enabled(settings) or settings.ollama_degraded_for_run:
         return candidate_pool
     forced_refinement_mode = refinement_mode in {"forced_sample", "forced_seed_triage"}
     allow_single_seed_triage_without_cleanup = (
@@ -7370,7 +7849,7 @@ async def _maybe_force_round_lead_refinement_with_ollama(
     run_id: str | None = None,
 ) -> list[JobLead]:
     if (
-        settings.llm_provider != "ollama"
+        not _ollama_inline_refinement_enabled(settings)
         or settings.ollama_degraded_for_run
         or run_id is None
         or len(round_leads) < 2
@@ -7444,7 +7923,7 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
     run_id: str | None = None,
 ) -> list[JobLead]:
     if (
-        settings.llm_provider != "ollama"
+        not _ollama_inline_refinement_enabled(settings)
         or settings.ollama_degraded_for_run
         or run_id is None
         or not seed_leads
@@ -7650,7 +8129,7 @@ async def _search_single_query_local(
         if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
     )
     if (
-        settings.llm_provider == "ollama"
+        _ollama_inline_refinement_enabled(settings)
         and _is_clean_high_confidence_direct_bundle(
             candidate_pool_count=len(candidate_pool),
             average_confidence=average_confidence,
@@ -7696,7 +8175,7 @@ async def _search_single_query_local(
     )
     if (
         refinement_mode is None
-        and settings.llm_provider == "ollama"
+        and _ollama_inline_refinement_enabled(settings)
         and _is_trusted_company_careers_bundle(
             query=query,
             candidate_pool_count=len(candidate_pool),
@@ -7709,7 +8188,7 @@ async def _search_single_query_local(
         refinement_mode = "trusted_direct_bundle"
     if (
         refinement_mode is None
-        and settings.llm_provider == "ollama"
+        and _ollama_inline_refinement_enabled(settings)
         and run_id is not None
         and attempt_number is not None
         and len(candidate_pool) >= 2
@@ -7747,7 +8226,7 @@ async def _search_single_query_local(
         normalized = _deterministic_trim_local_leads(settings, query, refined_pool)
         normalized_confidences = [_lead_confidence(lead) for lead in normalized]
         average_confidence = (sum(normalized_confidences) / len(normalized_confidences)) if normalized_confidences else 0.0
-    elif settings.llm_provider == "ollama" and run_id is not None:
+    elif _ollama_inline_refinement_enabled(settings) and run_id is not None:
         if _is_trusted_company_careers_bundle(
             query=query,
             candidate_pool_count=len(candidate_pool),
@@ -9516,15 +9995,17 @@ async def find_matching_jobs(
             )
 
         discovery_agent = build_job_discovery_agent(settings, tuning) if openai_agents_enabled else None
+        attempt_query_family_metrics: dict[str, dict[str, int]] = {}
         query_rounds = _build_query_rounds(
             settings,
             tuning=tuning,
             query_family_history=query_family_history,
+            run_id=run_id,
         )
         attempt_start_leads = total_unique_leads
         resolved_leads_this_attempt = 0
         lead_timeout_seconds = settings.per_lead_timeout_seconds
-        if settings.llm_provider == "ollama":
+        if _ollama_inline_refinement_enabled(settings):
             lead_timeout_seconds = max(lead_timeout_seconds, 40)
 
         if attempt_number == 1 and len(jobs_by_url) < stop_goal:
@@ -9660,6 +10141,8 @@ async def find_matching_jobs(
                         query,
                         attempt_number=attempt_number,
                         query_family_history=query_family_history,
+                        attempt_query_family_metrics=attempt_query_family_metrics,
+                        run_id=run_id,
                     )
                     if skip_reason is None:
                         runnable_queries.append(query)
@@ -9707,8 +10190,8 @@ async def find_matching_jobs(
                     try:
                         query, results = await task
                     except SearchQueryTimeoutError as exc:
-                        _update_query_family_run_metrics(
-                            query_family_metrics,
+                        _update_query_family_metric_sets(
+                            (query_family_metrics, attempt_query_family_metrics),
                             exc.query,
                             timed_out=True,
                         )
@@ -9738,7 +10221,7 @@ async def find_matching_jobs(
                             )
                         continue
                     except SearchQueryExecutionError as exc:
-                        _update_query_family_run_metrics(query_family_metrics, exc.query)
+                        _update_query_family_metric_sets((query_family_metrics, attempt_query_family_metrics), exc.query)
                         if _is_insufficient_quota_error(exc.cause):
                             _record_failure_live(
                                 settings,
@@ -9780,6 +10263,7 @@ async def find_matching_jobs(
                         continue
 
                     fresh_leads = 0
+                    new_companies = 0
                     for lead in results:
                         failed_history_skip = _failed_lead_history_skip_reason(lead, settings, failed_lead_history)
                         if failed_history_skip is not None:
@@ -9803,7 +10287,10 @@ async def find_matching_jobs(
                             continue
                         seen_lead_keys.add(key)
                         total_unique_leads += 1
-                        _increment_metric_count(diagnostics.company_lead_counts, _normalize_company_key(lead.company_name))
+                        company_key = _normalize_company_key(lead.company_name)
+                        if company_key and company_key not in diagnostics.company_lead_counts:
+                            new_companies += 1
+                        _increment_metric_count(diagnostics.company_lead_counts, company_key)
                         fresh_leads += 1
                         round_leads.append(lead)
 
@@ -9821,6 +10308,13 @@ async def find_matching_jobs(
                         query_family_metrics,
                         query,
                         fresh_leads=fresh_leads,
+                        new_companies=new_companies,
+                    )
+                    _update_query_family_run_metrics(
+                        attempt_query_family_metrics,
+                        query,
+                        fresh_leads=fresh_leads,
+                        new_companies=new_companies,
                     )
                     diagnostics.unique_leads_discovered = total_unique_leads
                     _persist_search_diagnostics(settings, diagnostics)
@@ -10231,8 +10725,8 @@ async def find_matching_jobs(
                     reacquired_before = len(reacquired_jobs_by_url)
                     reacquired_jobs_by_url.setdefault(validated_key, validated)
                     if len(reacquired_jobs_by_url) > reacquired_before:
-                        _update_query_family_run_metrics(
-                            query_family_metrics,
+                        _update_query_family_metric_sets(
+                            (query_family_metrics, attempt_query_family_metrics),
                             validated.source_query or lead.source_query or "",
                             count_execution=False,
                             validated_jobs=1,
@@ -10240,8 +10734,8 @@ async def find_matching_jobs(
                 else:
                     jobs_by_url.setdefault(validated_key, validated)
                 if len(jobs_by_url) > accepted_before:
-                    _update_query_family_run_metrics(
-                        query_family_metrics,
+                    _update_query_family_metric_sets(
+                        (query_family_metrics, attempt_query_family_metrics),
                         validated.source_query or lead.source_query or "",
                         count_execution=False,
                         validated_jobs=1,
@@ -10290,6 +10784,11 @@ async def find_matching_jobs(
             )
         )
         _persist_search_diagnostics(settings, diagnostics)
+        query_family_history = _merge_query_family_history(
+            query_family_history,
+            run_id=run_id,
+            query_family_metrics=attempt_query_family_metrics,
+        )
 
         if status:
             status.emit(

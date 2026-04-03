@@ -73,9 +73,14 @@ async def _run_daily_workflow_body(
                 )
         else:
             if status:
+                deferred_message = "Deferred Ollama prewarm until the first actual local-model task for this run."
+                if not settings.ollama_inline_lead_refinement_enabled and not settings.ollama_drafting_enabled:
+                    deferred_message = (
+                        "Deferred Ollama until the first bounded sidecar experiment for this run."
+                    )
                 status.emit(
                     "starting",
-                    "Deferred Ollama prewarm until the first actual local-model task for this run.",
+                    deferred_message,
                     ollama_model=settings.ollama_model,
                     ollama_degraded_for_run=False,
                 )
