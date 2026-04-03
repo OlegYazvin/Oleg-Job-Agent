@@ -139,6 +139,27 @@ def _read_status_payload(status_path: Path) -> dict[str, Any]:
             "done": False,
             "failed": False,
         }
+    auto_loop_state_path = status_path.parent / "auto-loop-state.json"
+    if auto_loop_state_path.exists():
+        try:
+            auto_loop_payload = json.loads(auto_loop_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            auto_loop_payload = None
+        if isinstance(auto_loop_payload, dict):
+            payload_metrics = dict(payload.get("metrics", {}) or {})
+            if auto_loop_payload.get("enabled"):
+                payload_metrics.setdefault("auto_loop_enabled", True)
+                if auto_loop_payload.get("status") is not None:
+                    payload_metrics["auto_loop_status"] = auto_loop_payload.get("status")
+                if auto_loop_payload.get("current_iteration") is not None:
+                    payload_metrics["auto_loop_iteration"] = auto_loop_payload.get("current_iteration")
+                if auto_loop_payload.get("completed_attempts") is not None:
+                    payload_metrics["auto_loop_completed_attempts"] = auto_loop_payload.get("completed_attempts")
+                if auto_loop_payload.get("target_attempts") is not None:
+                    payload_metrics["auto_loop_target_attempts"] = auto_loop_payload.get("target_attempts")
+                if auto_loop_payload.get("codex_session_id") is not None:
+                    payload_metrics["codex_session_id"] = auto_loop_payload.get("codex_session_id")
+                payload["metrics"] = payload_metrics
     if _status_payload_is_stale(payload):
         payload = dict(payload)
         payload["stage"] = "stale"
