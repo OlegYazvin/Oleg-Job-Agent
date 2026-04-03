@@ -97,8 +97,10 @@ def build_summary_document(
     document.add_heading("Job Summary", level=0)
     document.add_paragraph(f"Generated at: {generated_at.isoformat(timespec='seconds')}")
 
-    if not bundles:
+    if not bundles and not reacquired_jobs:
         document.add_paragraph("No qualifying jobs were found in this run.")
+    elif not bundles:
+        document.add_paragraph("No brand-new validated jobs were found in this run.")
 
     table = document.add_table(rows=1, cols=8)
     headers = table.rows[0].cells

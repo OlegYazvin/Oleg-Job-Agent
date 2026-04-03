@@ -21,7 +21,6 @@ from .criteria import DEFAULT_ROLE_SEARCH_PROFILE
 from .history import (
     load_company_watchlist_entries,
     load_previously_reported_company_keys,
-    load_previously_reported_job_keys,
     load_validated_job_history_index,
 )
 from .job_pages import USER_AGENT, JobPageSnapshot, fetch_job_page
@@ -888,8 +887,17 @@ def _lead_is_reacquisition_eligible(
     normalized_direct_url = _normalize_direct_job_url(direct_job_url or "")
     if not normalized_direct_url or not _is_allowed_direct_job_url(normalized_direct_url):
         return False
-    host = (urlparse(normalized_direct_url).netloc or urlparse(str(lead.source_url)).netloc or "").lower()
-    if not host or any(fragment in host for fragment in LOW_TRUST_REACQUISITION_HOST_FRAGMENTS):
+    direct_host = (urlparse(normalized_direct_url).netloc or "").lower()
+    source_host = (urlparse(str(lead.source_url)).netloc or "").lower()
+    if not direct_host:
+        return False
+    if any(fragment in direct_host for fragment in LOW_TRUST_REACQUISITION_HOST_FRAGMENTS):
+        return False
+    if (
+        source_host
+        and any(fragment in source_host for fragment in LOW_TRUST_REACQUISITION_HOST_FRAGMENTS)
+        and lead.source_type not in {"direct_ats", "company_site"}
+    ):
         return False
     if lead.source_type in {"direct_ats", "company_site"}:
         return True
@@ -3802,6 +3810,8 @@ def _company_hint_from_url(url: str) -> str:
         candidate = path_segments[0].replace("_", " ").replace("-", " ").title()
         if not _is_weak_company_hint(candidate):
             return candidate
+    if "portal.dynamicsats.com" in host:
+        return ""
     if "jobs.lever.co" in host and path_segments:
         return path_segments[0].replace("-", " ").title()
     if "ashbyhq.com" in host and path_segments:
@@ -5397,7 +5407,6 @@ async def _replay_seed_leads(
     jobs_by_url: dict[str, JobPosting],
     reacquired_jobs_by_url: dict[str, JobPosting],
     previously_reported_company_keys: set[str],
-    previously_reported_job_keys: set[str],
     validated_job_history_index: dict[str, dict[str, object]],
     reacquisition_attempted_keys: set[str],
     reacquisition_suppressed_keys: set[str],
@@ -5675,6 +5684,40 @@ async def _replay_seed_leads(
             validated.resolved_job_url or validated.direct_job_url,
             validated_job_history_index,
         )
+        if post_validation_reacquisition_entry is not None and reacquisition_entry is None:
+            post_key = str(
+                post_validation_reacquisition_entry.get("canonical_job_key")
+                or post_validation_reacquisition_entry.get("job_key")
+                or ""
+            ).strip()
+            if len(reacquisition_attempted_keys) >= settings.reacquisition_attempt_cap and (
+                not post_key or post_key not in reacquisition_attempted_keys
+            ):
+                if post_key and post_key not in reacquisition_suppressed_keys:
+                    reacquisition_suppressed_keys.add(post_key)
+                    diagnostics.reacquired_jobs_suppressed_count += 1
+                _record_failure_live(
+                    settings,
+                    diagnostics,
+                    _make_failure(
+                        stage="filter",
+                        reason_code="reacquisition_suppressed",
+                        detail=(
+                            "Validated a previously reported job, but skipped coverage credit because the per-run "
+                            f"reacquisition cap ({settings.reacquisition_attempt_cap}) was reached."
+                        ),
+                        lead=lead,
+                        direct_job_url=str(validated.direct_job_url),
+                        candidate=validated,
+                        attempt_number=attempt_number,
+                        round_number=0,
+                    ),
+                    unique_leads_discovered=total_unique_leads,
+                )
+                continue
+            if post_key and post_key not in reacquisition_attempted_keys:
+                reacquisition_attempted_keys.add(post_key)
+                diagnostics.reacquisition_attempt_count += 1
         if post_validation_reacquisition_entry is not None:
             metadata = _reacquisition_history_metadata(post_validation_reacquisition_entry)
             validated = validated.model_copy(update={"is_reacquired": True, **metadata})
@@ -8203,7 +8246,6 @@ async def find_matching_jobs(
         run_id=run_id,
         diagnostics=diagnostics,
     )
-    previously_reported_job_keys = load_previously_reported_job_keys(settings.data_dir)
     validated_job_history_index = load_validated_job_history_index(settings.data_dir)
     previously_reported_company_keys = load_previously_reported_company_keys(settings.data_dir)
     company_watchlist = load_company_watchlist_entries(settings.data_dir)
@@ -8261,7 +8303,6 @@ async def find_matching_jobs(
                 jobs_by_url=jobs_by_url,
                 reacquired_jobs_by_url=reacquired_jobs_by_url,
                 previously_reported_company_keys=previously_reported_company_keys,
-                previously_reported_job_keys=previously_reported_job_keys,
                 validated_job_history_index=validated_job_history_index,
                 reacquisition_attempted_keys=reacquisition_attempted_keys,
                 reacquisition_suppressed_keys=reacquisition_suppressed_keys,
@@ -8965,6 +9006,8 @@ async def find_matching_jobs(
 
     jobs = list(jobs_by_url.values())
     jobs.sort(key=lambda item: (item.company_name.lower(), item.role_title.lower()))
+    reacquired_jobs = list(reacquired_jobs_by_url.values())
+    reacquired_jobs.sort(key=lambda item: (item.company_name.lower(), item.role_title.lower()))
 
     if status:
         if len(jobs) >= stop_goal:
@@ -8988,4 +9031,4 @@ async def find_matching_jobs(
         run_id=run_id,
         query_family_metrics=query_family_metrics,
     )
-    return jobs, total_unique_leads, diagnostics
+    return jobs, reacquired_jobs, total_unique_leads, diagnostics

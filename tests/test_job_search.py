@@ -1,9 +1,10 @@
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 import json
 from pathlib import Path
 
 from job_agent.config import Settings
+from job_agent.history import load_validated_job_history_index
 from job_agent.job_search import (
     SearchTuning,
     _annotate_and_filter_resolution_leads,
@@ -48,6 +49,7 @@ from job_agent.job_search import (
     _is_ai_related_product_manager,
     _is_ai_related_product_manager_text,
     _lead_is_ai_related_product_manager,
+    _lead_is_reacquisition_eligible,
     _lead_priority,
     _load_seed_leads_from_file,
     _job_posting_dedupe_key,
@@ -75,6 +77,7 @@ from job_agent.job_search import (
     _query_timeout_seconds_for_query,
     _query_timeout_skip_reason,
     _repair_direct_job_url,
+    _replay_seed_leads,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
     _resolve_lead_via_company_careers_pages,
@@ -1832,6 +1835,158 @@ def test_precheck_lead_hints_rejects_company_hosted_direct_job_url_mismatch() ->
     assert failure is not None
     assert failure.reason_code == "company_mismatch"
     assert "dominos" in failure.detail.lower()
+
+
+def test_precheck_lead_hints_allows_dynamicsats_vendor_host_without_company_mismatch() -> None:
+    settings = build_settings()
+    recent_posted_date = (date.today() - timedelta(days=2)).isoformat()
+    lead = JobLead(
+        company_name="Quorum Software",
+        role_title="Senior Product Manager - AI Strategy (USA - Remote)",
+        source_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        source_type="direct_ats",
+        direct_job_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        is_remote_hint=True,
+        posted_date_hint=recent_posted_date,
+        salary_text_hint="$165,000 - $220,000",
+        evidence_notes="Replayed seeded direct URL.",
+    )
+
+    failure = _precheck_lead_hints(lead, settings, attempt_number=1, round_number=1)
+
+    assert failure is None
+    assert _is_weak_company_hint(
+        _company_hint_from_url(
+            "https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04"
+        )
+    )
+
+
+def test_lead_is_reacquisition_eligible_rejects_low_trust_mirror_sources() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Databricks",
+        role_title="Staff Product Manager, AI Platform",
+        source_url="https://www.mediabistro.com/jobs/123",
+        source_type="other",
+        direct_job_url="https://www.databricks.com/company/careers/product/staff-product-manager-ai-platform-1",
+        evidence_notes="Mirror source with a copied company URL.",
+        source_quality_score_hint=10,
+    )
+
+    assert _lead_is_reacquisition_eligible(
+        lead,
+        settings,
+        direct_job_url=lead.direct_job_url,
+    ) is False
+
+
+def test_replay_seed_leads_routes_previously_validated_job_into_reacquired_lane(monkeypatch, tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    historical_job_url = "https://boards.greenhouse.io/acme/jobs/123"
+    (settings.data_dir / "job-history.json").write_text(
+        json.dumps(
+            {
+                "greenhouse:acme:123": {
+                    "job_key": "greenhouse:acme:123",
+                    "canonical_job_key": "greenhouse:acme:123",
+                    "normalized_job_url": historical_job_url,
+                    "company_name": "Acme AI",
+                    "role_title": "Staff Product Manager, AI",
+                    "first_reported_at": "2026-03-20T10:00:00+00:00",
+                    "last_reported_at": "2026-03-25T10:00:00+00:00",
+                    "report_count": 2,
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (settings.data_dir / "company-history.json").write_text("{}", encoding="utf-8")
+    (settings.data_dir / "run-history.json").write_text("[]", encoding="utf-8")
+
+    lead = JobLead(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        source_url=historical_job_url,
+        source_type="direct_ats",
+        direct_job_url=historical_job_url,
+        is_remote_hint=True,
+        posted_date_hint=(date.today() - timedelta(days=1)).isoformat(),
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="Previously validated ATS role that still looks current.",
+        source_quality_score_hint=10,
+    )
+    validated_job = JobPosting(
+        company_name="Acme AI",
+        role_title="Staff Product Manager, AI",
+        direct_job_url=historical_job_url,
+        resolved_job_url=historical_job_url,
+        ats_platform="Greenhouse",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text=(date.today() - timedelta(days=1)).isoformat(),
+        posted_date_iso=(date.today() - timedelta(days=1)).isoformat(),
+        base_salary_min_usd=210000,
+        base_salary_max_usd=240000,
+        salary_text="$210,000 - $240,000",
+        evidence_notes="Validated again.",
+        validation_evidence=["Remote, current, and salary-qualified."],
+    )
+
+    async def fake_validate_candidate(*args, **kwargs):
+        return validated_job, None, None, None
+
+    async def passthrough_seed_refinement(settings_arg, leads, *, run_id=None):
+        return leads
+
+    monkeypatch.setattr("job_agent.job_search._validate_candidate", fake_validate_candidate)
+    monkeypatch.setattr("job_agent.job_search._maybe_force_seed_lead_refinement_with_ollama", passthrough_seed_refinement)
+
+    diagnostics = SearchDiagnostics(run_id="run-reacquired", minimum_qualifying_jobs=5)
+    jobs_by_url: dict[str, JobPosting] = {}
+    reacquired_jobs_by_url: dict[str, JobPosting] = {}
+
+    total_unique_leads, resolved_leads = asyncio.run(
+        _replay_seed_leads(
+            [lead],
+            settings=settings,
+            diagnostics=diagnostics,
+            company_watchlist={},
+            failed_lead_history={},
+            jobs_by_url=jobs_by_url,
+            reacquired_jobs_by_url=reacquired_jobs_by_url,
+            previously_reported_company_keys=set(),
+            validated_job_history_index=load_validated_job_history_index(settings.data_dir),
+            reacquisition_attempted_keys=set(),
+            reacquisition_suppressed_keys=set(),
+            seen_lead_keys=set(),
+            total_unique_leads=0,
+            resolved_leads_this_attempt=0,
+            stop_goal=5,
+            lead_timeout_seconds=10,
+            resolution_agent=None,
+            attempt_number=1,
+            status=None,
+            run_id="run-reacquired",
+        )
+    )
+
+    assert total_unique_leads == 1
+    assert resolved_leads == 1
+    assert jobs_by_url == {}
+    assert len(reacquired_jobs_by_url) == 1
+    reacquired_job = next(iter(reacquired_jobs_by_url.values()))
+    assert reacquired_job.is_reacquired is True
+    assert reacquired_job.first_reported_at == "2026-03-20T10:00:00+00:00"
+    assert reacquired_job.last_reported_at == "2026-03-25T10:00:00+00:00"
+    assert reacquired_job.report_count == 3
+    assert diagnostics.reacquisition_attempt_count == 1
 
 
 def test_query_timeout_seconds_for_query_keeps_broad_queries_tighter_than_targeted_queries() -> None:

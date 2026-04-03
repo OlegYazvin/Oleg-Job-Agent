@@ -125,7 +125,9 @@ def _format_scorecard_summary(scorecard: dict[str, Any] | None) -> str:
     validation = dict(scorecard.get("validation") or {})
     return (
         f"Latest scorecard\n"
-        f"Validated jobs: {int(outcome.get('validated_jobs_count') or 0)} | "
+        f"Novel validated jobs: {int(outcome.get('novel_validated_jobs_count') or outcome.get('validated_jobs_count') or 0)} | "
+        f"Current validated coverage: {int(outcome.get('total_current_validated_jobs_count') or outcome.get('validated_jobs_count') or 0)}\n"
+        f"Reacquired jobs: {int(outcome.get('reacquired_validated_jobs_count') or 0)} | "
         f"Jobs with messages: {int(outcome.get('jobs_with_messages_count') or 0)}\n"
         f"Fresh leads: {int(outcome.get('fresh_new_leads_count') or 0)} | "
         f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}\n"
@@ -144,12 +146,19 @@ def _scorecard_detail_lines(scorecard: dict[str, Any] | None) -> list[str]:
     timing = dict(scorecard.get("timing") or {})
     return [
         "Run Scorecard",
+        f"Novel validated jobs: {int(outcome.get('novel_validated_jobs_count') or outcome.get('validated_jobs_count') or 0)}",
+        f"Current validated coverage: {int(outcome.get('total_current_validated_jobs_count') or outcome.get('validated_jobs_count') or 0)}",
+        f"Reacquired validated jobs: {int(outcome.get('reacquired_validated_jobs_count') or 0)}",
         f"Fresh new leads: {int(outcome.get('fresh_new_leads_count') or 0)}",
         f"Actionable near-misses: {int(outcome.get('actionable_near_miss_count') or 0)}",
         f"Replay seeds: {int(discovery.get('replayed_seed_leads_count') or 0)}",
+        f"Reacquisition attempts: {int(discovery.get('reacquisition_attempt_count') or 0)}",
+        f"Suppressed repeats: {int(discovery.get('reacquired_jobs_suppressed_count') or 0)}",
         f"Repeated failures suppressed: {int(discovery.get('repeated_failed_leads_suppressed_count') or 0)}",
         f"Query timeouts: {int(discovery.get('query_timeout_count') or 0)}",
         f"Discovery efficiency: {discovery.get('discovery_efficiency', 0.0)}",
+        f"Novel validated yield: {validation.get('novel_validated_yield', validation.get('validated_yield', 0.0))}",
+        f"Reacquisition yield: {validation.get('reacquisition_yield', 0.0)}",
         f"Message coverage: {validation.get('message_coverage_rate', 0.0)}",
         f"Ollama requests: {int(ollama.get('request_count') or 0)}",
         f"Ollama useful/request: {ollama.get('useful_actions_per_request', 0.0)}",

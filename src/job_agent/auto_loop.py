@@ -44,6 +44,8 @@ THEME_COMMIT_SUMMARIES = {
     "near_miss_noise": "improve near-miss quality filters",
     "salary_extraction_gap": "improve salary extraction",
     "plateau_breaker": "break repeated-theme plateau",
+    "coverage_regression": "preserve reacquired validated coverage",
+    "diversification_gap": "increase novel validated job discovery",
     "general_iterative_improvement": "apply bounded iterative improvement",
 }
 
@@ -538,7 +540,7 @@ def _build_patterns(
         + current.validation.stale_posting_count
         + current.validation.missing_salary_count
     )
-    if current.outcome.validated_jobs_count == 0 and validation_hard_filter_burden >= 3:
+    if current.outcome.novel_validated_jobs_count == 0 and validation_hard_filter_burden >= 3:
         patterns.append(
             _pattern(
                 "validation_hard_filter_burden",
@@ -550,7 +552,7 @@ def _build_patterns(
             )
         )
 
-    if current.outcome.fresh_new_leads_count <= 5:
+    if current.outcome.fresh_new_leads_count <= 5 and current.outcome.total_current_validated_jobs_count == 0:
         patterns.append(
             _pattern(
                 "low_fresh_discovery",
@@ -578,14 +580,42 @@ def _build_patterns(
             )
         )
 
-    if current.outcome.validated_jobs_count > 0 and current.outcome.jobs_with_messages_count == 0:
+    if current.outcome.novel_validated_jobs_count > 0 and current.outcome.jobs_with_messages_count == 0:
         patterns.append(
             _pattern(
                 "linkedin_message_gap",
                 "The run produced validated jobs but no LinkedIn messages, so the LinkedIn capture/drafting path still needs work.",
                 35.0,
-                validated_jobs_count=current.outcome.validated_jobs_count,
+                validated_jobs_count=current.outcome.novel_validated_jobs_count,
                 jobs_with_messages_count=current.outcome.jobs_with_messages_count,
+            )
+        )
+
+    previous_total_current_validated = _average_metric(
+        previous_entries,
+        lambda item: item.outcome.total_current_validated_jobs_count,
+    )
+    if previous_total_current_validated > 0 and current.outcome.total_current_validated_jobs_count < previous_total_current_validated:
+        patterns.append(
+            _pattern(
+                "coverage_regression",
+                "Current validated coverage has dropped run-over-run; preserve reacquired still-open jobs before focusing only on novelty.",
+                34.0 + max(0.0, previous_total_current_validated - current.outcome.total_current_validated_jobs_count) * 4.0,
+                total_current_validated_jobs_count=current.outcome.total_current_validated_jobs_count,
+                previous_total_current_validated=previous_total_current_validated,
+                reacquired_validated_jobs_count=current.outcome.reacquired_validated_jobs_count,
+            )
+        )
+
+    if current.outcome.total_current_validated_jobs_count > 0 and current.outcome.novel_validated_jobs_count == 0:
+        patterns.append(
+            _pattern(
+                "diversification_gap",
+                "The system is still finding current valid jobs through coverage, but it is not adding novel validated jobs; prioritize diversification and discovery quality.",
+                32.0,
+                total_current_validated_jobs_count=current.outcome.total_current_validated_jobs_count,
+                reacquired_validated_jobs_count=current.outcome.reacquired_validated_jobs_count,
+                fresh_new_leads_count=current.outcome.fresh_new_leads_count,
             )
         )
 
@@ -593,7 +623,8 @@ def _build_patterns(
         repeated_theme
         and repeated_theme_streak >= 3
         and len(recent_window) >= 4
-        and all(entry.outcome.validated_jobs_count == 0 for entry in recent_window)
+        and all(entry.outcome.novel_validated_jobs_count == 0 for entry in recent_window)
+        and all(entry.outcome.total_current_validated_jobs_count == 0 for entry in recent_window)
         and all(entry.outcome.actionable_near_miss_count == 0 for entry in recent_window)
         and _fresh_lead_range(recent_window) <= 1
     ):
@@ -612,7 +643,8 @@ def _build_patterns(
                 stagnant_run_count=len(recent_window),
                 fresh_lead_range=_fresh_lead_range(recent_window),
                 latest_fresh_new_leads=current.outcome.fresh_new_leads_count,
-                latest_validated_jobs=current.outcome.validated_jobs_count,
+                latest_validated_jobs=current.outcome.novel_validated_jobs_count,
+                latest_total_current_validated_jobs=current.outcome.total_current_validated_jobs_count,
             )
         )
 
@@ -659,13 +691,14 @@ def _build_patterns(
         )
 
     if not patterns:
-        validated_avg = _average_metric(previous_entries or window, lambda item: item.outcome.validated_jobs_count)
+        validated_avg = _average_metric(previous_entries or window, lambda item: item.outcome.novel_validated_jobs_count)
         patterns.append(
             _pattern(
                 "general_iterative_improvement",
                 "No single failure family dominates; apply one bounded improvement batch that most directly increases validated jobs or fresh leads.",
                 1.0,
                 validated_jobs_average=validated_avg,
+                total_current_validated_jobs_count=current.outcome.total_current_validated_jobs_count,
             )
         )
     return sorted(patterns, key=lambda item: item.severity_score, reverse=True)
@@ -676,13 +709,21 @@ def _metric_deltas(window: list[RunScorecard]) -> dict[str, float]:
         return {}
     current = window[0]
     previous_entries = window[1:] or window
-    previous_validated = _average_metric(previous_entries, lambda item: item.outcome.validated_jobs_count)
+    previous_validated = _average_metric(previous_entries, lambda item: item.outcome.novel_validated_jobs_count)
+    previous_total_current_validated = _average_metric(
+        previous_entries,
+        lambda item: item.outcome.total_current_validated_jobs_count,
+    )
     previous_fresh = _average_metric(previous_entries, lambda item: item.outcome.fresh_new_leads_count)
     previous_timeouts = _average_metric(previous_entries, lambda item: item.discovery.query_timeout_count)
     previous_messages = _average_metric(previous_entries, lambda item: item.outcome.jobs_with_messages_count)
     previous_ollama = _average_metric(previous_entries, lambda item: item.ollama.request_count)
     return {
-        "validated_jobs_delta": round(current.outcome.validated_jobs_count - previous_validated, 3),
+        "validated_jobs_delta": round(current.outcome.novel_validated_jobs_count - previous_validated, 3),
+        "total_current_validated_jobs_delta": round(
+            current.outcome.total_current_validated_jobs_count - previous_total_current_validated,
+            3,
+        ),
         "fresh_new_leads_delta": round(current.outcome.fresh_new_leads_count - previous_fresh, 3),
         "query_timeout_delta": round(current.discovery.query_timeout_count - previous_timeouts, 3),
         "jobs_with_messages_delta": round(current.outcome.jobs_with_messages_count - previous_messages, 3),
@@ -709,15 +750,22 @@ def build_run_improvement_analysis(
     current_metrics = {}
     if current is not None:
         current_metrics = {
-            "validated_jobs_count": current.outcome.validated_jobs_count,
+            "validated_jobs_count": current.outcome.novel_validated_jobs_count,
+            "novel_validated_jobs_count": current.outcome.novel_validated_jobs_count,
+            "reacquired_validated_jobs_count": current.outcome.reacquired_validated_jobs_count,
+            "total_current_validated_jobs_count": current.outcome.total_current_validated_jobs_count,
             "jobs_with_messages_count": current.outcome.jobs_with_messages_count,
             "fresh_new_leads_count": current.outcome.fresh_new_leads_count,
             "actionable_near_miss_count": current.outcome.actionable_near_miss_count,
             "query_timeout_count": current.discovery.query_timeout_count,
             "query_skipped_timeout_budget_count": current.discovery.query_skipped_timeout_budget_count,
             "replayed_seed_leads_count": current.discovery.replayed_seed_leads_count,
+            "reacquisition_attempt_count": current.discovery.reacquisition_attempt_count,
+            "reacquired_jobs_suppressed_count": current.discovery.reacquired_jobs_suppressed_count,
             "discovery_efficiency": current.discovery.discovery_efficiency,
             "validated_yield": current.validation.validated_yield,
+            "novel_validated_yield": current.validation.novel_validated_yield,
+            "reacquisition_yield": current.validation.reacquisition_yield,
             "missing_salary_count": current.validation.missing_salary_count,
             "fetch_non_200_count": current.validation.fetch_non_200_count,
             "not_remote_count": current.validation.not_remote_count,

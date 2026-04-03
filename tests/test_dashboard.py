@@ -27,7 +27,9 @@ def test_format_scorecard_summary_renders_primary_metrics() -> None:
         }
     )
 
-    assert "Validated jobs: 2" in rendered
+    assert "Latest scorecard" in rendered
+    assert "Novel validated jobs: 2" in rendered
+    assert "Current validated coverage: 2" in rendered
     assert "Jobs with messages: 1" in rendered
     assert "Fresh leads: 14" in rendered
     assert "Actionable near-misses: 3" in rendered
