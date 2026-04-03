@@ -3955,6 +3955,54 @@ def test_maybe_force_seed_lead_refinement_with_ollama_requires_cleanup_signals_e
     assert forced_calls == []
 
 
+def test_maybe_force_seed_lead_refinement_with_ollama_allows_single_trusted_seed(monkeypatch) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    lead = JobLead(
+        company_name="Krisp",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/krisp/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/krisp/123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=210000,
+        evidence_notes="Direct ATS role with salary and remote hints.",
+    )
+    forced_calls: list[tuple[int, str | None, str]] = []
+
+    async def fake_refine(
+        _settings: Settings,
+        query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        forced_calls.append((cleanup_limit, refinement_mode, query))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+    import job_agent.job_search as job_search_module
+
+    job_search_module.FORCED_OLLAMA_SEED_REFINEMENT_RUNS.clear()
+
+    refined = asyncio.run(
+        _maybe_force_seed_lead_refinement_with_ollama(
+            settings,
+            [lead],
+            run_id="run-single-seed",
+        )
+    )
+
+    assert refined == [lead]
+    assert forced_calls == [(1, "forced_seed_triage", "seed replay triage")]
+
+
 def test_ensure_lazy_ollama_prewarm_only_runs_once_per_run(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

@@ -6061,7 +6061,7 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
         settings.llm_provider != "ollama"
         or settings.ollama_degraded_for_run
         or run_id is None
-        or len(seed_leads) < 2
+        or not seed_leads
         or run_id in FORCED_OLLAMA_SEED_REFINEMENT_RUNS
     ):
         return seed_leads
@@ -6070,14 +6070,31 @@ async def _maybe_force_seed_lead_refinement_with_ollama(
     confidences = [_lead_confidence(lead) for lead in seed_window]
     average_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0
     cleanup_signal_count = sum(1 for lead in seed_window if _lead_needs_local_cleanup(lead))
-    if cleanup_signal_count <= 0:
-        return seed_leads
     low_trust_source_count = sum(1 for lead in seed_window if lead.source_type in {"linkedin", "builtin", "other"})
     trustworthy_direct_url_count = sum(
         1
         for lead in seed_window
         if lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(lead.direct_job_url, lead)
     )
+    if (
+        len(seed_window) == 1
+        and average_confidence >= 0.9
+        and low_trust_source_count == 0
+        and trustworthy_direct_url_count >= 1
+    ):
+        return await _refine_local_leads_with_ollama(
+            settings,
+            "seed replay triage",
+            seed_leads,
+            cleanup_limit=1,
+            refinement_mode="forced_seed_triage",
+            pre_refinement_average_confidence=average_confidence,
+            pre_refinement_cleanup_signal_count=cleanup_signal_count,
+            pre_refinement_trustworthy_direct_url_count=trustworthy_direct_url_count,
+            run_id=run_id,
+        )
+    if cleanup_signal_count <= 0:
+        return seed_leads
     if not _should_force_ollama_refinement_sample(
         settings,
         sample_size=len(seed_window),
