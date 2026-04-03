@@ -3128,6 +3128,29 @@ def test_build_lead_from_search_result_uses_title_or_url_for_remote_hint() -> No
     assert lead.is_remote_hint is True
 
 
+def test_build_lead_from_search_result_uses_remote_query_for_trusted_direct_result_when_snippet_is_silent() -> None:
+    lead = _build_lead_from_search_result(
+        "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        "Senior Product Manager, Voice AI SDK | Krisp",
+        "Own product strategy for Voice AI SDK capabilities.",
+        '"senior product manager" "voice AI" remote "growth stage"',
+    )
+    assert lead is not None
+    assert lead.source_type == "company_site"
+    assert lead.is_remote_hint is True
+
+
+def test_build_lead_from_search_result_does_not_override_explicit_hybrid_signal_with_remote_query() -> None:
+    lead = _build_lead_from_search_result(
+        "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+        "Senior Product Manager, Voice AI SDK | Krisp",
+        "Hybrid role based in Austin with in office collaboration three days per week.",
+        '"senior product manager" "voice AI" remote "growth stage"',
+    )
+    assert lead is not None
+    assert lead.is_remote_hint is False
+
+
 def test_dedupe_round_leads_keeps_best_source_for_same_role() -> None:
     settings = build_settings()
     linkedin = JobLead(

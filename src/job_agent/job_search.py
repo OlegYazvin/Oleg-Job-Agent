@@ -6376,6 +6376,12 @@ def _build_lead_from_search_result(url: str, title: str, snippet: str, query: st
         is_remote = True
     else:
         is_remote = None
+        lowered_query = " ".join(query.lower().split())
+        if (
+            source_type in {"direct_ats", "company_site"}
+            and (" remote" in f" {lowered_query}" or "work from home" in lowered_query)
+        ):
+            is_remote = True
     remote_restriction_note = _remote_restriction_note(title, snippet)
     location_hint = None
     if is_remote:
