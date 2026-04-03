@@ -18,6 +18,9 @@ def test_format_scorecard_summary_renders_primary_metrics() -> None:
         {
             "outcome": {
                 "validated_jobs_count": 2,
+                "novel_validated_jobs_count": 2,
+                "reacquired_validated_jobs_count": 1,
+                "total_current_validated_jobs_count": 3,
                 "jobs_with_messages_count": 1,
                 "fresh_new_leads_count": 14,
                 "actionable_near_miss_count": 3,
@@ -29,7 +32,8 @@ def test_format_scorecard_summary_renders_primary_metrics() -> None:
 
     assert "Latest scorecard" in rendered
     assert "Novel validated jobs: 2" in rendered
-    assert "Current validated coverage: 2" in rendered
+    assert "Current validated coverage: 3" in rendered
+    assert "Reacquired jobs: 1" in rendered
     assert "Jobs with messages: 1" in rendered
     assert "Fresh leads: 14" in rendered
     assert "Actionable near-misses: 3" in rendered
@@ -38,19 +42,31 @@ def test_format_scorecard_summary_renders_primary_metrics() -> None:
 def test_scorecard_detail_lines_include_discovery_and_ollama_context() -> None:
     lines = _scorecard_detail_lines(
         {
-            "outcome": {"fresh_new_leads_count": 9, "actionable_near_miss_count": 2},
+            "outcome": {
+                "novel_validated_jobs_count": 1,
+                "reacquired_validated_jobs_count": 2,
+                "total_current_validated_jobs_count": 3,
+                "fresh_new_leads_count": 9,
+                "actionable_near_miss_count": 2,
+            },
             "discovery": {
                 "replayed_seed_leads_count": 4,
+                "reacquisition_attempt_count": 2,
+                "reacquired_jobs_suppressed_count": 1,
                 "repeated_failed_leads_suppressed_count": 7,
                 "query_timeout_count": 3,
                 "discovery_efficiency": 1.5,
             },
-            "validation": {"message_coverage_rate": 0.5},
+            "validation": {"message_coverage_rate": 0.5, "novel_validated_yield": 0.111, "reacquisition_yield": 1.0},
             "ollama": {"request_count": 2, "useful_actions_per_request": 0.5},
             "timing": {"duration_seconds": 720.0},
         }
     )
 
+    assert "Novel validated jobs: 1" in lines
+    assert "Current validated coverage: 3" in lines
+    assert "Reacquired validated jobs: 2" in lines
     assert "Fresh new leads: 9" in lines
     assert "Replay seeds: 4" in lines
+    assert "Reacquisition attempts: 2" in lines
     assert "Ollama requests: 2" in lines

@@ -429,11 +429,29 @@ def save_run_scorecard(data_dir: Path, scorecard: RunScorecard) -> None:
     latest_path = _scorecard_latest_path(data_dir)
     history_path = _scorecard_history_path(data_dir)
     latest_path.parent.mkdir(parents=True, exist_ok=True)
+    previous_entries = [
+        entry
+        for entry in load_run_scorecard_entries(data_dir, bootstrap=False)
+        if entry.run_id != scorecard.run_id
+    ]
+    if previous_entries:
+        baseline = sum(entry.outcome.total_current_validated_jobs_count for entry in previous_entries[:20]) / min(len(previous_entries), 20)
+        coverage_retention_rate = round(
+            scorecard.outcome.total_current_validated_jobs_count / baseline,
+            3,
+        ) if baseline else None
+        scorecard = scorecard.model_copy(
+            update={
+                "validation": scorecard.validation.model_copy(
+                    update={"coverage_retention_rate": coverage_retention_rate}
+                )
+            }
+        )
     payload = scorecard.model_dump(mode="json")
     latest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     entries_by_run_id = {
         entry.run_id: entry
-        for entry in load_run_scorecard_entries(data_dir, bootstrap=False)
+        for entry in previous_entries
     }
     entries_by_run_id[scorecard.run_id] = scorecard
     ordered_entries = sorted(
@@ -546,13 +564,16 @@ def save_failed_run_scorecard(
     near_miss_payload = _load_json(data_dir / "near-misses-latest.json", default={})
     if not isinstance(near_miss_payload, Mapping) or str(near_miss_payload.get("run_id") or "").strip() != run_id:
         near_miss_payload = None
+    reacquired_jobs_payload = _load_json(data_dir / "reacquired-jobs-latest.json", default=None)
+    if not isinstance(reacquired_jobs_payload, Mapping) or str(reacquired_jobs_payload.get("run_id") or "").strip() != run_id:
+        reacquired_jobs_payload = None
     ollama_summary_payload = _load_json(data_dir / "ollama-summary-latest.json", default={})
     if not isinstance(ollama_summary_payload, Mapping) or str(ollama_summary_payload.get("run_id") or "").strip() != run_id:
         ollama_summary_payload = None
     scorecard = build_run_scorecard(
         run_id=run_id,
         status="failed",
-        reacquired_jobs_payload=_load_json(data_dir / "reacquired-jobs-latest.json", default=None),
+        reacquired_jobs_payload=reacquired_jobs_payload,
         search_diagnostics=search_diagnostics,
         near_miss_payload=near_miss_payload,
         ollama_summary_payload=ollama_summary_payload,

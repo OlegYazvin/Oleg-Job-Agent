@@ -766,6 +766,7 @@ def build_run_improvement_analysis(
             "validated_yield": current.validation.validated_yield,
             "novel_validated_yield": current.validation.novel_validated_yield,
             "reacquisition_yield": current.validation.reacquisition_yield,
+            "coverage_retention_rate": current.validation.coverage_retention_rate,
             "missing_salary_count": current.validation.missing_salary_count,
             "fetch_non_200_count": current.validation.fetch_non_200_count,
             "not_remote_count": current.validation.not_remote_count,

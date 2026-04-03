@@ -84,6 +84,9 @@ def _make_scorecard(
     status: str,
     generated_at: datetime,
     validated_jobs_count: int = 0,
+    novel_validated_jobs_count: int | None = None,
+    reacquired_validated_jobs_count: int = 0,
+    total_current_validated_jobs_count: int | None = None,
     jobs_with_messages_count: int = 0,
     fresh_new_leads_count: int = 0,
     raw_near_miss_count: int = 0,
@@ -99,12 +102,21 @@ def _make_scorecard(
     request_count: int = 0,
     useful_actions_per_request: float = 0.0,
 ) -> RunScorecard:
+    novel_validated_jobs_count = validated_jobs_count if novel_validated_jobs_count is None else novel_validated_jobs_count
+    total_current_validated_jobs_count = (
+        novel_validated_jobs_count + reacquired_validated_jobs_count
+        if total_current_validated_jobs_count is None
+        else total_current_validated_jobs_count
+    )
     return RunScorecard(
         run_id=run_id,
         generated_at=generated_at,
         status=status,
         outcome=RunOutcomeMetrics(
-            validated_jobs_count=validated_jobs_count,
+            validated_jobs_count=novel_validated_jobs_count,
+            novel_validated_jobs_count=novel_validated_jobs_count,
+            reacquired_validated_jobs_count=reacquired_validated_jobs_count,
+            total_current_validated_jobs_count=total_current_validated_jobs_count,
             jobs_with_messages_count=jobs_with_messages_count,
             unique_leads_discovered_count=fresh_new_leads_count + replayed_seed_leads_count,
             fresh_new_leads_count=fresh_new_leads_count,
@@ -123,8 +135,16 @@ def _make_scorecard(
             discovery_efficiency=discovery_efficiency,
         ),
         validation=RunValidationMetrics(
-            validated_jobs_count=validated_jobs_count,
+            validated_jobs_count=novel_validated_jobs_count,
             validated_yield=0.0,
+            novel_validated_jobs_count=novel_validated_jobs_count,
+            novel_validated_yield=0.0,
+            reacquired_validated_jobs_count=reacquired_validated_jobs_count,
+            total_current_validated_jobs_count=total_current_validated_jobs_count,
+            reacquisition_attempt_count=0,
+            reacquired_jobs_suppressed_count=0,
+            reacquisition_yield=0.0,
+            coverage_retention_rate=None,
             jobs_with_messages_count=jobs_with_messages_count,
             message_coverage_rate=0.0,
             raw_near_miss_count=raw_near_miss_count,
@@ -320,6 +340,75 @@ def test_build_run_improvement_analysis_prioritizes_validation_hard_filter_burde
     assert analysis.current_metrics["not_remote_count"] == 2
     assert analysis.current_metrics["stale_posting_count"] == 1
     assert analysis.current_metrics["missing_salary_count"] == 1
+
+
+def test_build_run_improvement_analysis_detects_diversification_gap_when_coverage_exists(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    older = _make_scorecard(
+        run_id="run-older",
+        status="completed",
+        generated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        novel_validated_jobs_count=0,
+        reacquired_validated_jobs_count=2,
+        total_current_validated_jobs_count=2,
+        fresh_new_leads_count=8,
+    )
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
+        novel_validated_jobs_count=0,
+        reacquired_validated_jobs_count=2,
+        total_current_validated_jobs_count=2,
+        fresh_new_leads_count=7,
+    )
+    save_run_scorecard(settings.data_dir, older)
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(
+        settings,
+        iteration_number=2,
+        run_id="run-current",
+    )
+
+    assert analysis.selected_theme == "diversification_gap"
+    assert analysis.current_metrics["total_current_validated_jobs_count"] == 2
+    assert analysis.current_metrics["novel_validated_jobs_count"] == 0
+
+
+def test_build_run_improvement_analysis_detects_coverage_regression(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    older = _make_scorecard(
+        run_id="run-older",
+        status="completed",
+        generated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        novel_validated_jobs_count=1,
+        reacquired_validated_jobs_count=3,
+        total_current_validated_jobs_count=4,
+        fresh_new_leads_count=8,
+    )
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
+        novel_validated_jobs_count=0,
+        reacquired_validated_jobs_count=1,
+        total_current_validated_jobs_count=1,
+        fresh_new_leads_count=8,
+    )
+    save_run_scorecard(settings.data_dir, older)
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(
+        settings,
+        iteration_number=2,
+        run_id="run-current",
+    )
+
+    assert any(pattern.key == "coverage_regression" for pattern in analysis.top_patterns)
+    assert analysis.metric_deltas["total_current_validated_jobs_delta"] < 0
 
 
 def test_ensure_baseline_commit_commits_dirty_main(tmp_path: Path) -> None:

@@ -113,6 +113,37 @@ def test_summary_report_counts_second_order_targets_not_messages(tmp_path: Path)
     assert table.rows[1].cells[7].text == "2"
 
 
+def test_summary_report_renders_still_open_again_section_for_reacquired_jobs(tmp_path: Path) -> None:
+    bundle = build_bundle()
+    reacquired_job = JobPosting(
+        company_name="Bravo AI",
+        role_title="Principal Product Manager, AI",
+        direct_job_url="https://jobs.lever.co/bravo/123",
+        resolved_job_url="https://jobs.lever.co/bravo/123",
+        ats_platform="Lever",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text="2026-03-28",
+        posted_date_iso="2026-03-28",
+        base_salary_min_usd=220000,
+        base_salary_max_usd=260000,
+        salary_text="$220,000 - $260,000",
+        evidence_notes="Still live and fully qualified.",
+        is_reacquired=True,
+        first_reported_at="2026-03-20T10:00:00+00:00",
+        last_reported_at="2026-03-28T10:00:00+00:00",
+        report_count=3,
+    )
+
+    summary_doc = build_summary_document([bundle], tmp_path, reacquired_jobs=[reacquired_job])
+    doc = Document(summary_doc)
+    text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
+
+    assert "Still Open Again" in text
+    assert "Bravo AI | Principal Product Manager, AI" in text
+    assert "First reported: 2026-03-20T10:00:00+00:00" in text
+
+
 def test_near_miss_report_and_payload_are_written(tmp_path: Path) -> None:
     near_miss = NearMissJob(
         company_name="Acme AI",

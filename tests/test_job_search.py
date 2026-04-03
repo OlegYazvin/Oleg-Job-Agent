@@ -2562,6 +2562,29 @@ def test_failed_lead_history_skip_reason_does_not_persist_already_reported() -> 
     assert _failed_lead_history_skip_reason(lead, settings, history) is None
 
 
+def test_failed_lead_history_skip_reason_ignores_vendor_host_company_mismatch() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Quorum Software",
+        role_title="Senior Product Manager - AI Strategy (USA - Remote)",
+        source_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        source_type="direct_ats",
+        direct_job_url="https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-31",
+        salary_text_hint="$165,000 - $220,000",
+        evidence_notes="Replayed seeded direct URL.",
+    )
+    history = {
+        "url:https://portal.dynamicsats.com/JobListing/Details/be9c621a-ba9d-41b6-bc7b-917d59117a03/eed50803-efca-f011-bbd3-6045bdeb7e04": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"company_mismatch": 1},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, history) is None
+
+
 def test_persist_validated_jobs_checkpoint_writes_current_jobs(tmp_path: Path) -> None:
     settings = build_settings()
     settings.data_dir = tmp_path

@@ -316,6 +316,12 @@ def _bootstrap_histories_from_run_artifacts(data_dir: Path) -> tuple[list[dict[s
                     "message": "Imported from historical run artifact.",
                     "jobs_found_by_search": int(manifest.get("jobs_found_by_search") or 0),
                     "jobs_kept_after_validation": int(manifest.get("jobs_kept_after_validation") or 0),
+                    "novel_validated_jobs_count": int(manifest.get("novel_validated_jobs_count") or manifest.get("jobs_kept_after_validation") or 0),
+                    "reacquired_validated_jobs_count": int(manifest.get("reacquired_validated_jobs_count") or 0),
+                    "total_current_validated_jobs_count": int(
+                        manifest.get("total_current_validated_jobs_count")
+                        or int(manifest.get("jobs_kept_after_validation") or 0) + int(manifest.get("reacquired_validated_jobs_count") or 0)
+                    ),
                     "jobs_with_any_messages": int(manifest.get("jobs_with_any_messages") or 0),
                     "message_docx_path": manifest.get("message_docx_path"),
                     "summary_docx_path": manifest.get("summary_docx_path"),
@@ -324,30 +330,44 @@ def _bootstrap_histories_from_run_artifacts(data_dir: Path) -> tuple[list[dict[s
             seen_run_ids.add(run_id)
             changed = True
 
+        artifact_jobs: list[dict[str, Any]] = []
         for bundle in payload.get("bundles", []):
             if not isinstance(bundle, dict):
                 continue
             job_payload = bundle.get("job")
-            if not isinstance(job_payload, dict):
-                continue
+            if isinstance(job_payload, dict):
+                artifact_jobs.append(job_payload)
+        for job_payload in payload.get("reacquired_jobs", []):
+            if isinstance(job_payload, dict):
+                artifact_jobs.append(job_payload)
+
+        for job_payload in artifact_jobs:
             job_key = _normalize_job_history_key(job_payload.get("resolved_job_url") or job_payload.get("direct_job_url"))
             if not job_key:
                 continue
             if job_key in job_history:
+                entry = dict(job_history[job_key])
+                entry["last_reported_at"] = generated_at
+                entry["last_run_id"] = run_id
+                entry["report_count"] = max(int(entry.get("report_count") or 0), int(job_payload.get("report_count") or 0) or 1)
+                if manifest.get("summary_docx_path"):
+                    entry["summary_docx_path"] = manifest.get("summary_docx_path")
+                job_history[job_key] = entry
+                changed = True
                 continue
             job_history[job_key] = {
                 "job_key": job_key,
                 "normalized_job_url": _normalize_job_history_key(job_payload.get("resolved_job_url") or job_payload.get("direct_job_url")),
-                "canonical_job_key": job_key,
+                "canonical_job_key": str(job_payload.get("canonical_job_key") or job_key),
                 "company_name": job_payload.get("company_name"),
                 "role_title": job_payload.get("role_title"),
                 "posted_date_iso": job_payload.get("posted_date_iso"),
                 "posted_date_text": job_payload.get("posted_date_text"),
                 "salary_text": job_payload.get("salary_text"),
-                "first_reported_at": generated_at,
-                "last_reported_at": generated_at,
+                "first_reported_at": job_payload.get("first_reported_at") or generated_at,
+                "last_reported_at": job_payload.get("last_reported_at") or generated_at,
                 "last_run_id": run_id,
-                "report_count": 1,
+                "report_count": int(job_payload.get("report_count") or 1),
                 "message_docx_path": manifest.get("message_docx_path"),
                 "summary_docx_path": manifest.get("summary_docx_path"),
             }
