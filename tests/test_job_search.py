@@ -4193,6 +4193,68 @@ def test_search_single_query_applies_post_local_trusted_bundle_refinement(monkey
     assert refine_calls == [(3, "trusted_direct_bundle")]
 
 
+def test_search_single_query_applies_post_local_trusted_bundle_refinement_for_single_high_confidence_direct_lead(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    settings.use_openai_fallback = False
+    local_leads = [
+        JobLead(
+            company_name="Krisp",
+            role_title="Senior Product Manager, Voice AI SDK",
+            source_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
+            source_type="company_site",
+            direct_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            base_salary_min_usd_hint=210000,
+            evidence_notes="Direct company role.",
+        )
+    ]
+    refine_calls: list[tuple[int, str | None]] = []
+
+    async def fake_local_search(
+        _settings: Settings,
+        _query: str,
+        *,
+        attempt_number: int | None = None,
+        run_id: str | None = None,
+    ) -> tuple[list[JobLead], float]:
+        return local_leads, 1.0
+
+    async def fake_refine(
+        _settings: Settings,
+        _query: str,
+        candidate_pool: list[JobLead],
+        *,
+        cleanup_limit: int,
+        refinement_mode: str | None = None,
+        pre_refinement_average_confidence: float | None = None,
+        pre_refinement_cleanup_signal_count: int | None = None,
+        pre_refinement_trustworthy_direct_url_count: int | None = None,
+        run_id: str | None = None,
+    ) -> list[JobLead]:
+        refine_calls.append((cleanup_limit, refinement_mode))
+        return candidate_pool
+
+    monkeypatch.setattr("job_agent.job_search._search_single_query_local", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
+
+    result = asyncio.run(
+        _search_single_query(
+            None,
+            settings,
+            '"senior product manager" "voice AI" remote "growth stage"',
+            attempt_number=1,
+            run_id="run-1",
+        )
+    )
+
+    assert result == local_leads
+    assert refine_calls == [(3, "trusted_direct_bundle")]
+
+
 def test_maybe_force_round_lead_refinement_with_ollama_runs_once_per_attempt(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

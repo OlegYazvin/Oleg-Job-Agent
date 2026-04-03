@@ -6639,6 +6639,12 @@ async def _search_single_query(
                 cleanup_signal_count=local_cleanup_signal_count,
                 low_trust_source_count=local_low_trust_source_count,
                 trustworthy_direct_url_count=local_trustworthy_direct_url_count,
+            ) or (
+                len(local_leads) == 1
+                and local_cleanup_signal_count == 0
+                and local_low_trust_source_count == 0
+                and local_trustworthy_direct_url_count >= 1
+                and local_average_confidence >= 0.9
             ):
                 local_leads = await _refine_local_leads_with_ollama(
                     settings,
