@@ -2142,26 +2142,14 @@ def _annotate_and_filter_resolution_leads(
     company_watchlist: dict[str, dict[str, object]],
 ) -> list[JobLead]:
     annotated: list[JobLead] = []
-    validated_job_history_index = load_validated_job_history_index(settings.data_dir)
     for lead in leads:
         watchlist_entry = company_watchlist.get(_normalize_company_key(lead.company_name), {})
-        recent_validated_history = _lead_has_recent_validated_history(
-            lead,
-            settings,
-            validated_job_history_index,
-        )
         if _watchlist_entry_should_skip_resolution(lead, settings, watchlist_entry):
             continue
         source_quality_score = _lead_source_quality_score(lead, settings, watchlist_entry)
-        if recent_validated_history:
-            source_quality_score = max(source_quality_score, 3)
         if source_quality_score <= 0:
             continue
-        if (
-            source_quality_score <= 2
-            and _role_title_is_low_signal(lead.role_title, lead.evidence_notes)
-            and not recent_validated_history
-        ):
+        if source_quality_score <= 2 and _role_title_is_low_signal(lead.role_title, lead.evidence_notes):
             continue
         annotated.append(lead.model_copy(update={"source_quality_score_hint": source_quality_score}))
     annotated.sort(
@@ -7165,19 +7153,6 @@ def _stale_posted_hint_should_be_deferred(
     if not posted_hint or _hint_is_recent(posted_hint, settings) is not False:
         return False
 
-    return _validated_history_was_reported_recently(
-        last_reported_at=last_reported_at,
-        first_reported_at=first_reported_at,
-        settings=settings,
-    )
-
-
-def _validated_history_was_reported_recently(
-    *,
-    last_reported_at: str | None = None,
-    first_reported_at: str | None = None,
-    settings: Settings,
-) -> bool:
     reported_at_raw = str(last_reported_at or first_reported_at or "").strip()
     if not reported_at_raw:
         return False
@@ -7238,27 +7213,6 @@ def _refresh_seed_lead_from_validated_history(
             "posted_date_hint": None,
             "evidence_notes": evidence_notes,
         }
-    )
-
-
-def _lead_has_recent_validated_history(
-    lead: JobLead,
-    settings: Settings,
-    validated_job_history_index: dict[str, dict[str, object]],
-) -> bool:
-    if lead.source_type not in {"direct_ats", "company_site"}:
-        return False
-    if not lead.direct_job_url:
-        return False
-
-    history_entry = _validated_job_history_entry_for_url(lead.direct_job_url, validated_job_history_index)
-    if history_entry is None:
-        return False
-
-    return _validated_history_was_reported_recently(
-        last_reported_at=str(history_entry.get("last_reported_at") or "").strip() or None,
-        first_reported_at=str(history_entry.get("first_reported_at") or "").strip() or None,
-        settings=settings,
     )
 
 
