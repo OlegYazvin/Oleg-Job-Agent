@@ -268,6 +268,7 @@ REPLAYABLE_FAILURE_REASON_CODES = {
 }
 FAILED_LEAD_TRACKED_REASON_CODES = {
     "stale_posting",
+    "missing_salary",
     "not_remote",
     "remote_unclear",
     "salary_below_min",
@@ -288,6 +289,7 @@ FAILED_LEAD_IMMEDIATE_SUPPRESS_REASON_CODES = {
 FAILED_LEAD_REPEAT_SUPPRESS_THRESHOLDS = {
     "company_mismatch": 2,
     "stale_posting": 2,
+    "missing_salary": 1,
     "not_remote": 2,
     "remote_unclear": 3,
     "salary_below_min": 2,
@@ -1081,10 +1083,10 @@ def _failed_lead_history_skip_reason(
                 reason_code,
                 f"Lead matched prior failed lead history ({matched_key}) with persistent reason {reason_code}.",
             )
-    if _lead_has_strong_override_hints(lead, settings):
-        return None
     for reason_code, threshold in FAILED_LEAD_REPEAT_SUPPRESS_THRESHOLDS.items():
         if reason_counts.get(reason_code, 0) >= threshold:
+            if _lead_has_override_hints_for_reason(lead, settings, reason_code):
+                continue
             return (
                 reason_code,
                 (
@@ -2238,6 +2240,21 @@ def _lead_has_strong_override_hints(lead: JobLead, settings: Settings) -> bool:
         or lead.source_type in {"direct_ats", "company_site", "builtin"}
         or bool(salary_values)
     )
+
+
+def _lead_has_override_hints_for_reason(lead: JobLead, settings: Settings, reason_code: str) -> bool:
+    if not _lead_has_strong_override_hints(lead, settings):
+        return False
+    if reason_code != "missing_salary":
+        return True
+    salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
+        lead.base_salary_min_usd_hint,
+        lead.base_salary_max_usd_hint,
+        lead.salary_text_hint,
+        lead.evidence_notes,
+    )
+    salary_values = [value for value in (salary_min, salary_max) if value is not None]
+    return bool(salary_values and max(salary_values) >= settings.min_base_salary_usd)
 
 
 def _watchlist_entry_should_skip_resolution(

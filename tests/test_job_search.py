@@ -56,6 +56,7 @@ from job_agent.job_search import (
     _lead_is_reacquisition_eligible,
     _lead_priority,
     _load_seed_leads_from_file,
+    _load_failed_lead_history,
     _job_posting_dedupe_key,
     _is_duckduckgo_anomaly_page,
     _is_google_interstitial_page,
@@ -3321,6 +3322,88 @@ def test_failed_lead_history_skip_reason_suppresses_repeat_failures() -> None:
 
     assert skip_reason is not None
     assert skip_reason[0] == "stale_posting"
+
+
+def test_failed_lead_history_skip_reason_suppresses_repeat_missing_salary_without_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Hopper",
+        role_title="Principal Product Manager - AI Travel (100% Remote - UK)",
+        source_url="https://jobs.ashbyhq.com/hopper",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/hopper/0482ca59-d815-42cb-850d-2d229cb9d9a0",
+        is_remote_hint=True,
+        posted_date_hint="2026-04-02",
+        evidence_notes="Replayed seeded direct URL without compensation.",
+    )
+    history = {
+        "url:ashby:hopper:0482ca59-d815-42cb-850d-2d229cb9d9a0": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"missing_salary": 1},
+        }
+    }
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "missing_salary"
+
+
+def test_failed_lead_history_skip_reason_allows_missing_salary_replay_with_new_salary_hint() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Hopper",
+        role_title="Principal Product Manager - AI Travel (100% Remote - USA)",
+        source_url="https://jobs.ashbyhq.com/hopper",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/hopper/9a3d0809-326b-4ca5-ae60-bae9a835234c",
+        is_remote_hint=True,
+        posted_date_hint="2026-04-02",
+        salary_text_hint="$220,000 - $320,000",
+        evidence_notes="Replayed seeded direct URL with fresh compensation evidence.",
+    )
+    history = {
+        "url:ashby:hopper:9a3d0809-326b-4ca5-ae60-bae9a835234c": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"missing_salary": 1},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, history) is None
+
+
+def test_load_failed_lead_history_tracks_missing_salary_failures(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    (settings.data_dir / "run-20260403-000000.json").write_text(
+        json.dumps(
+            {
+                "search_diagnostics": {
+                    "failures": [
+                        {
+                            "stage": "validation",
+                            "reason_code": "missing_salary",
+                            "detail": "No salary range was available from the direct page or trusted hints.",
+                            "company_name": "Hopper",
+                            "role_title": "Principal Product Manager - AI Travel (100% Remote - UK)",
+                            "source_url": "https://jobs.ashbyhq.com/hopper",
+                            "direct_job_url": "https://jobs.ashbyhq.com/hopper/0482ca59-d815-42cb-850d-2d229cb9d9a0",
+                            "posted_date_text": "2026-04-02",
+                            "salary_text": None,
+                            "is_remote": True,
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    history = _load_failed_lead_history(settings)
+
+    assert history["url:ashby:hopper:0482ca59-d815-42cb-850d-2d229cb9d9a0"]["recent_rejection_reasons"] == {
+        "missing_salary": 1
+    }
 
 
 def test_failed_lead_history_skip_reason_does_not_persist_already_reported() -> None:
