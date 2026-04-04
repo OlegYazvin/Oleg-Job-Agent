@@ -7142,7 +7142,81 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
     return lead
 
 
-def _seed_lead_from_job_payload(payload: dict[str, object]) -> JobLead | None:
+def _stale_posted_hint_should_be_deferred(
+    posted_hint: str | None,
+    *,
+    last_reported_at: str | None = None,
+    first_reported_at: str | None = None,
+    settings: Settings,
+) -> bool:
+    posted_hint = str(posted_hint or "").strip()
+    if not posted_hint or _hint_is_recent(posted_hint, settings) is not False:
+        return False
+
+    reported_at_raw = str(last_reported_at or first_reported_at or "").strip()
+    if not reported_at_raw:
+        return False
+    try:
+        reported_at = datetime.fromisoformat(reported_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if reported_at.tzinfo is None:
+        reported_at = reported_at.replace(tzinfo=UTC)
+    recency_cutoff = datetime.now(UTC) - timedelta(days=max(1, settings.posted_within_days))
+    return reported_at >= recency_cutoff
+
+
+def _historical_job_should_defer_stale_posted_hint(job: JobPosting, settings: Settings) -> bool:
+    return _stale_posted_hint_should_be_deferred(
+        job.posted_date_iso or job.posted_date_text,
+        last_reported_at=job.last_reported_at,
+        first_reported_at=job.first_reported_at,
+        settings=settings,
+    )
+
+
+def _refresh_seed_lead_from_validated_history(
+    lead: JobLead,
+    settings: Settings,
+    validated_job_history_index: dict[str, dict[str, object]],
+) -> JobLead:
+    history_entry = _validated_job_history_entry_for_url(
+        lead.direct_job_url or lead.source_url,
+        validated_job_history_index,
+    )
+    if history_entry is None:
+        return lead
+
+    if not _stale_posted_hint_should_be_deferred(
+        lead.posted_date_hint,
+        last_reported_at=str(history_entry.get("last_reported_at") or "").strip() or None,
+        first_reported_at=str(history_entry.get("first_reported_at") or "").strip() or None,
+        settings=settings,
+    ):
+        return lead
+
+    history_reported_on = str(history_entry.get("last_reported_at") or history_entry.get("first_reported_at") or "").strip()
+    historical_note = (
+        "Historical replay deferred stale posted-date hint because the job was still validated on "
+        f"{history_reported_on[:10]}."
+    )
+    evidence_notes = " ".join(
+        part
+        for part in (
+            (lead.evidence_notes or "").strip(),
+            historical_note,
+        )
+        if part
+    )[:400]
+    return lead.model_copy(
+        update={
+            "posted_date_hint": None,
+            "evidence_notes": evidence_notes,
+        }
+    )
+
+
+def _seed_lead_from_job_payload(payload: dict[str, object], settings: Settings | None = None) -> JobLead | None:
     try:
         job = JobPosting.model_validate(payload)
     except Exception:
@@ -7150,6 +7224,14 @@ def _seed_lead_from_job_payload(payload: dict[str, object]) -> JobLead | None:
     direct_job_url = _normalize_direct_job_url(job.direct_job_url)
     if not _is_allowed_direct_job_url(direct_job_url):
         return None
+    posted_date_hint = job.posted_date_iso or job.posted_date_text
+    historical_note = ""
+    if settings is not None and _historical_job_should_defer_stale_posted_hint(job, settings):
+        posted_date_hint = None
+        historical_note = (
+            f"Historical replay deferred stale posted-date hint because the job was still validated on "
+            f"{str(job.last_reported_at or job.first_reported_at or '')[:10]}."
+        )
     lead = JobLead(
         company_name=job.company_name,
         role_title=job.role_title,
@@ -7162,7 +7244,7 @@ def _seed_lead_from_job_payload(payload: dict[str, object]) -> JobLead | None:
             job.job_page_title,
             job.evidence_notes,
         ),
-        posted_date_hint=job.posted_date_iso or job.posted_date_text,
+        posted_date_hint=posted_date_hint,
         is_remote_hint=job.is_fully_remote,
         base_salary_min_usd_hint=job.base_salary_min_usd,
         base_salary_max_usd_hint=job.base_salary_max_usd,
@@ -7173,6 +7255,7 @@ def _seed_lead_from_job_payload(payload: dict[str, object]) -> JobLead | None:
                 part
                 for part in (
                     (job.evidence_notes or "Historical accepted candidate.")[:400],
+                    historical_note,
                     _remote_restriction_note(job.role_title, job.job_page_title, job.evidence_notes),
                 )
                 if part
@@ -7198,7 +7281,7 @@ def _load_historical_seed_leads(settings: Settings) -> list[JobLead]:
                 continue
             job_payload = bundle.get("job")
             if isinstance(job_payload, dict):
-                lead = _seed_lead_from_job_payload(job_payload)
+                lead = _seed_lead_from_job_payload(job_payload, settings)
                 if lead is not None:
                     leads.append(lead)
         reacquired_jobs = payload.get("reacquired_jobs")
@@ -7212,7 +7295,7 @@ def _load_historical_seed_leads(settings: Settings) -> list[JobLead]:
             for job_payload in reacquired_jobs:
                 if not isinstance(job_payload, dict):
                     continue
-                lead = _seed_lead_from_job_payload(job_payload)
+                lead = _seed_lead_from_job_payload(job_payload, settings)
                 if lead is not None:
                     leads.append(lead)
         diagnostics = payload.get("search_diagnostics", {})
@@ -7233,7 +7316,11 @@ def _load_historical_seed_leads(settings: Settings) -> list[JobLead]:
 
 
 def _collect_replay_seed_leads(settings: Settings) -> list[JobLead]:
-    file_seed_leads = _load_seed_leads_from_file(settings)
+    validated_job_history_index = load_validated_job_history_index(settings.data_dir)
+    file_seed_leads = [
+        _refresh_seed_lead_from_validated_history(lead, settings, validated_job_history_index)
+        for lead in _load_seed_leads_from_file(settings)
+    ]
     curated_seed_keys = {_lead_dedupe_key(lead) for lead in file_seed_leads}
     deduped: dict[str, JobLead] = {}
     for lead in [*file_seed_leads, *_load_historical_seed_leads(settings)]:
