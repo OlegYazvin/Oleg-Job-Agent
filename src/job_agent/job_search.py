@@ -1849,20 +1849,6 @@ def _company_names_match(expected: str, observed: str) -> bool:
         return True
     if expected_key in observed_key or observed_key in expected_key:
         return True
-    expected_words = re.findall(r"[A-Za-z0-9]+", expected.lower())
-    observed_words = re.findall(r"[A-Za-z0-9]+", observed.lower())
-    if len(expected_words) >= 2 and len(observed_words) == 1:
-        trailing_words = "".join(expected_words[1:])
-        if trailing_words and observed_key.endswith(trailing_words):
-            leading_prefix = observed_key[: -len(trailing_words)] if len(observed_key) > len(trailing_words) else ""
-            if len(leading_prefix) >= 3 and expected_words[0].startswith(leading_prefix):
-                return True
-    if len(observed_words) >= 2 and len(expected_words) == 1:
-        trailing_words = "".join(observed_words[1:])
-        if trailing_words and expected_key.endswith(trailing_words):
-            leading_prefix = expected_key[: -len(trailing_words)] if len(expected_key) > len(trailing_words) else ""
-            if len(leading_prefix) >= 3 and observed_words[0].startswith(leading_prefix):
-                return True
     expected_acronyms = acronym_candidates(expected)
     observed_acronyms = acronym_candidates(observed)
     if expected_acronyms.intersection(observed_acronyms):
@@ -7395,33 +7381,6 @@ def _historical_direct_url_key_candidates(
     return candidates
 
 
-def _historical_direct_url_company_key(company_name: str | None) -> str | None:
-    normalized_company_key = _normalize_company_key(company_name)
-    if not normalized_company_key:
-        return None
-    return f"company:{normalized_company_key}"
-
-
-def _normalized_salary_text_key(salary_text: str | None) -> str:
-    return "".join(ch for ch in str(salary_text or "").lower() if ch.isalnum())
-
-
-def _historical_role_similarity(left: str | None, right: str | None) -> float:
-    left_tokens = {
-        token
-        for token in re.findall(r"[a-z0-9]+", str(left or "").lower())
-        if token and token not in {"and", "or", "of", "the", "for", "to", "a", "an"}
-    }
-    right_tokens = {
-        token
-        for token in re.findall(r"[a-z0-9]+", str(right or "").lower())
-        if token and token not in {"and", "or", "of", "the", "for", "to", "a", "an"}
-    }
-    if not left_tokens or not right_tokens:
-        return 0.0
-    return len(left_tokens.intersection(right_tokens)) / len(left_tokens.union(right_tokens))
-
-
 def _record_historical_direct_url_hint(
     hints: dict[str, list[dict[str, object]]],
     *,
@@ -7429,7 +7388,6 @@ def _record_historical_direct_url_hint(
     role_title: str | None,
     source_url: str | None,
     direct_job_url: str | None,
-    salary_text: str | None,
     observed_at: str | None,
     confidence_rank: int,
     reason_code: str | None = None,
@@ -7439,28 +7397,19 @@ def _record_historical_direct_url_hint(
         return
     if not _is_allowed_direct_job_url(normalized_direct_job_url) or _looks_like_generic_job_url(normalized_direct_job_url):
         return
-    if reason_code in {"resolution_missing", "not_specific_job_page", "resolution_blocked_url"}:
-        return
-    if reason_code == "company_mismatch" and not _direct_job_url_matches_expected_company(normalized_direct_job_url, company_name):
+    if reason_code in {"resolution_missing", "company_mismatch", "not_specific_job_page", "resolution_blocked_url"}:
         return
 
     payload = {
-        "company_name": str(company_name or "").strip(),
-        "role_title": str(role_title or "").strip(),
-        "salary_text": str(salary_text or "").strip(),
         "direct_job_url": normalized_direct_job_url,
         "observed_at": str(observed_at or "").strip(),
         "confidence_rank": confidence_rank,
     }
-    keys = _historical_direct_url_key_candidates(
+    for key in _historical_direct_url_key_candidates(
         company_name,
         role_title,
         source_url=source_url,
-    )
-    company_key = _historical_direct_url_company_key(company_name)
-    if company_key and company_key not in keys:
-        keys.append(company_key)
-    for key in keys:
+    ):
         bucket = hints.setdefault(key, [])
         existing = next(
             (entry for entry in bucket if str(entry.get("direct_job_url") or "").strip() == normalized_direct_job_url),
@@ -7498,7 +7447,6 @@ def _load_historical_direct_url_hints(settings: Settings) -> dict[str, list[dict
                 role_title=str(job_payload.get("role_title") or "").strip() or None,
                 source_url=None,
                 direct_job_url=str(job_payload.get("direct_job_url") or job_payload.get("resolved_job_url") or "").strip() or None,
-                salary_text=str(job_payload.get("salary_text") or "").strip() or None,
                 observed_at=observed_at,
                 confidence_rank=0,
             )
@@ -7518,7 +7466,6 @@ def _load_historical_direct_url_hints(settings: Settings) -> dict[str, list[dict
                 role_title=str(job_payload.get("role_title") or "").strip() or None,
                 source_url=source_url,
                 direct_job_url=str(job_payload.get("direct_job_url") or job_payload.get("resolved_job_url") or "").strip() or None,
-                salary_text=str(job_payload.get("salary_text") or "").strip() or None,
                 observed_at=observed_at,
                 confidence_rank=0,
             )
@@ -7535,7 +7482,6 @@ def _load_historical_direct_url_hints(settings: Settings) -> dict[str, list[dict
                 role_title=str(raw_failure.get("role_title") or "").strip() or None,
                 source_url=str(raw_failure.get("source_url") or "").strip() or None,
                 direct_job_url=str(raw_failure.get("direct_job_url") or "").strip() or None,
-                salary_text=str(raw_failure.get("salary_text") or "").strip() or None,
                 observed_at=observed_at,
                 confidence_rank=1,
                 reason_code=str(raw_failure.get("reason_code") or "").strip() or None,
@@ -7549,29 +7495,17 @@ def _historical_direct_url_hint_for_lead(
 ) -> str | None:
     best_url: str | None = None
     best_priority: tuple[int, int, int, str] | None = None
-    keys = _historical_direct_url_key_candidates(
+    for key in _historical_direct_url_key_candidates(
         lead.company_name,
         lead.role_title,
         source_url=lead.source_url,
-    )
-    company_key = _historical_direct_url_company_key(lead.company_name)
-    if company_key and company_key not in keys:
-        keys.append(company_key)
-    current_salary_key = _normalized_salary_text_key(lead.salary_text_hint)
-    for key in keys:
+    ):
         source_key_match = key.startswith("source:")
-        company_key_match = key.startswith("company:")
         source_match_bonus = 100 if source_key_match else 0
         for entry in historical_direct_url_hints.get(key, []):
             direct_job_url = _normalize_direct_job_url(str(entry.get("direct_job_url") or "").strip())
             if not source_key_match and not _candidate_direct_job_url_is_trustworthy(direct_job_url, lead):
                 continue
-            if company_key_match:
-                entry_salary_key = _normalized_salary_text_key(str(entry.get("salary_text") or "").strip())
-                salary_match = bool(current_salary_key and entry_salary_key and current_salary_key == entry_salary_key)
-                role_similarity = _historical_role_similarity(lead.role_title, str(entry.get("role_title") or "").strip())
-                if not salary_match and role_similarity < 0.5:
-                    continue
             score = _url_candidate_score(direct_job_url, lead.role_title or lead.company_name or "Historical direct URL hint", lead)
             if score[0] <= 0:
                 continue
