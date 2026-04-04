@@ -54,6 +54,21 @@ THEME_COMMIT_SUMMARIES = {
     "salary_presumption_opportunity": "apply principal AI PM salary presumption",
     "general_iterative_improvement": "apply bounded iterative improvement",
 }
+FULL_WORKFLOW_RERUN_THEMES = {
+    "failure_repair",
+    "query_timeout_burden",
+    "low_fresh_discovery",
+    "linkedin_message_gap",
+    "plateau_breaker",
+    "coverage_regression",
+    "diversification_gap",
+    "company_discovery_gap",
+    "official_board_coverage_gap",
+    "discovery_starvation",
+    "company_concentration_gap",
+    "directory_source_yield_gap",
+    "general_iterative_improvement",
+}
 
 
 def _utc_now() -> datetime:
@@ -923,6 +938,23 @@ def _metric_comparison(
     return comparison
 
 
+def _theme_requires_full_workflow_rerun(selected_theme: str | None) -> bool:
+    return str(selected_theme or "").strip() in FULL_WORKFLOW_RERUN_THEMES
+
+
+def _workflow_rerun_timeout_seconds(
+    settings: Settings,
+    *,
+    timeout_seconds: int | None,
+) -> int | None:
+    configured_cap = max(0, int(settings.auto_loop_workflow_rerun_timeout_seconds or 0))
+    if timeout_seconds is None:
+        return configured_cap or None
+    if configured_cap <= 0:
+        return timeout_seconds
+    return min(timeout_seconds, configured_cap)
+
+
 def _rerun_metrics_are_acceptable(
     before_metrics: dict[str, float | int | None],
     after_metrics: dict[str, float | int | None],
@@ -1016,7 +1048,7 @@ def build_run_improvement_analysis(
     acceptance_checks = [
         "Run targeted tests for the changed area and then `PYTHONPATH=src .venv/bin/pytest -q` successfully.",
         "Leave the repository in a clean, committable state.",
-        "The controller will rerun the workflow for evidence after validation; you do not need to run it yourself.",
+        "The controller may rerun the workflow for evidence after validation when the selected theme changes end-to-end runtime behavior; you do not need to run it yourself.",
         "Do not commit or sync; the controller handles commits.",
     ]
     return RunImprovementAnalysis(
@@ -1440,7 +1472,33 @@ async def run_autonomous_loop(
             rerun_limit = max(0, settings.auto_loop_max_workflow_reruns_per_iteration)
             rerun_metrics_ok = rerun_limit == 0
             rerun_failure_summary: str | None = None
-            if rerun_limit > 0:
+            if rerun_limit > 0 and not _theme_requires_full_workflow_rerun(analysis.selected_theme):
+                rerun_metrics_ok = True
+                metric_comparison = {
+                    "rerun_policy": "skipped",
+                    "rerun_reason": (
+                        "The selected theme targets validation, replay, or history quality and does not require a full "
+                        "workflow evidence rerun."
+                    ),
+                    "selected_theme": analysis.selected_theme,
+                }
+                codex_result.workflow_rerun_run_ids = []
+                codex_result.workflow_rerun_count = 0
+                codex_result.metric_comparison = metric_comparison
+                write_auto_loop_status(
+                    settings,
+                    state,
+                    stage="rerun",
+                    message=(
+                        f"Skipping full workflow evidence rerun for iteration {iteration_number} because "
+                        f"`{analysis.selected_theme}` is a non-runtime change."
+                    ),
+                )
+            elif rerun_limit > 0:
+                rerun_timeout_seconds = _workflow_rerun_timeout_seconds(
+                    settings,
+                    timeout_seconds=timeout_seconds,
+                )
                 for rerun_index in range(1, rerun_limit + 1):
                     write_auto_loop_status(
                         settings,
@@ -1448,12 +1506,17 @@ async def run_autonomous_loop(
                         stage="rerun",
                         message=(
                             f"Running workflow evidence rerun {rerun_index}/{rerun_limit} "
-                            f"for iteration {iteration_number}."
+                            f"for iteration {iteration_number}"
+                            + (
+                                f" with a {rerun_timeout_seconds}s timeout cap."
+                                if rerun_timeout_seconds
+                                else "."
+                            )
                         ),
                     )
                     rerun_run_id, rerun_status, rerun_failure = await _run_workflow_attempt(
                         settings,
-                        timeout_seconds=timeout_seconds,
+                        timeout_seconds=rerun_timeout_seconds,
                     )
                     rerun_run_ids.append(rerun_run_id)
                     if rerun_status != "completed":

@@ -91,6 +91,7 @@ class Settings:
     ollama_sidecar_max_requests_per_run: int = 1
     ollama_sidecar_timeout_seconds: float = 20.0
     auto_loop_max_workflow_reruns_per_iteration: int = 2
+    auto_loop_workflow_rerun_timeout_seconds: int = 900
     company_discovery_indexer_enabled: bool = True
     company_discovery_frontier_budget_per_run: int = 12
     company_discovery_board_crawl_budget_per_run: int = 12
@@ -300,6 +301,10 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         auto_loop_max_workflow_reruns_per_iteration=max(
             0,
             int(os.getenv("AUTO_LOOP_MAX_WORKFLOW_RERUNS_PER_ITERATION", "2")),
+        ),
+        auto_loop_workflow_rerun_timeout_seconds=max(
+            0,
+            int(os.getenv("AUTO_LOOP_WORKFLOW_RERUN_TIMEOUT_SECONDS", "900")),
         ),
         company_discovery_indexer_enabled=os.getenv("COMPANY_DISCOVERY_INDEXER_ENABLED", "true").lower() == "true",
         company_discovery_frontier_budget_per_run=max(

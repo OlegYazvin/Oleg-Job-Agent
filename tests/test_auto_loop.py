@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 
 from job_agent.auto_loop import (
+    _theme_requires_full_workflow_rerun,
+    _workflow_rerun_timeout_seconds,
     build_run_improvement_analysis,
     ensure_baseline_commit,
     invoke_codex_iteration,
@@ -357,6 +359,22 @@ def test_build_run_improvement_analysis_detects_plateau_breaker_after_repeated_o
     assert "Recent selected themes:" in prompt
     assert "Recent theme streak: `ollama_idle` x5." in prompt
     assert "Do not spend this iteration on another micro-tweak in that same area" in prompt
+
+
+def test_theme_requires_full_workflow_rerun_focuses_on_runtime_themes() -> None:
+    assert _theme_requires_full_workflow_rerun("company_discovery_gap") is True
+    assert _theme_requires_full_workflow_rerun("query_timeout_burden") is True
+    assert _theme_requires_full_workflow_rerun("validation_hard_filter_burden") is False
+    assert _theme_requires_full_workflow_rerun("salary_presumption_opportunity") is False
+
+
+def test_workflow_rerun_timeout_seconds_caps_evidence_runs(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.auto_loop_workflow_rerun_timeout_seconds = 600
+
+    assert _workflow_rerun_timeout_seconds(settings, timeout_seconds=3600) == 600
+    assert _workflow_rerun_timeout_seconds(settings, timeout_seconds=300) == 300
+    assert _workflow_rerun_timeout_seconds(settings, timeout_seconds=None) == 600
 
 
 def test_build_run_improvement_analysis_does_not_prioritize_ollama_without_recent_successes(tmp_path: Path) -> None:
@@ -712,6 +730,89 @@ def test_run_autonomous_loop_continues_after_validation_failure(tmp_path: Path, 
     assert state.latest_commit_hash == "commit-2"
 
 
+def test_run_autonomous_loop_skips_full_rerun_for_validation_theme(tmp_path: Path, monkeypatch) -> None:
+    settings = build_settings(tmp_path)
+    settings.auto_loop_max_workflow_reruns_per_iteration = 2
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    workflow_timeout_calls: list[int | None] = []
+
+    async def fake_run_workflow_attempt(_settings: Settings, *, timeout_seconds: int | None = None):
+        workflow_timeout_calls.append(timeout_seconds)
+        return ("run-1", "completed", None)
+
+    def fake_analysis(_settings: Settings, *, iteration_number: int, run_id: str | None, failure_message: str | None = None):
+        return RunImprovementAnalysis(
+            iteration_number=iteration_number,
+            generated_at=datetime.now(UTC),
+            target_run_id=run_id,
+            analyzed_run_ids=[run_id] if run_id else [],
+            recent_selected_themes=[],
+            current_run_status="completed",
+            current_metrics={"fresh_new_leads_count": 8, "query_timeout_count": 2, "total_current_validated_jobs_count": 0},
+            metric_deltas={},
+            top_patterns=[
+                ImprovementPattern(
+                    key="validation_hard_filter_burden",
+                    summary="Reduce repeated salary/remote misses.",
+                    severity_score=10.0,
+                    evidence={},
+                )
+            ],
+            selected_theme="validation_hard_filter_burden",
+            selected_summary="Reduce repeated salary/remote misses.",
+            acceptance_checks=[],
+            artifact_paths={},
+        )
+
+    monkeypatch.setattr("job_agent.auto_loop._ensure_main_branch", lambda _settings: None)
+    monkeypatch.setattr("job_agent.auto_loop.ensure_baseline_commit", lambda _settings, iteration_number=1: "baseline123")
+    monkeypatch.setattr("job_agent.auto_loop._run_workflow_attempt", fake_run_workflow_attempt)
+    monkeypatch.setattr("job_agent.auto_loop.build_run_improvement_analysis", fake_analysis)
+    monkeypatch.setattr(
+        "job_agent.auto_loop.invoke_codex_iteration",
+        lambda *_args, **_kwargs: CodexIterationResult(
+            iteration_number=1,
+            generated_at=datetime.now(UTC),
+            status="succeeded",
+            session_id="session-1",
+            selected_theme="validation_hard_filter_burden",
+            summary="Applied a validation-focused fix.",
+        ),
+    )
+    monkeypatch.setattr(
+        "job_agent.auto_loop.run_validation_commands",
+        lambda _settings, *, iteration_number: [
+            ValidationCommandResult(
+                command="PYTHONPATH=src .venv/bin/pytest -q",
+                passed=True,
+                exit_code=0,
+                output_path=str(settings.auto_loop_dir / "iteration-01" / "validation-1.log"),
+            )
+        ],
+    )
+    monkeypatch.setattr("job_agent.auto_loop._git_head", lambda _settings: "head123")
+    monkeypatch.setattr("job_agent.auto_loop._working_tree_dirty", lambda _settings: True)
+    monkeypatch.setattr("job_agent.auto_loop._commit_all_changes", lambda _settings, _message: "commit-1")
+
+    state = asyncio.run(
+        run_autonomous_loop(
+            settings,
+            attempts=1,
+            show_gui=False,
+            timeout_seconds=1200,
+        )
+    )
+
+    result = json.loads((settings.auto_loop_dir / "iteration-01" / "result.json").read_text(encoding="utf-8"))
+
+    assert state.status == "stopped"
+    assert workflow_timeout_calls == [1200]
+    assert result["workflow_rerun_count"] == 0
+    assert result["metric_comparison"]["rerun_policy"] == "skipped"
+
+
 def test_build_run_improvement_analysis_can_prioritize_company_discovery_gap(tmp_path: Path) -> None:
     settings = build_settings(tmp_path)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -750,9 +851,11 @@ def test_build_run_improvement_analysis_can_prioritize_company_discovery_gap(tmp
 def test_run_autonomous_loop_records_workflow_rerun_evidence(tmp_path: Path, monkeypatch) -> None:
     settings = build_settings(tmp_path)
     settings.auto_loop_max_workflow_reruns_per_iteration = 1
+    settings.auto_loop_workflow_rerun_timeout_seconds = 600
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
+    workflow_timeout_calls: list[int | None] = []
     workflow_results = iter(
         [
             ("run-1", "completed", None),
@@ -761,6 +864,7 @@ def test_run_autonomous_loop_records_workflow_rerun_evidence(tmp_path: Path, mon
     )
 
     async def fake_run_workflow_attempt(_settings: Settings, *, timeout_seconds: int | None = None):
+        workflow_timeout_calls.append(timeout_seconds)
         return next(workflow_results)
 
     def fake_analysis(_settings: Settings, *, iteration_number: int, run_id: str | None, failure_message: str | None = None):
@@ -847,11 +951,12 @@ def test_run_autonomous_loop_records_workflow_rerun_evidence(tmp_path: Path, mon
     monkeypatch.setattr("job_agent.auto_loop._working_tree_dirty", lambda _settings: True)
     monkeypatch.setattr("job_agent.auto_loop._commit_all_changes", lambda _settings, _message: "commit-1")
 
-    state = asyncio.run(run_autonomous_loop(settings, attempts=1, show_gui=False, timeout_seconds=1))
+    state = asyncio.run(run_autonomous_loop(settings, attempts=1, show_gui=False, timeout_seconds=1200))
 
     assert state.status == "stopped"
     result_path = Path(state.iterations[0].result_path)
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     assert payload["workflow_rerun_count"] == 1
     assert payload["workflow_rerun_run_ids"] == ["run-1-rerun"]
+    assert workflow_timeout_calls == [1200, 600]
     assert payload["metric_comparison"]["after_fresh_new_leads_count"] == 5
