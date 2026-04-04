@@ -2102,7 +2102,9 @@ def test_is_ai_related_product_manager_accepts_direct_page_ai_context_even_if_ti
 def test_company_names_match_rejects_different_companies() -> None:
     assert _company_names_match("Coinbase", "Coinbase, Inc.")
     assert _company_names_match("GSK", "1925 GlaxoSmithKline LLC")
+    assert _company_names_match("Capital Group", "Capgroup")
     assert not _company_names_match("Coinbase", "Spindl")
+    assert not _company_names_match("Capital Group", "Capgemini")
 
 
 def test_extract_experience_years_floor_supports_range_and_plus_formats() -> None:
@@ -4627,6 +4629,84 @@ def test_resolve_lead_to_direct_job_url_uses_historical_direct_url_hint_when_loc
     assert resolution is not None
     assert resolution.direct_job_url == _normalize_direct_job_url(direct_job_url)
     assert "historically successful direct job URL" in resolution.evidence_notes
+
+
+def test_resolve_lead_to_direct_job_url_uses_company_level_historical_hint_for_close_role_variant(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    historical_source_url = "https://builtin.com/job/principal-product-manager-ai-measurement-reporting/8860707"
+    current_source_url = "https://builtin.com/job/ai-principal-product-manager/8923847"
+    direct_job_url = (
+        "https://capgroup.wd1.myworkdayjobs.com/capitalgroupcareers/job/Los-Angeles/"
+        "Principal-Product-Manager-of-AI-Measurement---Reporting_JR6359"
+    )
+    salary_text = "$208,245-$354,017"
+    (settings.data_dir / "run-20260404-000000.json").write_text(
+        json.dumps(
+            {
+                "manifest": {"generated_at": "2026-04-04T10:00:00+00:00"},
+                "bundles": [],
+                "search_diagnostics": {
+                    "failures": [
+                        {
+                            "stage": "resolution",
+                            "reason_code": "company_mismatch",
+                            "detail": "Lead direct URL company hint 'Capgroup' did not match expected company 'Capital Group'.",
+                            "company_name": "Capital Group",
+                            "role_title": "Principal Product Manager of AI Measurement & Reporting",
+                            "source_url": historical_source_url,
+                            "direct_job_url": direct_job_url,
+                            "posted_date_text": "2026-03-25",
+                            "salary_text": salary_text,
+                            "is_remote": True,
+                            "attempt_number": 1,
+                            "round_number": 0,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    lead = JobLead(
+        company_name="Capital Group",
+        role_title="AI Principal Product Manager",
+        source_url=current_source_url,
+        source_type="builtin",
+        is_remote_hint=True,
+        posted_date_hint="2026-04-01",
+        salary_text_hint=salary_text,
+        evidence_notes="Built In source disclosed remote salary hints for this AI PM role.",
+    )
+
+    async def fake_extract_direct_job_url_from_source(_lead: JobLead) -> str | None:
+        return None
+
+    async def fake_resolve_lead_via_company_careers_pages(_lead: JobLead) -> DirectJobResolution | None:
+        return None
+
+    monkeypatch.setattr(
+        "job_agent.job_search._extract_direct_job_url_from_source",
+        fake_extract_direct_job_url_from_source,
+    )
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_via_company_careers_pages",
+        fake_resolve_lead_via_company_careers_pages,
+    )
+
+    resolution = asyncio.run(
+        _resolve_lead_to_direct_job_url(
+            None,
+            lead,
+            historical_direct_url_hints=_load_historical_direct_url_hints(settings),
+        )
+    )
+
+    assert resolution is not None
+    assert resolution.direct_job_url == _normalize_direct_job_url(direct_job_url)
 
 
 def test_repair_direct_job_url_uses_historical_direct_url_hint_before_agent(monkeypatch, tmp_path: Path) -> None:
