@@ -3949,6 +3949,127 @@ def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_witho
     assert with_override[0].company_name == "RepeatCo"
 
 
+def test_annotate_and_filter_resolution_leads_preserves_recently_validated_direct_replay_leads_with_zero_quality_score(
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    direct_job_url = "https://uscareers-yelp.icims.com/jobs/13442/principal-product-manager---applied-ml/job"
+    lead = JobLead(
+        company_name="Yelp",
+        role_title="Principal Product Manager - Applied ML (Remote - United States)",
+        source_url=direct_job_url,
+        source_type="direct_ats",
+        direct_job_url=direct_job_url,
+        location_hint="Remote - United States",
+        is_remote_hint=True,
+        posted_date_hint=None,
+        evidence_notes="Previously validated direct ATS role.",
+    )
+    watchlist = {
+        "yelp": {
+            "company_name": "Yelp",
+            "watch_count": 2945,
+            "last_reason_code": "fetch_non_200",
+            "recent_rejection_reasons": {
+                "stale_posting": 1178,
+                "resolution_missing": 1178,
+                "fetch_non_200": 589,
+            },
+        }
+    }
+
+    without_history = _annotate_and_filter_resolution_leads([lead], settings, watchlist)
+    assert without_history == []
+
+    recent_reported_at = f"{date.today().isoformat()}T10:00:00+00:00"
+    (settings.data_dir / "job-history.json").write_text(
+        json.dumps(
+            {
+                direct_job_url: {
+                    "job_key": direct_job_url,
+                    "canonical_job_key": direct_job_url,
+                    "normalized_job_url": direct_job_url,
+                    "company_name": "Yelp",
+                    "role_title": lead.role_title,
+                    "first_reported_at": recent_reported_at,
+                    "last_reported_at": recent_reported_at,
+                    "report_count": 4,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (settings.data_dir / "company-history.json").write_text("{}", encoding="utf-8")
+    (settings.data_dir / "run-history.json").write_text("[]", encoding="utf-8")
+
+    with_history = _annotate_and_filter_resolution_leads([lead], settings, watchlist)
+
+    assert len(with_history) == 1
+    assert with_history[0].company_name == "Yelp"
+    assert with_history[0].source_quality_score_hint == 3
+
+
+def test_annotate_and_filter_resolution_leads_preserves_recently_validated_low_signal_direct_replay_leads(
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    direct_job_url = "https://jobs.lever.co/acme/low-signal-ai-role"
+    lead = JobLead(
+        company_name="Acme",
+        role_title="Senior Product Manager - Growth",
+        source_url=direct_job_url,
+        source_type="direct_ats",
+        direct_job_url=direct_job_url,
+        location_hint="Remote",
+        is_remote_hint=True,
+        posted_date_hint=None,
+        salary_text_hint="$180,000 - $220,000",
+        evidence_notes="Previously validated AI product manager role from a direct ATS page.",
+    )
+    watchlist = {
+        "acme": {
+            "company_name": "Acme",
+            "watch_count": 1178,
+            "last_reason_code": "resolution_missing",
+            "recent_rejection_reasons": {
+                "resolution_missing": 1178,
+            },
+        }
+    }
+
+    without_history = _annotate_and_filter_resolution_leads([lead], settings, watchlist)
+    assert without_history == []
+
+    recent_reported_at = f"{date.today().isoformat()}T10:00:00+00:00"
+    (settings.data_dir / "job-history.json").write_text(
+        json.dumps(
+            {
+                direct_job_url: {
+                    "job_key": direct_job_url,
+                    "canonical_job_key": direct_job_url,
+                    "normalized_job_url": direct_job_url,
+                    "company_name": "Acme",
+                    "role_title": lead.role_title,
+                    "first_reported_at": recent_reported_at,
+                    "last_reported_at": recent_reported_at,
+                    "report_count": 3,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (settings.data_dir / "company-history.json").write_text("{}", encoding="utf-8")
+    (settings.data_dir / "run-history.json").write_text("[]", encoding="utf-8")
+
+    with_history = _annotate_and_filter_resolution_leads([lead], settings, watchlist)
+
+    assert len(with_history) == 1
+    assert with_history[0].company_name == "Acme"
+    assert with_history[0].source_quality_score_hint == 3
+
+
 def test_normalize_and_filter_discovery_leads_keeps_supported_job_board_pages_without_direct_urls() -> None:
     lead = JobLead(
         company_name="Acme",
