@@ -36,6 +36,45 @@ KNOWN_BOARD_HOST_FRAGMENTS = (
     "ats.rippling.com",
 )
 
+BUILTIN_HOST_FRAGMENTS = (
+    "builtin.com",
+    "builtinnyc.com",
+    "builtinsf.com",
+    "builtinseattle.com",
+    "builtinla.com",
+    "builtinchicago.org",
+    "builtinchicago.com",
+    "builtincharlotte.com",
+    "builtinboston.com",
+    "builtincolorado.com",
+)
+
+SOCIAL_PROFILE_HOST_FRAGMENTS = (
+    "linkedin.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "facebook.com",
+    "youtube.com",
+    "tiktok.com",
+)
+
+DIRECTORY_PORTAL_HOST_FRAGMENTS = (
+    "ycombinator.com",
+    "workatastartup.com",
+    "wellfound.com",
+    "knowledgebase.builtin.com",
+    "employers.builtin.com",
+    *BUILTIN_HOST_FRAGMENTS,
+)
+
+RECURSIVE_PLATFORM_HOST_FRAGMENTS = (
+    "knowledgebase.builtin.com",
+    "employers.builtin.com",
+    *BUILTIN_HOST_FRAGMENTS,
+    *SOCIAL_PROFILE_HOST_FRAGMENTS,
+)
+
 COMMON_CAREERS_PATHS = (
     "/careers",
     "/jobs",
@@ -98,6 +137,88 @@ def _dedupe_strings(values: list[str], *, limit: int) -> list[str]:
         if len(ordered) >= limit:
             break
     return ordered
+
+
+def _host_matches_fragment(host: str, fragment: str) -> bool:
+    lowered_host = str(host or "").lower()
+    lowered_fragment = str(fragment or "").lower()
+    return lowered_host == lowered_fragment or lowered_host.endswith(f".{lowered_fragment}")
+
+
+def _slug_to_company_name(slug: str, *, company_name_hint: str | None = None) -> str:
+    hint = re.sub(r"\s+", " ", str(company_name_hint or "").strip())
+    hint = re.sub(r"^(?:view|see|get)\s+(?:all\s+)?jobs?\s+(?:at|for)\s+", "", hint, flags=re.I)
+    hint = re.sub(r"^(?:jobs?|careers?)\s+(?:at|for)\s+", "", hint, flags=re.I)
+    hint = re.sub(r"\s+(?:jobs?|careers?)$", "", hint, flags=re.I)
+    hint_key = _normalize_company_key(hint)
+    if (
+        hint
+        and len(hint) <= 80
+        and re.search(r"[A-Za-z]", hint)
+        and not hint_key.startswith("builtin")
+        and hint_key not in {"linkedin", "twitter", "instagram", "facebook", "youtube", "tiktok", "x"}
+    ):
+        return hint
+    cleaned_slug = re.sub(r"[-_](?:\d+)$", "", str(slug or "").strip())
+    words = [word for word in re.split(r"[-_]+", cleaned_slug) if word]
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def _directory_company_candidate(
+    url: str | None,
+    *,
+    company_name_hint: str | None = None,
+) -> dict[str, str] | None:
+    normalized = str(url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments:
+        return None
+
+    slug: str | None = None
+    task_type = "company_page"
+    if any(_host_matches_fragment(host, fragment) for fragment in BUILTIN_HOST_FRAGMENTS):
+        if len(segments) >= 2 and segments[0] == "company":
+            slug = segments[1]
+            if len(segments) >= 3 and segments[2] == "jobs":
+                task_type = "careers_root"
+    elif _host_matches_fragment(host, "ycombinator.com"):
+        if len(segments) >= 2 and segments[0] == "companies":
+            slug = segments[1]
+            if len(segments) >= 3 and segments[2] == "jobs":
+                task_type = "careers_root"
+    elif _host_matches_fragment(host, "workatastartup.com"):
+        if len(segments) >= 2 and segments[0] in {"companies", "company"}:
+            slug = segments[1]
+            if len(segments) >= 3 and segments[2] == "jobs":
+                task_type = "careers_root"
+    elif _host_matches_fragment(host, "wellfound.com"):
+        if len(segments) >= 2 and segments[0] in {"company", "companies", "organization", "organizations"}:
+            slug = segments[1]
+            if len(segments) >= 3 and segments[2] == "jobs":
+                task_type = "careers_root"
+
+    if not slug:
+        return None
+    company_name = _slug_to_company_name(slug, company_name_hint=company_name_hint)
+    if not company_name:
+        return None
+    return {
+        "url": normalized.rstrip("/"),
+        "company_name": company_name,
+        "task_type": task_type,
+    }
+
+
+def _is_blocked_external_company_homepage_host(host: str) -> bool:
+    return any(_host_matches_fragment(host, fragment) for fragment in (*DIRECTORY_PORTAL_HOST_FRAGMENTS, *SOCIAL_PROFILE_HOST_FRAGMENTS))
+
+
+def _is_recursive_platform_host(host: str) -> bool:
+    return any(_host_matches_fragment(host, fragment) for fragment in RECURSIVE_PLATFORM_HOST_FRAGMENTS)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -165,7 +286,20 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
             task = CompanyDiscoveryFrontierTask.model_validate(raw_task)
         except Exception:
             continue
-        tasks.append(task.model_dump(mode="json"))
+        rendered = task.model_dump(mode="json")
+        task_type = str(rendered.get("task_type") or "")
+        candidate = _directory_company_candidate(
+            str(rendered.get("url") or ""),
+            company_name_hint=str(rendered.get("company_name") or "").strip() or None,
+        )
+        if task_type != "directory_source" and candidate is None:
+            host = (urlparse(str(rendered.get("url") or "")).netloc or "").lower()
+            if _is_recursive_platform_host(host):
+                continue
+        if candidate is not None:
+            rendered["company_name"] = candidate["company_name"]
+            rendered["company_key"] = _normalize_company_key(candidate["company_name"]) or None
+        tasks.append(rendered)
     return tasks
 
 
@@ -415,8 +549,33 @@ def extract_company_homepage_urls(page_url: str, html: str) -> list[str]:
             continue
         if any(fragment in host for fragment in LOW_TRUST_SCOUT_HOST_FRAGMENTS):
             continue
+        if _is_blocked_external_company_homepage_host(host):
+            continue
         candidates.append(f"{parsed.scheme}://{parsed.netloc}")
     return _dedupe_strings(candidates, limit=16)
+
+
+def extract_directory_company_tasks(page_url: str, html: str) -> list[dict[str, str]]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates_by_url: dict[str, dict[str, str]] = {}
+
+    for tag in soup.find_all("a"):
+        href = str(tag.get("href") or "").strip()
+        if not href:
+            continue
+        resolved = urljoin(page_url, href)
+        candidate = _directory_company_candidate(
+            resolved,
+            company_name_hint=tag.get_text(" ", strip=True),
+        )
+        if candidate is None:
+            continue
+        existing = candidates_by_url.get(candidate["url"])
+        if existing is None or len(candidate["company_name"]) > len(existing["company_name"]):
+            candidates_by_url[candidate["url"]] = candidate
+
+    ordered = sorted(candidates_by_url.values(), key=lambda item: (item["task_type"] != "careers_root", item["url"]))
+    return ordered[:24]
 
 
 def default_careers_candidate_urls(source_url: str | None) -> list[str]:
@@ -648,6 +807,23 @@ def source_directory_seed_tasks() -> list[dict[str, Any]]:
             )
         )
     return tasks
+
+
+def is_low_value_company_discovery_entry(entry: Mapping[str, Any]) -> bool:
+    if int(entry.get("official_board_lead_count") or 0) > 0:
+        return False
+    if int(entry.get("ai_pm_candidate_count") or 0) > 0:
+        return False
+    if int(entry.get("recent_fresh_role_count") or 0) > 0:
+        return False
+    if [item for item in entry.get("board_identifiers") or [] if str(item).strip()]:
+        return False
+    if [item for item in entry.get("board_urls") or [] if str(item).strip()]:
+        return False
+    source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
+    if not source_hosts:
+        return False
+    return all(_is_recursive_platform_host(host) for host in source_hosts)
 
 
 def upsert_company_discovery_entry(

@@ -28,9 +28,11 @@ from .company_discovery import (
     company_discovery_index_path,
     default_careers_candidate_urls,
     extract_careers_page_urls,
+    extract_directory_company_tasks,
     extract_company_homepage_urls,
     extract_embedded_board_urls,
     infer_careers_root,
+    is_low_value_company_discovery_entry,
     load_company_discovery_audit,
     load_company_discovery_crawl_history,
     load_company_discovery_entries,
@@ -6085,15 +6087,20 @@ async def _collect_company_discovery_seed_leads(
         for seeded_task in source_directory_seed_tasks():
             upsert_frontier_task(frontier, **_frontier_task_kwargs(seeded_task))
 
-        for company_key, entry in sorted(
-            entries.items(),
-            key=lambda item: (
-                -int(item[1].get("official_board_lead_count") or 0),
-                -int(item[1].get("recent_fresh_role_count") or 0),
-                -int(item[1].get("source_trust") or 0),
-                str(item[1].get("company_name") or ""),
-            ),
-        )[:40]:
+        ranked_entries = [
+            (company_key, entry)
+            for company_key, entry in sorted(
+                entries.items(),
+                key=lambda item: (
+                    -int(item[1].get("official_board_lead_count") or 0),
+                    -int(item[1].get("recent_fresh_role_count") or 0),
+                    -int(item[1].get("source_trust") or 0),
+                    str(item[1].get("company_name") or ""),
+                ),
+            )
+            if not is_low_value_company_discovery_entry(entry)
+        ]
+        for company_key, entry in ranked_entries[:40]:
             company_name = str(entry.get("company_name") or "").strip() or _title_case_company_name(company_key)
             priority = max(
                 4,
@@ -6137,17 +6144,26 @@ async def _collect_company_discovery_seed_leads(
                     error="fetch_failed",
                 )
                 continue
-            company_urls = extract_company_homepage_urls(task_url, html)
             discovered_count = 0
+            for candidate in extract_directory_company_tasks(task_url, html):
+                if _queue_frontier_url(
+                    url=str(candidate.get("url") or "").strip(),
+                    company_name=str(candidate.get("company_name") or "").strip() or None,
+                    discovered_from=task_url,
+                    priority=9 if str(candidate.get("task_type") or "") == "careers_root" else 8,
+                    preferred_task_type=str(candidate.get("task_type") or "").strip() or "company_page",
+                ):
+                    discovered_count += 1
+            company_urls = extract_company_homepage_urls(task_url, html)
             for homepage in company_urls:
-                _queue_frontier_url(
+                if _queue_frontier_url(
                     url=homepage,
                     company_name=None,
                     discovered_from=task_url,
                     priority=6,
                     preferred_task_type="company_page",
-                )
-                discovered_count += 1
+                ):
+                    discovered_count += 1
             _increment_metric_count(source_adapter_yields, str(task.get("task_type") or "directory_source"), discovered_count)
             update_frontier_task_state(frontier, task_key=task_key, success=True)
             record_crawl_result(
