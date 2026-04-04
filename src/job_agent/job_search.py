@@ -7361,6 +7361,168 @@ def _load_historical_seed_leads(settings: Settings) -> list[JobLead]:
     return leads
 
 
+def _historical_direct_url_key_candidates(
+    company_name: str | None,
+    role_title: str | None,
+    *,
+    source_url: str | None = None,
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    normalized_source_url = _normalize_direct_job_url(source_url or "")
+    if normalized_source_url:
+        source_key = f"source:{normalized_source_url}"
+        seen.add(source_key)
+        candidates.append(source_key)
+    if str(company_name or "").strip() and str(role_title or "").strip():
+        role_key = f"role:{_normalize_job_key(str(company_name), str(role_title))}"
+        if role_key not in seen:
+            candidates.append(role_key)
+    return candidates
+
+
+def _record_historical_direct_url_hint(
+    hints: dict[str, list[dict[str, object]]],
+    *,
+    company_name: str | None,
+    role_title: str | None,
+    source_url: str | None,
+    direct_job_url: str | None,
+    observed_at: str | None,
+    confidence_rank: int,
+    reason_code: str | None = None,
+) -> None:
+    normalized_direct_job_url = _normalize_direct_job_url(direct_job_url or "")
+    if not normalized_direct_job_url:
+        return
+    if not _is_allowed_direct_job_url(normalized_direct_job_url) or _looks_like_generic_job_url(normalized_direct_job_url):
+        return
+    if reason_code in {"resolution_missing", "company_mismatch", "not_specific_job_page", "resolution_blocked_url"}:
+        return
+
+    payload = {
+        "direct_job_url": normalized_direct_job_url,
+        "observed_at": str(observed_at or "").strip(),
+        "confidence_rank": confidence_rank,
+    }
+    for key in _historical_direct_url_key_candidates(
+        company_name,
+        role_title,
+        source_url=source_url,
+    ):
+        bucket = hints.setdefault(key, [])
+        existing = next(
+            (entry for entry in bucket if str(entry.get("direct_job_url") or "").strip() == normalized_direct_job_url),
+            None,
+        )
+        if existing is None:
+            bucket.append(payload)
+            continue
+        existing_rank_raw = existing.get("confidence_rank")
+        existing_rank = int(existing_rank_raw) if existing_rank_raw is not None else 99
+        existing_observed_at = str(existing.get("observed_at") or "")
+        if confidence_rank < existing_rank or (
+            confidence_rank == existing_rank and str(observed_at or "").strip() > existing_observed_at
+        ):
+            existing.update(payload)
+
+
+def _load_historical_direct_url_hints(settings: Settings) -> dict[str, list[dict[str, object]]]:
+    hints: dict[str, list[dict[str, object]]] = {}
+    for path in sorted(settings.data_dir.glob("run-*.json"), reverse=True)[:180]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        observed_at = str((payload.get("manifest") or {}).get("generated_at") or path.stem).strip()
+        for job_payload in payload.get("reacquired_jobs", []):
+            if not isinstance(job_payload, dict):
+                continue
+            _record_historical_direct_url_hint(
+                hints,
+                company_name=str(job_payload.get("company_name") or "").strip() or None,
+                role_title=str(job_payload.get("role_title") or "").strip() or None,
+                source_url=None,
+                direct_job_url=str(job_payload.get("direct_job_url") or job_payload.get("resolved_job_url") or "").strip() or None,
+                observed_at=observed_at,
+                confidence_rank=0,
+            )
+        for bundle in payload.get("bundles", []):
+            if not isinstance(bundle, dict):
+                continue
+            job_payload = bundle.get("job")
+            if not isinstance(job_payload, dict):
+                continue
+            lead_payload = bundle.get("lead")
+            source_url = None
+            if isinstance(lead_payload, dict):
+                source_url = str(lead_payload.get("source_url") or "").strip() or None
+            _record_historical_direct_url_hint(
+                hints,
+                company_name=str(job_payload.get("company_name") or "").strip() or None,
+                role_title=str(job_payload.get("role_title") or "").strip() or None,
+                source_url=source_url,
+                direct_job_url=str(job_payload.get("direct_job_url") or job_payload.get("resolved_job_url") or "").strip() or None,
+                observed_at=observed_at,
+                confidence_rank=0,
+            )
+        diagnostics = payload.get("search_diagnostics")
+        failures = diagnostics.get("failures") if isinstance(diagnostics, dict) else None
+        if not isinstance(failures, list):
+            continue
+        for raw_failure in failures:
+            if not isinstance(raw_failure, dict):
+                continue
+            _record_historical_direct_url_hint(
+                hints,
+                company_name=str(raw_failure.get("company_name") or "").strip() or None,
+                role_title=str(raw_failure.get("role_title") or "").strip() or None,
+                source_url=str(raw_failure.get("source_url") or "").strip() or None,
+                direct_job_url=str(raw_failure.get("direct_job_url") or "").strip() or None,
+                observed_at=observed_at,
+                confidence_rank=1,
+                reason_code=str(raw_failure.get("reason_code") or "").strip() or None,
+            )
+    return hints
+
+
+def _historical_direct_url_hint_for_lead(
+    lead: JobLead,
+    historical_direct_url_hints: dict[str, list[dict[str, object]]],
+) -> str | None:
+    best_url: str | None = None
+    best_priority: tuple[int, int, int, str] | None = None
+    for key in _historical_direct_url_key_candidates(
+        lead.company_name,
+        lead.role_title,
+        source_url=lead.source_url,
+    ):
+        source_key_match = key.startswith("source:")
+        source_match_bonus = 100 if source_key_match else 0
+        for entry in historical_direct_url_hints.get(key, []):
+            direct_job_url = _normalize_direct_job_url(str(entry.get("direct_job_url") or "").strip())
+            if not source_key_match and not _candidate_direct_job_url_is_trustworthy(direct_job_url, lead):
+                continue
+            score = _url_candidate_score(direct_job_url, lead.role_title or lead.company_name or "Historical direct URL hint", lead)
+            if score[0] <= 0:
+                continue
+            confidence_rank_raw = entry.get("confidence_rank")
+            confidence_rank = int(confidence_rank_raw) if confidence_rank_raw is not None else 99
+            priority = (
+                source_match_bonus + score[0],
+                score[1],
+                -confidence_rank,
+                str(entry.get("observed_at") or ""),
+            )
+            if best_priority is None or priority > best_priority:
+                best_priority = priority
+                best_url = direct_job_url
+    return best_url
+
+
 def _collect_replay_seed_leads(settings: Settings) -> list[JobLead]:
     validated_job_history_index = load_validated_job_history_index(settings.data_dir)
     file_seed_leads = [
@@ -7412,11 +7574,14 @@ async def _replay_seed_leads(
     track_as_seed_replay: bool = True,
     company_discovery_entries: dict[str, dict[str, object]] | None = None,
     status_label: str | None = None,
+    historical_direct_url_hints: dict[str, list[dict[str, object]]] | None = None,
 ) -> tuple[int, int]:
     if not seed_leads:
         return total_unique_leads, resolved_leads_this_attempt
     if settings.company_discovery_enabled and company_discovery_entries is None:
         company_discovery_entries = load_company_discovery_entries(settings.data_dir)
+    if historical_direct_url_hints is None:
+        historical_direct_url_hints = _load_historical_direct_url_hints(settings)
 
     replay_seed_leads = _dedupe_round_leads(seed_leads, settings)
     replay_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
@@ -7633,6 +7798,7 @@ async def _replay_seed_leads(
                     resolution_agent=resolution_agent,
                     attempt_number=attempt_number,
                     round_number=0,
+                    historical_direct_url_hints=historical_direct_url_hints,
                 ),
                 timeout=lead_timeout_seconds,
             )
@@ -9021,7 +9187,12 @@ async def _resolve_lead_via_company_careers_pages(lead: JobLead) -> DirectJobRes
     )
 
 
-async def _resolve_lead_to_direct_job_url(agent: Agent | None, lead: JobLead) -> DirectJobResolution | None:
+async def _resolve_lead_to_direct_job_url(
+    agent: Agent | None,
+    lead: JobLead,
+    *,
+    historical_direct_url_hints: dict[str, list[dict[str, object]]] | None = None,
+) -> DirectJobResolution | None:
     locally_resolved_url = await _extract_direct_job_url_from_source(lead)
     if locally_resolved_url:
         return DirectJobResolution(
@@ -9030,6 +9201,16 @@ async def _resolve_lead_to_direct_job_url(agent: Agent | None, lead: JobLead) ->
             ats_platform=urlparse(locally_resolved_url).netloc,
             evidence_notes="Resolved locally from the discovered source page.",
         )
+
+    if historical_direct_url_hints:
+        historical_direct_url = _historical_direct_url_hint_for_lead(lead, historical_direct_url_hints)
+        if historical_direct_url:
+            return DirectJobResolution(
+                accepted=True,
+                direct_job_url=historical_direct_url,
+                ats_platform=urlparse(historical_direct_url).netloc,
+                evidence_notes="Resolved from a historically successful direct job URL for the same lead.",
+            )
 
     company_site_resolution = await _resolve_lead_via_company_careers_pages(lead)
     if company_site_resolution:
@@ -9053,11 +9234,18 @@ async def _repair_direct_job_url(
     lead: JobLead,
     bad_direct_url: str,
     failure_reason: str,
+    *,
+    historical_direct_url_hints: dict[str, list[dict[str, object]]] | None = None,
 ) -> str | None:
     retry_lead = lead.model_copy(update={"direct_job_url": None})
     local_retry = await _extract_direct_job_url_from_source(retry_lead)
     if local_retry and local_retry != bad_direct_url and _is_allowed_direct_job_url(local_retry):
         return local_retry
+
+    if historical_direct_url_hints:
+        historical_retry = _historical_direct_url_hint_for_lead(retry_lead, historical_direct_url_hints)
+        if historical_retry and historical_retry != bad_direct_url and _is_allowed_direct_job_url(historical_retry):
+            return historical_retry
 
     company_site_retry = await _resolve_lead_via_company_careers_pages(retry_lead)
     if company_site_retry and company_site_retry.direct_job_url:
@@ -10122,6 +10310,7 @@ async def _validate_candidate(
     resolution_agent: Agent | None,
     attempt_number: int,
     round_number: int,
+    historical_direct_url_hints: dict[str, list[dict[str, object]]] | None = None,
 ) -> tuple[JobPosting | None, SearchFailure | None, NearMissJob | None, FalseNegativeAuditEntry | None]:
     snapshot = await fetch_job_page(str(candidate.direct_job_url))
     if snapshot.status_code != 200:
@@ -10130,6 +10319,7 @@ async def _validate_candidate(
             lead,
             str(candidate.direct_job_url),
             f"HTTP {snapshot.status_code}",
+            historical_direct_url_hints=historical_direct_url_hints,
         )
         if repaired_url:
             candidate = candidate.model_copy(update={"direct_job_url": repaired_url, "resolved_job_url": repaired_url})
@@ -10188,6 +10378,7 @@ async def _validate_candidate(
             lead,
             str(candidate.direct_job_url),
             "Resolved to a generic board index or invalid job page.",
+            historical_direct_url_hints=historical_direct_url_hints,
         )
         if repaired_url:
             candidate = candidate.model_copy(update={"direct_job_url": repaired_url, "resolved_job_url": repaired_url})
@@ -10219,6 +10410,7 @@ async def _validate_candidate(
             lead,
             str(merged_job.direct_job_url),
             detail,
+            historical_direct_url_hints=historical_direct_url_hints,
         )
         if repaired_url:
             repaired_candidate = candidate.model_copy(update={"direct_job_url": repaired_url, "resolved_job_url": repaired_url})
@@ -10297,6 +10489,7 @@ async def find_matching_jobs(
     company_watchlist = load_company_watchlist_entries(settings.data_dir)
     company_discovery_entries = load_company_discovery_entries(settings.data_dir) if settings.company_discovery_enabled else {}
     failed_lead_history = _load_failed_lead_history(settings)
+    historical_direct_url_hints = _load_historical_direct_url_hints(settings)
     query_family_history = _load_query_family_history(settings)
     query_family_metrics: dict[str, dict[str, int]] = {}
     seen_lead_keys: set[str] = set()
@@ -10412,6 +10605,7 @@ async def find_matching_jobs(
                         run_id=run_id,
                         track_as_seed_replay=False,
                         company_discovery_entries=company_discovery_entries,
+                        historical_direct_url_hints=historical_direct_url_hints,
                         status_label=(
                             f"Pass {attempt_number}, company discovery surfaced "
                             f"{len(company_discovery_seed_leads)} official ATS candidates."
@@ -10444,6 +10638,7 @@ async def find_matching_jobs(
                 status=status,
                 run_id=run_id,
                 company_discovery_entries=company_discovery_entries,
+                historical_direct_url_hints=historical_direct_url_hints,
             )
             if len(jobs_by_url) >= stop_goal:
                 diagnostics.unique_leads_discovered = total_unique_leads
@@ -10749,7 +10944,11 @@ async def find_matching_jobs(
                 resolved_leads_this_attempt += 1
                 try:
                     resolution = await asyncio.wait_for(
-                        _resolve_lead_to_direct_job_url(resolution_agent, lead),
+                        _resolve_lead_to_direct_job_url(
+                            resolution_agent,
+                            lead,
+                            historical_direct_url_hints=historical_direct_url_hints,
+                        ),
                         timeout=lead_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
@@ -10930,6 +11129,7 @@ async def find_matching_jobs(
                             resolution_agent=resolution_agent,
                             attempt_number=attempt_number,
                             round_number=round_number,
+                            historical_direct_url_hints=historical_direct_url_hints,
                         ),
                         timeout=lead_timeout_seconds,
                     )

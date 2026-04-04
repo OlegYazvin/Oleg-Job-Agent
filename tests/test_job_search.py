@@ -63,6 +63,7 @@ from job_agent.job_search import (
     _lead_is_reacquisition_eligible,
     _lead_priority,
     _load_seed_leads_from_file,
+    _load_historical_direct_url_hints,
     _load_failed_lead_history,
     _job_posting_dedupe_key,
     _is_duckduckgo_anomaly_page,
@@ -93,6 +94,7 @@ from job_agent.job_search import (
     _replay_seed_leads,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
+    _resolve_lead_to_direct_job_url,
     _resolve_lead_via_company_careers_pages,
     _salary_is_base_salary,
     _search_single_query,
@@ -2869,7 +2871,16 @@ def test_replay_seed_leads_preserves_reacquisition_candidates_ahead_of_company_n
         quota_inputs.append([lead.company_name for lead in leads])
         return [lead for lead in leads if lead.company_name == "Novel AI"][:limit]
 
-    async def fake_validate_candidate(lead, candidate, settings, *, resolution_agent, attempt_number, round_number):
+    async def fake_validate_candidate(
+        lead,
+        candidate,
+        settings,
+        *,
+        resolution_agent,
+        attempt_number,
+        round_number,
+        historical_direct_url_hints=None,
+    ):
         return (
             JobPosting(
                 company_name=lead.company_name,
@@ -4542,6 +4553,152 @@ def test_repair_direct_job_url_uses_company_careers_resolution_before_agent(monk
     )
 
     assert repaired == "https://jobs.lever.co/versapay/1305d3eb-5d36-4a7b-86d7-9c2ab53f83d4"
+
+
+def test_resolve_lead_to_direct_job_url_uses_historical_direct_url_hint_when_local_resolution_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    source_url = "https://builtin.com/job/principal-product-manager-ai-factory/8208619"
+    direct_job_url = "https://app.careerpuck.com/job-board/domino-data-lab/job/7527281?gh_jid=7527281&gh_src=e01c747f1us"
+    (settings.data_dir / "run-20260404-000000.json").write_text(
+        json.dumps(
+            {
+                "manifest": {"generated_at": "2026-04-04T10:00:00+00:00"},
+                "bundles": [],
+                "search_diagnostics": {
+                    "failures": [
+                        {
+                            "stage": "validation",
+                            "reason_code": "not_remote",
+                            "detail": "Role was not clearly fully remote.",
+                            "company_name": "Domino Data Lab",
+                            "role_title": "Principal Product Manager, AI Factory",
+                            "source_url": source_url,
+                            "direct_job_url": direct_job_url,
+                            "posted_date_text": "2026-03-28",
+                            "salary_text": "$250,000",
+                            "is_remote": True,
+                            "attempt_number": 1,
+                            "round_number": 1,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url=source_url,
+        source_type="builtin",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-28",
+        salary_text_hint="$250,000",
+        evidence_notes="Built In source disclosed remote salary hints for this AI PM role.",
+    )
+
+    async def fake_extract_direct_job_url_from_source(_lead: JobLead) -> str | None:
+        return None
+
+    async def fake_resolve_lead_via_company_careers_pages(_lead: JobLead) -> DirectJobResolution | None:
+        return None
+
+    monkeypatch.setattr(
+        "job_agent.job_search._extract_direct_job_url_from_source",
+        fake_extract_direct_job_url_from_source,
+    )
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_via_company_careers_pages",
+        fake_resolve_lead_via_company_careers_pages,
+    )
+
+    resolution = asyncio.run(
+        _resolve_lead_to_direct_job_url(
+            None,
+            lead,
+            historical_direct_url_hints=_load_historical_direct_url_hints(settings),
+        )
+    )
+
+    assert resolution is not None
+    assert resolution.direct_job_url == _normalize_direct_job_url(direct_job_url)
+    assert "historically successful direct job URL" in resolution.evidence_notes
+
+
+def test_repair_direct_job_url_uses_historical_direct_url_hint_before_agent(monkeypatch, tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    source_url = "https://builtin.com/job/principal-product-manager-ai-factory/8208619"
+    historical_direct_job_url = "https://app.careerpuck.com/job-board/domino-data-lab/job/7527281?gh_jid=7527281&gh_src=e01c747f1us"
+    bad_direct_job_url = "https://jobs.dominos.com/us/jobs/supply-chain"
+    (settings.data_dir / "run-20260404-000000.json").write_text(
+        json.dumps(
+            {
+                "manifest": {"generated_at": "2026-04-04T10:00:00+00:00"},
+                "bundles": [],
+                "search_diagnostics": {
+                    "failures": [
+                        {
+                            "stage": "validation",
+                            "reason_code": "not_remote",
+                            "detail": "Role was not clearly fully remote.",
+                            "company_name": "Domino Data Lab",
+                            "role_title": "Principal Product Manager, AI Factory",
+                            "source_url": source_url,
+                            "direct_job_url": historical_direct_job_url,
+                            "posted_date_text": "2026-03-28",
+                            "salary_text": "$250,000",
+                            "is_remote": True,
+                            "attempt_number": 1,
+                            "round_number": 1,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url=source_url,
+        source_type="builtin",
+        is_remote_hint=True,
+        posted_date_hint="2026-03-28",
+        salary_text_hint="$250,000",
+        evidence_notes="Built In source disclosed remote salary hints for this AI PM role.",
+    )
+
+    async def fake_extract_direct_job_url_from_source(_lead: JobLead) -> str | None:
+        return None
+
+    async def fake_resolve_lead_via_company_careers_pages(_lead: JobLead) -> DirectJobResolution | None:
+        return None
+
+    monkeypatch.setattr(
+        "job_agent.job_search._extract_direct_job_url_from_source",
+        fake_extract_direct_job_url_from_source,
+    )
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_via_company_careers_pages",
+        fake_resolve_lead_via_company_careers_pages,
+    )
+
+    repaired = asyncio.run(
+        _repair_direct_job_url(
+            None,
+            lead,
+            bad_direct_job_url,
+            "Resolved page title did not line up with the expected role.",
+            historical_direct_url_hints=_load_historical_direct_url_hints(settings),
+        )
+    )
+
+    assert repaired == _normalize_direct_job_url(historical_direct_job_url)
 
 
 def test_local_query_rounds_rotate_to_new_variants_across_attempts() -> None:
