@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Mapping
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -2168,30 +2167,6 @@ def _normalize_company_key(company_name: str | None) -> str:
 def _company_looks_small_from_hosts(hosts: list[str]) -> bool:
     normalized_hosts = [host.lower() for host in hosts if host]
     return any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts)
-
-
-def _company_discovery_entry_seed_priority(entry: Mapping[str, object]) -> tuple[int, int, int, int, int, str]:
-    source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
-    board_identifiers = [str(item).strip() for item in entry.get("board_identifiers") or [] if str(item).strip()]
-    careers_roots = [str(item).strip() for item in entry.get("careers_roots") or [] if str(item).strip()]
-    official_board_lead_count = max(0, int(entry.get("official_board_lead_count") or 0))
-    recent_fresh_role_count = max(0, int(entry.get("recent_fresh_role_count") or 0))
-    board_crawl_success_count = max(0, int(entry.get("board_crawl_success_count") or 0))
-    saturation_score = official_board_lead_count + recent_fresh_role_count + board_crawl_success_count * 4
-    if board_identifiers and official_board_lead_count == 0:
-        exploration_stage = 0
-    elif careers_roots and official_board_lead_count == 0:
-        exploration_stage = 1
-    else:
-        exploration_stage = 2
-    return (
-        exploration_stage,
-        0 if _company_looks_small_from_hosts(source_hosts) else 1,
-        saturation_score,
-        -int(entry.get("source_trust") or 0),
-        -len(board_identifiers),
-        str(entry.get("company_name") or "").lower(),
-    )
 
 
 def _watchlist_reason_count(entry: dict[str, object], reason_code: str) -> int:
@@ -5805,7 +5780,6 @@ async def _collect_company_discovery_seed_leads(
         discovered_from: str | None,
         priority: int,
         preferred_task_type: str | None = None,
-        reactivate_completed: bool = True,
     ) -> bool:
         normalized_url = str(url or "").strip()
         if not normalized_url.startswith(("http://", "https://")):
@@ -5826,7 +5800,6 @@ async def _collect_company_discovery_seed_leads(
                 source_trust=source_trust,
                 priority=max(priority, 9),
                 discovered_from=discovered_from,
-                reactivate_completed=reactivate_completed,
             )
             
         task_type = preferred_task_type or ("careers_root" if "/careers" in normalized_url.lower() or normalized_url.lower().endswith("/jobs") else "company_page")
@@ -5840,7 +5813,6 @@ async def _collect_company_discovery_seed_leads(
             source_trust=source_trust,
             priority=priority,
             discovered_from=discovered_from,
-            reactivate_completed=reactivate_completed,
         )
 
     async def _maybe_apply_ollama_discovery_sidecar(
@@ -6113,13 +6085,18 @@ async def _collect_company_discovery_seed_leads(
 
     if settings.company_discovery_indexer_enabled:
         for seeded_task in source_directory_seed_tasks():
-            upsert_frontier_task(frontier, reactivate_completed=True, **_frontier_task_kwargs(seeded_task))
+            upsert_frontier_task(frontier, **_frontier_task_kwargs(seeded_task))
 
         ranked_entries = [
             (company_key, entry)
             for company_key, entry in sorted(
                 entries.items(),
-                key=lambda item: _company_discovery_entry_seed_priority(item[1]),
+                key=lambda item: (
+                    -int(item[1].get("official_board_lead_count") or 0),
+                    -int(item[1].get("recent_fresh_role_count") or 0),
+                    -int(item[1].get("source_trust") or 0),
+                    str(item[1].get("company_name") or ""),
+                ),
             )
             if not is_low_value_company_discovery_entry(entry)
         ]
@@ -6141,7 +6118,6 @@ async def _collect_company_discovery_seed_leads(
                     discovered_from="company_discovery_index",
                     priority=priority,
                     preferred_task_type="board_url",
-                    reactivate_completed=False,
                 )
             for careers_root in [str(item) for item in entry.get("careers_roots") or [] if str(item).strip()][:3]:
                 _queue_frontier_url(
@@ -6150,7 +6126,6 @@ async def _collect_company_discovery_seed_leads(
                     discovered_from="company_discovery_index",
                     priority=max(6, priority - 1),
                     preferred_task_type="careers_root",
-                    reactivate_completed=False,
                 )
 
         directory_budget = max(0, settings.company_discovery_directory_crawl_budget_per_run)
@@ -7201,20 +7176,6 @@ def _load_historical_seed_leads(settings: Settings) -> list[JobLead]:
                 lead = _seed_lead_from_job_payload(job_payload)
                 if lead is not None:
                     leads.append(lead)
-        reacquired_jobs = payload.get("reacquired_jobs")
-        if not isinstance(reacquired_jobs, list):
-            reacquired_payload = payload.get("reacquired_jobs_payload")
-            if isinstance(reacquired_payload, dict):
-                items = reacquired_payload.get("items")
-                if isinstance(items, list):
-                    reacquired_jobs = items
-        if isinstance(reacquired_jobs, list):
-            for job_payload in reacquired_jobs:
-                if not isinstance(job_payload, dict):
-                    continue
-                lead = _seed_lead_from_job_payload(job_payload)
-                if lead is not None:
-                    leads.append(lead)
         diagnostics = payload.get("search_diagnostics", {})
         failures = diagnostics.get("failures") if isinstance(diagnostics, dict) else None
         if not isinstance(failures, list):
@@ -7325,25 +7286,12 @@ async def _replay_seed_leads(
         len(fresh_seed_leads),
         max(settings.max_leads_per_query * 4, settings.max_leads_to_resolve_per_pass // 2),
     )
-    reacquisition_seed_leads = [
-        lead
-        for lead in fresh_seed_leads
-        if _validated_job_history_entry_for_url(lead.direct_job_url, validated_job_history_index) is not None
-    ]
-    non_reacquisition_seed_leads = [
-        lead
-        for lead in fresh_seed_leads
-        if _validated_job_history_entry_for_url(lead.direct_job_url, validated_job_history_index) is None
-    ]
-    prioritized_reacquisition_seed_leads = reacquisition_seed_leads[:seed_replay_cap]
-    remaining_seed_replay_cap = max(0, seed_replay_cap - len(prioritized_reacquisition_seed_leads))
-    novelty_shaped_seed_leads = _apply_company_novelty_quota(
-        non_reacquisition_seed_leads,
+    fresh_seed_leads = _apply_company_novelty_quota(
+        fresh_seed_leads,
         previously_reported_company_keys,
         min_novelty_ratio=NOVEL_COMPANY_TARGET_RATIO,
-        limit=remaining_seed_replay_cap,
+        limit=seed_replay_cap,
     )
-    fresh_seed_leads = [*prioritized_reacquisition_seed_leads, *novelty_shaped_seed_leads]
     if 0 < len(fresh_seed_leads) < len(replay_seed_leads):
         fresh_seed_leads = await _maybe_force_seed_lead_refinement_with_ollama(
             settings,

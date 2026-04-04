@@ -3,13 +3,7 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 
-from job_agent.company_discovery import (
-    load_company_discovery_entries,
-    load_company_discovery_frontier,
-    save_company_discovery_entries,
-    save_company_discovery_frontier,
-    upsert_company_discovery_entry,
-)
+from job_agent.company_discovery import load_company_discovery_entries, load_company_discovery_frontier, save_company_discovery_frontier
 from job_agent.config import Settings
 from job_agent.history import load_validated_job_history_index
 from job_agent.job_search import (
@@ -37,7 +31,6 @@ from job_agent.job_search import (
     _chunk_queries,
     _candidate_direct_job_url_is_trustworthy,
     _company_names_match,
-    _company_discovery_entry_seed_priority,
     _company_hint_from_url,
     _collect_company_discovery_seed_leads,
     _collect_replay_seed_leads,
@@ -565,56 +558,6 @@ def test_collect_replay_seed_leads_ignores_non_dict_run_artifacts(tmp_path: Path
 
     leads = _collect_replay_seed_leads(settings)
     assert leads == []
-
-
-def test_collect_replay_seed_leads_includes_reacquired_jobs_from_run_artifacts(tmp_path: Path) -> None:
-    settings = build_settings()
-    settings.data_dir = tmp_path
-    (settings.data_dir / "run-20260404-000000.json").write_text(
-        json.dumps(
-            {
-                "bundles": [],
-                "reacquired_jobs": [
-                    {
-                        "company_name": "Krisp",
-                        "role_title": "Senior Product Manager, Voice AI SDK",
-                        "direct_job_url": "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
-                        "resolved_job_url": "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
-                        "ats_platform": "krisp.ai",
-                        "location_text": "Remote",
-                        "is_fully_remote": True,
-                        "posted_date_text": "",
-                        "posted_date_iso": None,
-                        "base_salary_min_usd": None,
-                        "base_salary_max_usd": None,
-                        "salary_text": None,
-                        "salary_inferred": False,
-                        "salary_inference_reason": None,
-                        "salary_inference_kind": None,
-                        "inferred_experience_years_min": None,
-                        "source_query": "\"senior product manager\" \"voice AI\" remote \"growth stage\"",
-                        "job_page_title": "Senior Product Manager, Voice AI SDK | Krisp",
-                        "evidence_notes": "Historical reacquired company-hosted role.",
-                        "validation_evidence": ["Remote role on the live company page."],
-                        "lead_refined_by_ollama": False,
-                        "source_quality_score": 6,
-                        "is_reacquired": True,
-                        "canonical_job_key": "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
-                        "first_reported_at": "2026-04-03T20:03:02.982918Z",
-                        "last_reported_at": "2026-04-04T02:33:34.359100Z",
-                        "report_count": 19,
-                    }
-                ],
-                "search_diagnostics": {"failures": []},
-            }
-        )
-    )
-
-    leads = _collect_replay_seed_leads(settings)
-
-    assert len(leads) == 1
-    assert leads[0].company_name == "Krisp"
-    assert leads[0].direct_job_url == "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk"
 
 
 def test_extract_posted_hint_parses_absolute_month_dates() -> None:
@@ -1872,42 +1815,6 @@ def test_lead_ai_classifier_rejects_generic_search_snippet_noise() -> None:
     assert not _lead_is_ai_related_product_manager(lead)
 
 
-def test_company_discovery_entry_seed_priority_prefers_underexplored_companies() -> None:
-    saturated = {
-        "company_name": "Hopper",
-        "source_hosts": ["jobs.ashbyhq.com"],
-        "board_identifiers": ["ashby:hopper"],
-        "careers_roots": ["https://jobs.ashbyhq.com/hopper"],
-        "official_board_lead_count": 3256,
-        "recent_fresh_role_count": 3222,
-        "board_crawl_success_count": 53,
-        "source_trust": 10,
-    }
-    underexplored_board = {
-        "company_name": "Acme AI",
-        "source_hosts": ["jobs.ashbyhq.com"],
-        "board_identifiers": ["ashby:acmeai"],
-        "careers_roots": ["https://jobs.ashbyhq.com/acmeai"],
-        "official_board_lead_count": 0,
-        "recent_fresh_role_count": 0,
-        "board_crawl_success_count": 0,
-        "source_trust": 8,
-    }
-    underexplored_careers = {
-        "company_name": "Krisp",
-        "source_hosts": ["krisp.ai"],
-        "board_identifiers": [],
-        "careers_roots": ["https://krisp.ai/careers"],
-        "official_board_lead_count": 0,
-        "recent_fresh_role_count": 0,
-        "board_crawl_success_count": 0,
-        "source_trust": 7,
-    }
-
-    assert _company_discovery_entry_seed_priority(underexplored_board) < _company_discovery_entry_seed_priority(underexplored_careers)
-    assert _company_discovery_entry_seed_priority(underexplored_careers) < _company_discovery_entry_seed_priority(saturated)
-
-
 def test_lead_ai_classifier_allows_builtin_description_evidence_for_generic_title() -> None:
     lead = JobLead(
         company_name="Acme",
@@ -2683,126 +2590,8 @@ def test_replay_seed_leads_retries_seed_refinement_after_failed_history_narrows_
     )
 
     assert refinement_call_sizes == [2, 1]
-
-
-def test_replay_seed_leads_preserves_reacquisition_candidates_ahead_of_company_novelty_quota(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    settings = build_settings()
-    settings.company_discovery_enabled = False
-    settings.data_dir = tmp_path / "data"
-    settings.output_dir = tmp_path / "output"
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-
-    reacquired_lead = JobLead(
-        company_name="Krisp",
-        role_title="Senior Product Manager, Voice AI SDK",
-        source_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
-        source_type="company_site",
-        direct_job_url="https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk/",
-        location_hint="Remote",
-        posted_date_hint=(date.today() - timedelta(days=1)).isoformat(),
-        is_remote_hint=True,
-        evidence_notes="Previously validated company-hosted role.",
-    )
-    novel_lead = JobLead(
-        company_name="Novel AI",
-        role_title="Principal Product Manager, AI Platform",
-        source_url="https://jobs.lever.co/novelai/123",
-        source_type="direct_ats",
-        direct_job_url="https://jobs.lever.co/novelai/123",
-        location_hint="Remote",
-        posted_date_hint=(date.today() - timedelta(days=1)).isoformat(),
-        is_remote_hint=True,
-        salary_text_hint="$220,000 - $260,000",
-        evidence_notes="Novel direct ATS seed.",
-    )
-    quota_inputs: list[list[str]] = []
-
-    async def passthrough_seed_refinement(settings_arg, leads, *, run_id=None):
-        return leads
-
-    def fake_apply_company_novelty_quota(leads, previously_reported_company_keys, min_novelty_ratio, limit):
-        quota_inputs.append([lead.company_name for lead in leads])
-        return [lead for lead in leads if lead.company_name == "Novel AI"][:limit]
-
-    async def fake_validate_candidate(lead, candidate, settings, *, resolution_agent, attempt_number, round_number):
-        return (
-            JobPosting(
-                company_name=lead.company_name,
-                role_title=lead.role_title,
-                direct_job_url=str(candidate.direct_job_url),
-                resolved_job_url=str(candidate.direct_job_url),
-                ats_platform=candidate.ats_platform,
-                location_text="Remote",
-                is_fully_remote=True,
-                posted_date_text=(date.today() - timedelta(days=1)).isoformat(),
-                posted_date_iso=(date.today() - timedelta(days=1)).isoformat(),
-                base_salary_min_usd=220000 if lead.company_name == "Novel AI" else None,
-                base_salary_max_usd=260000 if lead.company_name == "Novel AI" else None,
-                salary_text="$220,000 - $260,000" if lead.company_name == "Novel AI" else None,
-                evidence_notes="Validated in test.",
-                validation_evidence=["Accepted."],
-            ),
-            None,
-            None,
-            None,
-        )
-
-    monkeypatch.setattr("job_agent.job_search._maybe_force_seed_lead_refinement_with_ollama", passthrough_seed_refinement)
-    monkeypatch.setattr("job_agent.job_search._annotate_and_filter_resolution_leads", lambda leads, settings, company_watchlist: leads)
-    monkeypatch.setattr("job_agent.job_search._apply_company_novelty_quota", fake_apply_company_novelty_quota)
-    monkeypatch.setattr("job_agent.job_search._validate_candidate", fake_validate_candidate)
-
-    diagnostics = SearchDiagnostics(run_id="run-coverage-priority", minimum_qualifying_jobs=5)
-    jobs_by_url: dict[str, JobPosting] = {}
-    reacquired_jobs_by_url: dict[str, JobPosting] = {}
-    validated_job_history_index = {
-        "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk": {
-            "job_key": "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
-            "canonical_job_key": "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
-            "normalized_job_url": "https://krisp.ai/jobs/sr-product-manager-voice-ai-sdk",
-            "company_name": "Krisp",
-            "role_title": "Senior Product Manager, Voice AI SDK",
-            "first_reported_at": "2026-04-03T20:03:02.982918Z",
-            "last_reported_at": "2026-04-04T02:33:34.359100Z",
-            "report_count": 19,
-        }
-    }
-
-    total_unique_leads, resolved_leads = asyncio.run(
-        _replay_seed_leads(
-            [reacquired_lead, novel_lead],
-            settings=settings,
-            diagnostics=diagnostics,
-            company_watchlist={},
-            failed_lead_history={},
-            jobs_by_url=jobs_by_url,
-            reacquired_jobs_by_url=reacquired_jobs_by_url,
-            previously_reported_company_keys={"krisp"},
-            validated_job_history_index=validated_job_history_index,
-            reacquisition_attempted_keys=set(),
-            reacquisition_suppressed_keys=set(),
-            seen_lead_keys=set(),
-            total_unique_leads=0,
-            resolved_leads_this_attempt=0,
-            stop_goal=5,
-            lead_timeout_seconds=10,
-            resolution_agent=None,
-            attempt_number=1,
-            status=None,
-            run_id="run-coverage-priority",
-        )
-    )
-
-    assert quota_inputs == [["Novel AI"]]
-    assert total_unique_leads == 2
-    assert resolved_leads == 2
-    assert len(reacquired_jobs_by_url) == 1
-    assert next(iter(reacquired_jobs_by_url.values())).company_name == "Krisp"
-    assert any(job.company_name == "Novel AI" for job in jobs_by_url.values())
+    assert total_unique_leads == 1
+    assert resolved_leads == 1
 
 
 def test_query_timeout_seconds_for_query_keeps_broad_queries_tighter_than_targeted_queries() -> None:
@@ -6255,72 +6044,6 @@ def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandar
     assert metrics["source_adapter_yields"]["ollama_sidecar"] == 1
     frontier = load_company_discovery_frontier(settings.data_dir)
     assert any(task["url"] == "https://acme.example/join-the-team" for task in frontier)
-
-
-def test_collect_company_discovery_seed_leads_keeps_completed_index_task_completed_until_fresh_signal(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    settings = build_settings()
-    settings.project_root = tmp_path
-    settings.data_dir = tmp_path / "data"
-    settings.output_dir = tmp_path / "output"
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-    settings.company_discovery_frontier_budget_per_run = 1
-    settings.company_discovery_directory_crawl_budget_per_run = 0
-    settings.company_discovery_board_crawl_budget_per_run = 0
-
-    entries: dict[str, dict[str, object]] = {}
-    upsert_company_discovery_entry(
-        entries,
-        company_name="Acme AI",
-        source_url="https://acme.example/careers",
-        careers_root="https://acme.example/careers",
-        source_trust=7,
-        run_id="run-1",
-        ai_pm_candidate_delta=1,
-    )
-    save_company_discovery_entries(settings.data_dir, entries)
-    save_company_discovery_frontier(
-        settings.data_dir,
-        [
-            {
-                "task_key": "careers_root:https://acme.example/careers",
-                "task_type": "careers_root",
-                "url": "https://acme.example/careers",
-                "company_name": "Acme AI",
-                "company_key": "acmeai",
-                "source_kind": "careers_root",
-                "source_trust": 7,
-                "priority": 8,
-                "attempts": 3,
-                "status": "completed",
-                "discovered_from": "company_discovery_index",
-            }
-        ],
-    )
-
-    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
-    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: [])
-
-    async def fail_if_crawled(_url: str) -> str | None:
-        raise AssertionError("completed index task should not be reactivated without fresh evidence")
-
-    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fail_if_crawled)
-
-    leads, metrics = asyncio.run(
-        _collect_company_discovery_seed_leads(
-            settings,
-            discovery_agent=None,
-            run_id="run-index-preserve",
-        )
-    )
-
-    assert leads == []
-    assert metrics["frontier_tasks_consumed_count"] == 0
-    frontier = load_company_discovery_frontier(settings.data_dir)
-    assert frontier[0]["status"] == "completed"
 
 
 def test_should_force_ollama_refinement_sample_respects_inline_refinement_flag() -> None:
