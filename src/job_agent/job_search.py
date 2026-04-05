@@ -6506,15 +6506,88 @@ def _extract_builtin_search_items(html: str) -> list[tuple[str, str, str]]:
     return items
 
 
+def _decode_embedded_absolute_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = unescape(value).strip()
+    if not candidate:
+        return None
+    if "\\" in candidate:
+        try:
+            decoded = json.loads(f'"{candidate}"')
+        except json.JSONDecodeError:
+            decoded = candidate.replace("\\/", "/")
+    else:
+        decoded = candidate
+    normalized = str(decoded).strip()
+    if normalized.startswith("//"):
+        normalized = f"https:{normalized}"
+    if normalized.startswith(("http://", "https://")):
+        return normalized
+    return None
+
+
+def _extract_builtin_apply_url_candidates_from_payload(payload: object) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    target_fields = {
+        "howtoapply",
+        "applyurl",
+        "applicationurl",
+        "hostedurl",
+        "joburl",
+        "externalurl",
+    }
+
+    def maybe_add(value: object) -> None:
+        candidate = _decode_embedded_absolute_url(value)
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    def collect(node: object) -> None:
+        if isinstance(node, dict):
+            for raw_key, value in node.items():
+                key = str(raw_key or "").strip().lower()
+                if key in target_fields:
+                    if key == "howtoapply" and isinstance(value, dict):
+                        for nested_key in ("url", "@id", "href", "applyUrl", "applicationUrl", "hostedUrl", "jobUrl"):
+                            maybe_add(value.get(nested_key))
+                    else:
+                        maybe_add(value)
+                collect(value)
+            return
+        if isinstance(node, list):
+            for item in node:
+                collect(item)
+
+    collect(payload)
+    return candidates
+
+
 def _extract_builtin_apply_url(html: str) -> str | None:
-    match = re.search(r'"howToApply":"(?P<url>https?:\\?/\\?/[^"]+)"', html)
-    if not match:
-        return None
-    try:
-        decoded = json.loads(f'"{match.group("url")}"')
-    except json.JSONDecodeError:
-        return None
-    return decoded if isinstance(decoded, str) else None
+    key_pattern = r'"(?:howToApply|applyUrl|applicationUrl|hostedUrl|jobUrl|externalUrl)"'
+    string_field_pattern = re.compile(rf"{key_pattern}\s*:\s*\"(?P<url>[^\"]+)\"", re.I)
+
+    for match in string_field_pattern.finditer(html):
+        candidate = _decode_embedded_absolute_url(match.group("url"))
+        if candidate:
+            return candidate
+
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup.select("script"):
+        raw = script.get_text(strip=True)
+        if not raw or not re.search(key_pattern, raw, re.I):
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        candidates = _extract_builtin_apply_url_candidates_from_payload(payload)
+        if candidates:
+            return candidates[0]
+
+    return None
 
 
 def _extract_builtin_jobposting_payload(html: str) -> dict[str, object] | None:
@@ -8759,6 +8832,11 @@ async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
             continue
         score = _url_candidate_score(absolute_url, _link_context_text(link), lead)
         candidates.append((score, absolute_url))
+    for raw_url in re.findall(r"https?://[^\s\"'<>]+", response.text):
+        normalized_raw_url = _normalize_direct_job_url(raw_url)
+        if not _candidate_direct_job_url_is_trustworthy(normalized_raw_url, lead):
+            continue
+        candidates.append((_url_candidate_score(normalized_raw_url, "", lead), normalized_raw_url))
 
     if not candidates:
         return None

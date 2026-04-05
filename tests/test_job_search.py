@@ -22,6 +22,7 @@ from job_agent.job_search import (
     _builtin_category_urls_for_query,
     _builtin_paginated_category_urls,
     _builtin_search_base_urls,
+    _extract_builtin_apply_url,
     _extract_builtin_remote_hint,
     _builtin_search_terms_for_query,
     _build_local_query_rounds,
@@ -3935,6 +3936,72 @@ def test_extract_direct_job_url_from_builtin_source_prefers_specific_company_job
 
     direct_url = asyncio.run(_extract_direct_job_url_from_source(lead))
     assert direct_url == "https://www.invoca.com/company/job-listings?gh_jid=8375510002"
+
+
+def test_extract_builtin_apply_url_supports_nested_how_to_apply_url_objects() -> None:
+    html = """
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "howToApply": {
+          "@type": "ApplyAction",
+          "url": "https://jobs.ashbyhq.com/capitalgroup/8f6d2365-16cb-4abc-a2ef-58ab69cba880"
+        }
+      }
+    </script>
+    """
+
+    assert (
+        _extract_builtin_apply_url(html)
+        == "https://jobs.ashbyhq.com/capitalgroup/8f6d2365-16cb-4abc-a2ef-58ab69cba880"
+    )
+
+
+def test_extract_direct_job_url_from_builtin_source_reads_structured_apply_url_without_anchor(monkeypatch) -> None:
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url="https://builtin.com/job/principal-product-manager-ai-factory/8208619",
+        source_type="builtin",
+        evidence_notes="Remote AI PM role with salary disclosure.",
+    )
+
+    class FakeResponse:
+        def __init__(self, url: str, text: str) -> None:
+            self.url = url
+            self.text = text
+
+    class FakeAsyncClient:
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            assert url == lead.source_url
+            return FakeResponse(
+                url,
+                """
+                <script type="application/json">
+                  {
+                    "props": {
+                      "pageProps": {
+                        "job": {
+                          "applyUrl": "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
+                        }
+                      }
+                    }
+                  }
+                </script>
+                """,
+            )
+
+    monkeypatch.setattr("job_agent.job_search.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
+
+    direct_url = asyncio.run(_extract_direct_job_url_from_source(lead))
+    assert direct_url == "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
 
 
 def test_extract_direct_job_url_from_linkedin_source_rejects_wrong_company_ats_links(monkeypatch) -> None:
