@@ -92,6 +92,7 @@ from job_agent.job_search import (
     _repair_direct_job_url,
     _repair_company_scoped_board_frontier_tasks,
     _repair_workday_board_task_url,
+    _reactivate_repairable_board_frontier_tasks,
     _replay_seed_leads,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
@@ -1908,6 +1909,127 @@ def test_repair_company_scoped_board_frontier_tasks_repairs_root_only_workday_ta
     assert task["board_identifier"] == "workday:hpe.wd5"
     assert task["url"] == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
     assert task["task_key"] == "board_url:https://hpe.wd5.myworkdayjobs.com/ACJobSite:workday:hpe.wd5"
+    assert task["next_retry_at"] is None
+    assert task["last_error"] is None
+
+
+def test_reactivate_repairable_board_frontier_tasks_canonicalizes_and_dedupes_smartrecruiters_aliases() -> None:
+    frontier = [
+        {
+            "task_key": "board_url:https://careers.servicenow.com/jobs/744000107435185/principal-inbound-product-manager-ai-assistant-agentic-workflows-moveworks",
+            "task_type": "board_url",
+            "url": "https://careers.servicenow.com/jobs/744000107435185/principal-inbound-product-manager-ai-assistant-agentic-workflows-moveworks",
+            "company_name": "ServiceNow",
+            "company_key": "servicenow",
+            "board_identifier": None,
+            "source_kind": "board_url",
+            "source_trust": 7,
+            "priority": 10,
+            "attempts": 4,
+            "status": "pending",
+            "discovered_from": "role_first_search",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "missing_board_identifier",
+        },
+        {
+            "task_key": "board_url:https://careers.servicenow.com/jobs/744000117350352/principal-inbound-product-manager-ai-assistant-core-ml-moveworks:None",
+            "task_type": "board_url",
+            "url": "https://careers.servicenow.com/jobs/744000117350352/principal-inbound-product-manager-ai-assistant-core-ml-moveworks",
+            "company_name": "ServiceNow",
+            "company_key": "servicenow",
+            "board_identifier": "None",
+            "source_kind": "board_url",
+            "source_trust": 7,
+            "priority": 10,
+            "attempts": 1,
+            "status": "pending",
+            "discovered_from": "role_first_search",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "unsupported_adapter",
+        },
+        {
+            "task_key": "board_url:https://jobs.smartrecruiters.com:smartrecruiters:servicenow",
+            "task_type": "board_url",
+            "url": "https://jobs.smartrecruiters.com",
+            "company_name": "ServiceNow",
+            "company_key": "servicenow",
+            "board_identifier": "smartrecruiters:servicenow",
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 4,
+            "attempts": 1,
+            "status": "pending",
+            "discovered_from": "company_discovery_index",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "unsupported_adapter",
+        },
+    ]
+
+    _reactivate_repairable_board_frontier_tasks(
+        frontier,
+        entries={
+            "servicenow": {
+                "ats_types": ["SmartRecruiters"],
+                "board_urls": ["https://jobs.smartrecruiters.com"],
+                "careers_roots": [],
+                "source_hosts": ["careers.servicenow.com"],
+            }
+        },
+    )
+
+    assert len(frontier) == 1
+    task = frontier[0]
+    assert task["url"] == "https://jobs.smartrecruiters.com/servicenow"
+    assert task["board_identifier"] == "smartrecruiters:servicenow"
+    assert task["task_key"] == "board_url:https://jobs.smartrecruiters.com/servicenow:smartrecruiters:servicenow"
+    assert task["status"] == "pending"
+    assert task["next_retry_at"] is None
+    assert task["last_error"] is None
+    assert task["source_trust"] == 10
+    assert task["priority"] == 10
+    assert task["attempts"] == 1
+
+
+def test_reactivate_repairable_board_frontier_tasks_repairs_root_only_workday_aliases() -> None:
+    frontier = [
+        {
+            "task_key": "board_url:https://hpe.wd5.myworkdayjobs.com:workday:hpe.wd5",
+            "task_type": "board_url",
+            "url": "https://hpe.wd5.myworkdayjobs.com",
+            "company_name": "Hewlett Packard Enterprise",
+            "company_key": "hewlettpackardenterprise",
+            "board_identifier": "workday:hpe.wd5",
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 10,
+            "attempts": 2,
+            "status": "pending",
+            "discovered_from": "company_discovery_index",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "unsupported_adapter",
+        }
+    ]
+
+    _reactivate_repairable_board_frontier_tasks(
+        frontier,
+        entries={
+            "hewlettpackardenterprise": {
+                "ats_types": ["Workday"],
+                "board_urls": [
+                    "https://hpe.wd5.myworkdayjobs.com/ACJobSite/job/Sunnyvale-California-United-States-of-America/Principal-Product-Hardware-Manager--Cloud-Infrastructure-and-AI-Networking_1201888-2"
+                ],
+                "careers_roots": [],
+                "source_hosts": [],
+            }
+        },
+    )
+
+    assert len(frontier) == 1
+    task = frontier[0]
+    assert task["url"] == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
+    assert task["board_identifier"] == "workday:hpe.wd5"
+    assert task["task_key"] == "board_url:https://hpe.wd5.myworkdayjobs.com/ACJobSite:workday:hpe.wd5"
+    assert task["status"] == "pending"
     assert task["next_retry_at"] is None
     assert task["last_error"] is None
 
@@ -4318,6 +4440,46 @@ def test_extract_direct_job_url_from_builtin_source_reads_structured_apply_url_w
     assert direct_url == "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
 
 
+def test_extract_direct_job_url_from_workday_board_root_resolves_specific_matching_role(monkeypatch) -> None:
+    lead = JobLead(
+        company_name="Capital Group",
+        role_title="Principal Product Manager, AI",
+        source_url="https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers",
+        source_type="company_site",
+        evidence_notes="Official Workday board root discovered from the company careers page.",
+        is_remote_hint=True,
+    )
+
+    async def fake_fetch_workday_board_jobs(board_url: str) -> list[dict[str, object]]:
+        assert board_url == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers"
+        return [
+            {
+                "title": "Principal Product Manager, AI",
+                "externalPath": "/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456",
+                "locationsText": "Remote - United States",
+                "remoteType": "Remote",
+                "bulletFields": ["Remote - United States", "Posted 2 Days Ago"],
+                "description": "Lead AI product strategy and platform capabilities across the investment experience.",
+            },
+            {
+                "title": "Principal Product Manager, Payments",
+                "externalPath": "/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-Payments_R-999999",
+                "locationsText": "Remote - United States",
+                "remoteType": "Remote",
+                "bulletFields": ["Remote - United States", "Posted 2 Days Ago"],
+                "description": "Lead payments product strategy.",
+            },
+        ]
+
+    monkeypatch.setattr("job_agent.job_search._fetch_workday_board_jobs", fake_fetch_workday_board_jobs)
+
+    direct_url = asyncio.run(_extract_direct_job_url_from_source(lead))
+    assert (
+        direct_url
+        == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456"
+    )
+
+
 def test_extract_source_followup_resolution_urls_includes_builtin_company_directory_and_homepage(monkeypatch) -> None:
     lead = JobLead(
         company_name="Domino Data Lab",
@@ -4365,6 +4527,87 @@ def test_extract_source_followup_resolution_urls_includes_builtin_company_direct
     assert "https://builtin.com/company/domino-data-lab" in followups
     assert "https://builtin.com/company/domino-data-lab/jobs" in followups
     assert "https://www.domino.ai/" in followups
+
+
+def test_resolve_lead_via_company_careers_pages_walks_structured_homepage_to_workday_board(monkeypatch) -> None:
+    lead = JobLead(
+        company_name="Capital Group",
+        role_title="Principal Product Manager, AI",
+        source_url="https://builtinla.com/job/principal-product-manager-ai/123456",
+        source_type="builtin",
+        evidence_notes="Remote AI PM role with salary disclosure.",
+        is_remote_hint=True,
+    )
+
+    async def fake_search_company_resolution_candidates(_lead: JobLead) -> list[str]:
+        return []
+
+    async def fake_fetch_workday_board_jobs(board_url: str) -> list[dict[str, object]]:
+        assert board_url == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers"
+        return [
+            {
+                "title": "Principal Product Manager, AI",
+                "externalPath": "/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456",
+                "locationsText": "Remote - United States",
+                "remoteType": "Remote",
+                "bulletFields": ["Remote - United States", "Posted 2 Days Ago"],
+                "description": "Lead AI product strategy and platform capabilities across the investment experience.",
+            }
+        ]
+
+    class FakeResponse:
+        def __init__(self, url: str, text: str) -> None:
+            self.url = url
+            self.text = text
+            self.status_code = 200
+
+    class FakeAsyncClient:
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            if url == lead.source_url:
+                return FakeResponse(
+                    url,
+                    """
+                    <script type="application/ld+json">
+                      {
+                        "@context": "https://schema.org",
+                        "@type": "JobPosting",
+                        "hiringOrganization": {
+                          "@type": "Organization",
+                          "name": "Capital Group",
+                          "sameAs": "https://www.capitalgroup.com"
+                        }
+                      }
+                    </script>
+                    """,
+                )
+            if url in {"https://www.capitalgroup.com", "https://www.capitalgroup.com/"}:
+                return FakeResponse(url, '<a href="/careers">Careers</a>')
+            if url == "https://www.capitalgroup.com/careers":
+                return FakeResponse(
+                    url,
+                    '<script src="https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers"></script>',
+                )
+            raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(
+        "job_agent.job_search._search_company_resolution_candidates",
+        fake_search_company_resolution_candidates,
+    )
+    monkeypatch.setattr("job_agent.job_search._fetch_workday_board_jobs", fake_fetch_workday_board_jobs)
+    monkeypatch.setattr("job_agent.job_search.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
+
+    resolution = asyncio.run(_resolve_lead_via_company_careers_pages(lead))
+    assert resolution is not None
+    assert (
+        resolution.direct_job_url
+        == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456"
+    )
 
 
 def test_extract_direct_job_url_from_linkedin_source_rejects_wrong_company_ats_links(monkeypatch) -> None:

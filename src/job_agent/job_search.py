@@ -4390,17 +4390,21 @@ def _company_hint_from_url(url: str) -> str:
     if "careers.tellent.com" in host and len(path_segments) >= 2 and path_segments[0] == "o":
         return path_segments[1].replace("-", " ").title()
     if "myworkdayjobs.com" in host:
+        host_prefix = host.split(".wd", 1)[0]
+        host_candidate = host_prefix.replace("-", " ").title() if host_prefix else ""
         if (
             len(path_segments) >= 2
             and re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", path_segments[0], re.I)
             and path_segments[1].lower() not in {"job", "jobs", "ext"}
         ):
             candidate = path_segments[1].replace("_", " ").replace("-", " ").title()
-            if not _is_weak_company_hint(candidate):
+            if (
+                not _is_weak_company_hint(candidate)
+                and not re.search(r"(careers?|jobs?)$", path_segments[1], re.I)
+            ):
                 return candidate
-        host_prefix = host.split(".wd", 1)[0]
-        if host_prefix:
-            return host_prefix.replace("-", " ").title()
+        if host_candidate:
+            return host_candidate
     if "ats.rippling.com" in host and path_segments:
         candidate = path_segments[0].replace("_", " ").replace("-", " ").title()
         if not _is_weak_company_hint(candidate):
@@ -5119,6 +5123,17 @@ def _extract_followup_resolution_urls(base_url: str, html: str) -> list[str]:
     for raw_url in re.findall(r"https?://[^\s\"'<>]+", html):
         maybe_add(raw_url)
 
+    for board_url in extract_embedded_board_urls(base_url, html):
+        maybe_add(board_url, "Embedded ATS board")
+
+    for careers_url in extract_careers_page_urls(base_url, html):
+        maybe_add(careers_url, "Careers")
+
+    for homepage_url in extract_company_homepage_urls(base_url, html):
+        maybe_add(homepage_url, "Company website")
+        for careers_candidate in default_careers_candidate_urls(homepage_url):
+            maybe_add(careers_candidate, "Careers")
+
     ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
     return [url for url, _ in ranked[:8]]
 
@@ -5200,6 +5215,102 @@ async def _search_company_resolution_candidates(lead: JobLead) -> list[str]:
     resolved = [url for url, _ in sorted(ranked_results.items(), key=lambda item: item[1], reverse=True)[:6]]
     COMPANY_RESOLUTION_URL_CACHE[company_key] = resolved
     return resolved
+
+
+def _board_resolution_candidate_score(expected_lead: JobLead, candidate_lead: JobLead) -> int:
+    score = min(
+        _role_match_score(expected_lead.role_title, candidate_lead.role_title),
+        _role_match_score(candidate_lead.role_title, expected_lead.role_title),
+    )
+    if _role_titles_align(expected_lead.role_title, candidate_lead.role_title):
+        score += 16
+    if _company_names_match(expected_lead.company_name, candidate_lead.company_name):
+        score += 4
+    if expected_lead.is_remote_hint is True and candidate_lead.is_remote_hint is True:
+        score += 2
+    if expected_lead.is_remote_hint is True and candidate_lead.is_remote_hint is False:
+        score -= 4
+    if candidate_lead.direct_job_url and _candidate_direct_job_url_is_trustworthy(candidate_lead.direct_job_url, expected_lead):
+        score += 3
+    return score
+
+
+async def _resolve_supported_board_job_url_from_lead(lead: JobLead) -> str | None:
+    board_candidates: list[tuple[str, str]] = []
+    seen_board_keys: set[tuple[str, str]] = set()
+    for raw_url in (lead.direct_job_url, lead.source_url):
+        normalized_url = _normalize_direct_job_url(raw_url or "")
+        if not normalized_url:
+            continue
+        board_identifier = str(_extract_company_board_identifier(normalized_url) or board_identifier_from_url(normalized_url) or "").strip()
+        if not board_identifier:
+            continue
+        board_root = str(infer_careers_root(normalized_url) or normalized_url).strip()
+        board_key = (board_identifier, board_root)
+        if board_key in seen_board_keys:
+            continue
+        seen_board_keys.add(board_key)
+        board_candidates.append(board_key)
+
+    best_url: str | None = None
+    best_score = 0
+    for board_identifier, board_root in board_candidates:
+        prefix, _, token = board_identifier.partition(":")
+        board_leads: list[JobLead] = []
+        try:
+            if prefix == "greenhouse" and token:
+                board_leads = [
+                    candidate
+                    for candidate in (
+                        _greenhouse_board_job_to_lead(token, lead.company_name, job)
+                        for job in await _fetch_greenhouse_board_jobs(token)
+                    )
+                    if candidate is not None
+                ]
+            elif prefix == "ashby" and token:
+                board_leads = [
+                    candidate
+                    for candidate in (
+                        _ashby_board_job_to_lead(token, lead.company_name, job)
+                        for job in await _fetch_ashby_board_jobs(token)
+                    )
+                    if candidate is not None
+                ]
+            elif prefix == "lever" and token:
+                board_leads = [
+                    candidate
+                    for candidate in (
+                        _lever_board_job_to_lead(token, lead.company_name, job)
+                        for job in await _fetch_lever_board_jobs(token)
+                    )
+                    if candidate is not None
+                ]
+            elif prefix == "smartrecruiters" and token:
+                board_leads = await _smartrecruiters_board_jobs_to_leads(token, lead.company_name)
+            elif prefix == "workday":
+                board_leads = [
+                    candidate
+                    for candidate in (
+                        _workday_board_job_to_lead(board_root, lead.company_name, job)
+                        for job in await _fetch_workday_board_jobs(board_root)
+                    )
+                    if candidate is not None
+                ]
+        except Exception:
+            continue
+
+        for candidate_lead in board_leads:
+            candidate_url = _normalize_direct_job_url(candidate_lead.direct_job_url or "")
+            if not candidate_url.startswith(("http://", "https://")):
+                continue
+            score = _board_resolution_candidate_score(lead, candidate_lead)
+            if score > best_score:
+                best_score = score
+                best_url = candidate_url
+
+    if best_score < 14:
+        return None
+    return best_url
 
 
 def _extract_greenhouse_board_token(url: str) -> str | None:
@@ -5985,22 +6096,63 @@ def _increment_metric_count(bucket: dict[str, int], key: str | None, delta: int 
     bucket[normalized_key] = int(bucket.get(normalized_key) or 0) + int(delta)
 
 
-def _reactivate_repairable_board_frontier_tasks(frontier: list[dict[str, object]]) -> None:
+def _reactivate_repairable_board_frontier_tasks(
+    frontier: list[dict[str, object]],
+    *,
+    entries: Mapping[str, dict[str, object]],
+) -> None:
+    _repair_company_scoped_board_frontier_tasks(frontier, entries=entries)
+
+    merged_board_tasks: dict[str, dict[str, object]] = {}
+    merged_board_order: list[str] = []
+    passthrough_tasks: list[dict[str, object]] = []
+
     for task in frontier:
         if str(task.get("task_type") or "") != "board_url":
+            passthrough_tasks.append(task)
             continue
         board_identifier = str(task.get("board_identifier") or "").strip()
+        if board_identifier.lower() in {"none", "null"}:
+            board_identifier = ""
         if not board_identifier:
-            continue
-        prefix, _, _ = board_identifier.partition(":")
-        if prefix not in SUPPORTED_OFFICIAL_BOARD_PREFIXES:
-            continue
+            board_identifier = str(board_identifier_from_url(str(task.get("url") or "").strip()) or "").strip()
+            if board_identifier:
+                task["board_identifier"] = board_identifier
         last_error = str(task.get("last_error") or "").strip()
-        if last_error not in {"unsupported_adapter", "missing_board_identifier"}:
+        prefix, _, _ = board_identifier.partition(":")
+        if prefix in SUPPORTED_OFFICIAL_BOARD_PREFIXES and last_error in {"unsupported_adapter", "missing_board_identifier"}:
+            task["next_retry_at"] = None
+            task["last_error"] = None
+            task["status"] = "pending"
+        task_key = str(task.get("task_key") or "").strip()
+        if not task_key:
+            passthrough_tasks.append(task)
             continue
-        task["next_retry_at"] = None
-        task["last_error"] = None
-        task["status"] = "pending"
+        existing = merged_board_tasks.get(task_key)
+        if existing is None:
+            merged_board_tasks[task_key] = dict(task)
+            merged_board_order.append(task_key)
+            continue
+        existing["priority"] = max(int(existing.get("priority") or 0), int(task.get("priority") or 0))
+        existing["source_trust"] = max(int(existing.get("source_trust") or 0), int(task.get("source_trust") or 0))
+        existing["attempts"] = min(int(existing.get("attempts") or 0), int(task.get("attempts") or 0))
+        for field in ("company_name", "company_key", "board_identifier", "source_kind", "discovered_from"):
+            if not existing.get(field) and task.get(field):
+                existing[field] = task[field]
+        existing_completed = str(existing.get("status") or "").strip() == "completed"
+        task_completed = str(task.get("status") or "").strip() == "completed"
+        if existing_completed or task_completed:
+            existing["status"] = "completed"
+            existing["next_retry_at"] = None
+            existing["last_error"] = None
+            continue
+        if not str(existing.get("last_error") or "").strip() or not str(task.get("last_error") or "").strip():
+            existing["last_error"] = None
+        if not str(existing.get("next_retry_at") or "").strip() or not str(task.get("next_retry_at") or "").strip():
+            existing["next_retry_at"] = None
+        existing["status"] = "pending"
+
+    frontier[:] = [*passthrough_tasks, *(merged_board_tasks[key] for key in merged_board_order)]
 
 
 def _frontier_task_kwargs(task: dict[str, object]) -> dict[str, object]:
@@ -6356,8 +6508,7 @@ async def _collect_company_discovery_seed_leads(
 ) -> tuple[list[JobLead], dict[str, object]]:
     entries = load_company_discovery_entries(settings.data_dir)
     frontier = load_company_discovery_frontier(settings.data_dir)
-    _reactivate_repairable_board_frontier_tasks(frontier)
-    _repair_company_scoped_board_frontier_tasks(frontier, entries=entries)
+    _reactivate_repairable_board_frontier_tasks(frontier, entries=entries)
     crawl_history = load_company_discovery_crawl_history(settings.data_dir)
     audit_entries = load_company_discovery_audit(settings.data_dir)
     new_company_keys: set[str] = set()
@@ -7238,6 +7389,55 @@ def _extract_builtin_company_followup_urls(html: str) -> list[str]:
 
     for key in ("sameAs", "url", "careerSiteUrl", "careersUrl", "careerUrl", "jobUrl"):
         maybe_add(hiring_org.get(key))
+
+    return candidates
+
+
+def _extract_structured_company_followup_urls(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def maybe_add(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                maybe_add(item)
+            return
+        candidate = _decode_embedded_absolute_url(value)
+        if not candidate:
+            return
+        parsed = urlparse(candidate)
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return
+        if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+            return
+        if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
+            return
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    url_keys = ("sameAs", "url", "careerSiteUrl", "careersUrl", "careerUrl", "jobUrl", "@id")
+    for script in soup.select('script[type="application/ld+json"]'):
+        raw = script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for node in _jsonld_graph_nodes(payload):
+            if not isinstance(node, dict):
+                continue
+            nodes_to_scan: list[dict[str, object]] = [node]
+            hiring_org = node.get("hiringOrganization")
+            if isinstance(hiring_org, dict):
+                nodes_to_scan.append(hiring_org)
+            for candidate_node in nodes_to_scan:
+                for key in url_keys:
+                    maybe_add(candidate_node.get(key))
 
     return candidates
 
@@ -9523,9 +9723,9 @@ async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
     if candidate_url and _candidate_direct_job_url_is_trustworthy(candidate_url, lead):
         return candidate_url
 
-    greenhouse_board_url = await _resolve_greenhouse_board_job_url_from_lead(lead)
-    if greenhouse_board_url and _candidate_direct_job_url_is_trustworthy(greenhouse_board_url, lead):
-        return greenhouse_board_url
+    board_resolved_url = await _resolve_supported_board_job_url_from_lead(lead)
+    if board_resolved_url and _candidate_direct_job_url_is_trustworthy(board_resolved_url, lead):
+        return board_resolved_url
 
     try:
         async with httpx.AsyncClient(
@@ -9540,6 +9740,25 @@ async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
     resolved_source = _normalize_direct_job_url(str(response.url))
     if _is_allowed_direct_job_url(resolved_source) and not _looks_like_generic_job_url(resolved_source):
         return resolved_source
+
+    embedded_board_urls = _dedupe_queries(
+        [
+            *(extract_embedded_board_urls(resolved_source, response.text) or []),
+            *(url for url in (infer_careers_root(resolved_source),) if url),
+        ]
+    )
+    for board_url in embedded_board_urls:
+        board_resolution = await _resolve_supported_board_job_url_from_lead(
+            lead.model_copy(
+                update={
+                    "source_url": board_url,
+                    "source_type": "direct_ats",
+                    "direct_job_url": None,
+                }
+            )
+        )
+        if board_resolution and _candidate_direct_job_url_is_trustworthy(board_resolution, lead):
+            return board_resolution
 
     builtin_apply_url = None
     if _normalize_source_type(lead.source_url) == "builtin":
@@ -9648,6 +9867,22 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
             maybe_add_directory_seed(task_url)
             for followup_url in default_careers_candidate_urls(task_url):
                 maybe_add_directory_seed(followup_url)
+
+    for company_url in _extract_structured_company_followup_urls(response.text):
+        maybe_add(company_url, "Structured company URL")
+        for followup_url in default_careers_candidate_urls(company_url):
+            maybe_add(followup_url, "Careers")
+
+    for board_url in extract_embedded_board_urls(resolved_source, response.text):
+        maybe_add(board_url, "Embedded ATS board")
+
+    for careers_url in extract_careers_page_urls(resolved_source, response.text):
+        maybe_add(careers_url, "Careers")
+
+    for homepage_url in extract_company_homepage_urls(resolved_source, response.text):
+        maybe_add(homepage_url, "Company website")
+        for followup_url in default_careers_candidate_urls(homepage_url):
+            maybe_add(followup_url, "Careers")
 
     soup = BeautifulSoup(response.text, "html.parser")
     for link in soup.select("a[href]"):
