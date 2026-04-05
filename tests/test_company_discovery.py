@@ -64,6 +64,24 @@ def test_smartrecruiters_board_urls_preserve_company_token() -> None:
     )
 
 
+def test_workday_job_urls_preserve_board_root_path() -> None:
+    assert board_identifier_from_url(
+        "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Principal-Product-Manager-AI_R-123456"
+    ) == "workday:capitalgroup.wd1"
+    assert (
+        infer_careers_root(
+            "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Principal-Product-Manager-AI_R-123456"
+        )
+        == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers"
+    )
+    assert (
+        infer_careers_root(
+            "https://hpe.wd5.myworkdayjobs.com/ACJobSite/job/Sunnyvale-California-United-States-of-America/Principal-Product-Hardware-Manager--Cloud-Infrastructure-and-AI-Networking_1201888-2"
+        )
+        == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
+    )
+
+
 def test_upsert_company_discovery_entry_merges_repeated_board_discoveries(tmp_path: Path) -> None:
     entries: dict[str, dict[str, object]] = {}
 

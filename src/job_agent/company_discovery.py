@@ -509,6 +509,9 @@ def infer_careers_root(url: str | None) -> str | None:
         return None
     if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
         segments = [segment for segment in parsed.path.split("/") if segment]
+        workday_root = workday_board_root_url(normalized)
+        if workday_root:
+            return workday_root
         if "jobs.ashbyhq.com" in host and segments:
             return f"{parsed.scheme}://{host}/{segments[0]}"
         if "jobs.lever.co" in host and segments:
@@ -535,6 +538,30 @@ def infer_careers_root(url: str | None) -> str | None:
     if not is_company_discovery_seed_url(normalized, preferred_task_type="careers_root"):
         return None
     return f"{parsed.scheme}://{host}/careers"
+
+
+def workday_board_root_url(url: str | None) -> str | None:
+    normalized = str(url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    if "myworkdayjobs.com" not in host and "careers.workday.com" not in host:
+        return None
+
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments:
+        return None
+
+    if "job" in segments:
+        segments = segments[: segments.index("job")]
+    elif "details" in segments:
+        segments = segments[: segments.index("details")]
+
+    if not segments:
+        return None
+
+    return f"{parsed.scheme}://{host}/{'/'.join(segments)}"
 
 
 def _normalize_board_root_url(url: str | None) -> str | None:

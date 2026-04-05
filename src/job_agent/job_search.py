@@ -50,6 +50,7 @@ from .company_discovery import (
     update_frontier_task_state,
     upsert_frontier_task,
     upsert_company_discovery_entry,
+    workday_board_root_url,
 )
 from .config import Settings
 from .criteria import DEFAULT_ROLE_SEARCH_PROFILE
@@ -354,7 +355,8 @@ ASHBY_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 LEVER_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 SMARTRECRUITERS_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 SMARTRECRUITERS_POSTING_DETAILS_CACHE: dict[str, dict[str, object] | None] = {}
-SUPPORTED_OFFICIAL_BOARD_PREFIXES = {"greenhouse", "ashby", "lever", "smartrecruiters"}
+WORKDAY_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
+SUPPORTED_OFFICIAL_BOARD_PREFIXES = {"greenhouse", "ashby", "lever", "smartrecruiters", "workday"}
 SEARCH_ENGINE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -5333,6 +5335,187 @@ async def _fetch_lever_board_jobs(board_token: str) -> list[dict[str, object]]:
     return jobs
 
 
+def _workday_board_context(board_url: str | None) -> dict[str, str] | None:
+    board_root_url = workday_board_root_url(board_url)
+    if not board_root_url:
+        return None
+    parsed = urlparse(board_root_url)
+    host = (parsed.netloc or "").lower()
+    if "myworkdayjobs.com" not in host:
+        return None
+    segments = _path_segments(parsed.path)
+    if not segments:
+        return None
+    tenant = host.split(".wd", 1)[0]
+    site = segments[-1]
+    if not tenant or not site:
+        return None
+    return {
+        "board_root_url": board_root_url,
+        "api_url": f"{parsed.scheme}://{host}/wday/cxs/{tenant}/{site}/jobs",
+        "host_root_url": f"{parsed.scheme}://{host}",
+        "site": site,
+    }
+
+
+def _repair_workday_board_task_url(
+    task_url: str,
+    *,
+    company_key: str | None,
+    entries: Mapping[str, dict[str, object]],
+) -> str:
+    candidates = [task_url]
+    if company_key:
+        entry = entries.get(company_key)
+        if isinstance(entry, Mapping):
+            candidates.extend(str(item).strip() for item in entry.get("board_urls") or [])
+            candidates.extend(str(item).strip() for item in entry.get("careers_roots") or [])
+    for candidate in candidates:
+        repaired = workday_board_root_url(candidate)
+        if repaired:
+            return repaired
+    return task_url
+
+
+async def _fetch_workday_board_jobs(board_url: str) -> list[dict[str, object]]:
+    context = _workday_board_context(board_url)
+    if context is None:
+        return []
+    cache_key = context["board_root_url"]
+    cached = WORKDAY_BOARD_JOBS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    jobs: list[dict[str, object]] = []
+    offset = 0
+    limit = 20
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=20.0,
+        ) as client:
+            while offset < 200:
+                response = await client.post(
+                    context["api_url"],
+                    json={
+                        "appliedFacets": {},
+                        "limit": limit,
+                        "offset": offset,
+                        "searchText": "",
+                    },
+                )
+                if response.status_code != 200:
+                    WORKDAY_BOARD_JOBS_CACHE[cache_key] = []
+                    return []
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError:
+                    WORKDAY_BOARD_JOBS_CACHE[cache_key] = []
+                    return []
+                if not isinstance(payload, dict):
+                    WORKDAY_BOARD_JOBS_CACHE[cache_key] = []
+                    return []
+                page_jobs = payload.get("jobPostings")
+                if not isinstance(page_jobs, list):
+                    WORKDAY_BOARD_JOBS_CACHE[cache_key] = []
+                    return []
+                normalized_jobs = [job for job in page_jobs if isinstance(job, dict)]
+                jobs.extend(normalized_jobs)
+                total = int(payload.get("total") or 0)
+                if len(normalized_jobs) < limit or (total and offset + limit >= total):
+                    break
+                offset += limit
+    except httpx.RequestError:
+        WORKDAY_BOARD_JOBS_CACHE[cache_key] = []
+        return []
+
+    WORKDAY_BOARD_JOBS_CACHE[cache_key] = jobs
+    return jobs
+
+
+def _workday_job_text_value(job: dict[str, object], *keys: str) -> str:
+    for key in keys:
+        value = job.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _workday_board_job_to_lead(
+    board_url: str,
+    company_name: str,
+    job: dict[str, object],
+) -> JobLead | None:
+    context = _workday_board_context(board_url)
+    if context is None:
+        return None
+    title = _workday_job_text_value(job, "title", "name")
+    if not title or not _looks_like_product_manager_title(title):
+        return None
+
+    bullet_fields = [str(item).strip() for item in job.get("bulletFields") or [] if str(item).strip()]
+    location_text = _workday_job_text_value(job, "locationsText", "location")
+    remote_type = _workday_job_text_value(job, "remoteType", "workplaceType")
+    description_text = _workday_job_text_value(
+        job,
+        "description",
+        "jobDescription",
+        "externalDescription",
+        "shortDescription",
+    )
+    content_text = " ".join(part for part in (title, description_text, location_text, remote_type, " ".join(bullet_fields)) if part)
+    if not _is_ai_related_product_manager_text(content_text):
+        return None
+
+    external_path = _workday_job_text_value(job, "externalPath", "externalUrl", "jobUrl")
+    direct_job_url = _normalize_direct_job_url(urljoin(f"{context['host_root_url']}/", external_path))
+    if not direct_job_url.startswith(("http://", "https://")):
+        return None
+
+    remote_haystack = " ".join(part for part in (location_text, remote_type, description_text, " ".join(bullet_fields)) if part).lower()
+    if any(token in remote_haystack for token in ("hybrid", "on-site", "onsite", "in office")):
+        is_remote_hint: bool | None = False
+    elif "remote" in remote_haystack:
+        is_remote_hint = True
+    else:
+        is_remote_hint = None
+
+    posted_date_hint = _extract_posted_hint(
+        " ".join(
+            part
+            for part in (
+                _workday_job_text_value(job, "postedOn", "postedDate"),
+                " ".join(bullet_fields),
+            )
+            if part
+        )
+    )
+    location_hint = _lead_location_hint_with_remote_restriction(location_text, title, description_text, remote_type, " ".join(bullet_fields))
+    remote_restriction_note = _remote_restriction_note(title, location_text, description_text, remote_type, " ".join(bullet_fields))
+    evidence_notes = " ".join(
+        part
+        for part in (
+            "Discovered via official Workday board enumeration.",
+            remote_restriction_note,
+        )
+        if part
+    )
+    return JobLead(
+        company_name=company_name,
+        role_title=title,
+        source_url=context["board_root_url"],
+        source_type="direct_ats",
+        direct_job_url=direct_job_url,
+        location_hint=location_hint,
+        posted_date_hint=posted_date_hint,
+        is_remote_hint=is_remote_hint,
+        source_query=f"company_discovery:workday:{context['site'].lower()}",
+        evidence_notes=evidence_notes,
+        source_quality_score_hint=10,
+    )
+
+
 def _extract_smartrecruiters_board_token(url: str) -> str | None:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
@@ -6256,6 +6439,35 @@ async def _collect_company_discovery_seed_leads(
             company_name = _company_name_for_frontier_task(task, entries)
             company_key = _normalize_company_key(company_name)
             leads_for_task: list[JobLead] = []
+            if prefix == "workday":
+                repaired_task_url = _repair_workday_board_task_url(
+                    task_url,
+                    company_key=company_key or None,
+                    entries=entries,
+                )
+                repaired_board_identifier = str(board_identifier_from_url(repaired_task_url) or board_identifier).strip()
+                if repaired_task_url != task_url or repaired_board_identifier != board_identifier:
+                    task["url"] = repaired_task_url
+                    task["board_identifier"] = repaired_board_identifier
+                    task["task_key"] = frontier_task_key("board_url", repaired_task_url, board_identifier=repaired_board_identifier or None)
+                    task_key = str(task["task_key"])
+                    task_url = repaired_task_url
+                    board_identifier = repaired_board_identifier
+                    prefix, _, token = board_identifier.partition(":")
+                if _workday_board_context(task_url) is None:
+                    update_frontier_task_state(frontier, task_key=task_key, success=False, error="missing_board_identifier")
+                    record_crawl_result(
+                        crawl_history,
+                        target_type="board_url",
+                        url=task_url,
+                        company_key=company_key or None,
+                        board_identifier=board_identifier,
+                        success=False,
+                        error="missing_board_identifier",
+                    )
+                    official_roles_missed_count += 1
+                    frontier_tasks_consumed_count += 1
+                    continue
             official_board_crawl_attempt_count += 1
             frontier_tasks_consumed_count += 1
 
@@ -6289,6 +6501,15 @@ async def _collect_company_discovery_seed_leads(
                     ]
                 elif prefix == "smartrecruiters" and token:
                     leads_for_task = await _smartrecruiters_board_jobs_to_leads(token, company_name)
+                elif prefix == "workday":
+                    leads_for_task = [
+                        lead
+                        for lead in (
+                            _workday_board_job_to_lead(task_url, company_name, job)
+                            for job in await _fetch_workday_board_jobs(task_url)
+                        )
+                        if lead is not None
+                    ]
                 else:
                     append_company_discovery_audit_entry(
                         audit_entries,

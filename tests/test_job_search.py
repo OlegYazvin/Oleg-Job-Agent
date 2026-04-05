@@ -85,10 +85,12 @@ from job_agent.job_search import (
     _query_timeout_seconds_for_query,
     _query_timeout_skip_reason,
     _repair_direct_job_url,
+    _repair_workday_board_task_url,
     _replay_seed_leads,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
     _resolve_lead_via_company_careers_pages,
+    _workday_board_job_to_lead,
     _salary_is_base_salary,
     _search_single_query,
     _search_single_query_local,
@@ -1780,6 +1782,44 @@ def test_ashby_board_job_to_lead_preserves_title_only_remote_restriction_hint() 
     assert lead is not None
     assert lead.location_hint == "Remote - Ireland only"
     assert "Remote restriction: Ireland only." in lead.evidence_notes
+
+
+def test_workday_board_job_to_lead_builds_remote_ai_pm_lead() -> None:
+    lead = _workday_board_job_to_lead(
+        "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers",
+        "Capital Group",
+        {
+            "title": "Principal Product Manager, AI",
+            "externalPath": "/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456",
+            "locationsText": "Remote - United States",
+            "remoteType": "Remote",
+            "bulletFields": ["Remote - United States", "Posted 2 Days Ago"],
+            "description": "Lead AI product strategy and platform capabilities across the investment experience.",
+        },
+    )
+
+    assert lead is not None
+    assert lead.direct_job_url == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456"
+    assert lead.source_url == "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers"
+    assert lead.is_remote_hint is True
+    assert lead.posted_date_hint == "2 Days Ago"
+
+
+def test_repair_workday_board_task_url_uses_entry_board_url_root() -> None:
+    repaired = _repair_workday_board_task_url(
+        "https://hpe.wd5.myworkdayjobs.com",
+        company_key="hewlettpackardenterprise",
+        entries={
+            "hewlettpackardenterprise": {
+                "board_urls": [
+                    "https://hpe.wd5.myworkdayjobs.com/ACJobSite/job/Sunnyvale-California-United-States-of-America/Principal-Product-Hardware-Manager--Cloud-Infrastructure-and-AI-Networking_1201888-2"
+                ],
+                "careers_roots": [],
+            }
+        },
+    )
+
+    assert repaired == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
 
 
 def test_is_ai_related_product_manager_ignores_discovery_snippet_noise() -> None:
