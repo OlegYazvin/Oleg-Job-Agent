@@ -2166,6 +2166,26 @@ def _normalize_company_key(company_name: str | None) -> str:
     return "".join(character.lower() for character in str(company_name or "") if character.isalnum())
 
 
+def _focus_company_name_is_timeout_safe(company_name: str | None) -> bool:
+    company_key = _normalize_company_key(company_name)
+    if not company_key:
+        return False
+    return not company_key.startswith("builtin")
+
+
+def _sanitize_focus_companies(companies: list[str] | None) -> list[str]:
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    for company in companies or []:
+        normalized_company = re.sub(r"\s+", " ", str(company or "").strip())
+        company_key = _normalize_company_key(normalized_company)
+        if not normalized_company or company_key in seen or not _focus_company_name_is_timeout_safe(normalized_company):
+            continue
+        seen.add(company_key)
+        sanitized.append(normalized_company)
+    return sanitized
+
+
 def _company_looks_small_from_hosts(hosts: list[str]) -> bool:
     normalized_hosts = [host.lower() for host in hosts if host]
     return any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts)
@@ -2488,7 +2508,8 @@ def _build_focus_company_queries(
     include_site_domains: bool,
 ) -> list[str]:
     focus_roles = tuning.focus_roles or _default_focus_role_terms()
-    if not tuning.focus_companies or not focus_roles:
+    focus_companies = _sanitize_focus_companies(tuning.focus_companies)
+    if not focus_companies or not focus_roles:
         return []
 
     recency_terms = _current_recency_terms(settings.timezone)
@@ -2500,7 +2521,7 @@ def _build_focus_company_queries(
     )
 
     company_groups: list[list[str]] = []
-    for company in tuning.focus_companies[:12]:
+    for company in focus_companies[:12]:
         company_term = f"\"{company}\""
         company_queries: list[str] = []
         for role_term in focus_roles[:6]:
@@ -2562,13 +2583,14 @@ def _site_hints_from_board_identifiers(entry: dict[str, object]) -> list[str]:
 
 def _build_watchlist_board_focus_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
     focus_roles = tuning.focus_roles or _default_focus_role_terms()
-    if not tuning.focus_companies or not focus_roles:
+    focus_companies = _sanitize_focus_companies(tuning.focus_companies)
+    if not focus_companies or not focus_roles:
         return []
     watchlist = _merged_focus_company_entries(settings)
     recency_terms = _current_recency_terms(settings.timezone)
     salary_terms = [f"\"${settings.min_base_salary_usd:,}\"", *_salary_disclosure_terms()]
     queries: list[str] = []
-    for company in tuning.focus_companies[:8]:
+    for company in focus_companies[:8]:
         entry = watchlist.get(_normalize_company_key(company))
         if not entry or not _watchlist_entry_is_focusable(entry):
             continue
@@ -3019,6 +3041,7 @@ def _build_targeted_attempt_queries(settings: Settings, tuning: SearchTuning) ->
 
 def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = None) -> list[str]:
     tuning = tuning or SearchTuning(attempt_number=1)
+    focus_companies = _sanitize_focus_companies(tuning.focus_companies)
     role_queries = _base_role_queries()
     scout_queries = _build_small_company_scout_queries(settings, tuning)
     portfolio_scout_queries = _build_portfolio_company_scout_queries(settings, tuning)
@@ -3101,7 +3124,7 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
                 salary_queries.append(f"{role_query} {salary_region} \"base salary\"")
 
     focus_queries.extend(_build_focus_company_queries(settings, tuning, include_site_domains=tuning.attempt_number > 1))
-    for company in tuning.focus_companies[:10]:
+    for company in focus_companies[:10]:
         company_term = f"\"{company}\""
         for role_term in (tuning.focus_roles or _default_focus_role_terms())[:6]:
             for domain in discovery_domains:
@@ -3760,9 +3783,7 @@ def _query_is_company_named_open_web_query(query: str) -> bool:
     normalized_query = " ".join(query.lower().split())
     if not normalized_query or "site:" in normalized_query:
         return False
-    if _company_focused_query_marker(query) is None:
-        return False
-    return _query_is_broad_generic(normalized_query)
+    return _company_focused_query_marker(query) is not None
 
 
 def _query_timeout_skip_reason(
@@ -3813,13 +3834,17 @@ def _query_timeout_skip_reason(
                 f"{company_marker} after an earlier timeout in this pass."
             )
         if (
-            attempt_number >= 2
-            and company_timeout_count >= 1
+            company_timeout_count >= 1
             and _query_is_company_named_open_web_query(normalized_query)
             and not family_has_productive_yield
         ):
+            if attempt_number >= 2:
+                return (
+                    "Late-pass company-specific open-web discovery queries are being suppressed for "
+                    f"{company_marker} after an earlier timeout in this pass."
+                )
             return (
-                "Late-pass company-specific open-web discovery queries are being suppressed for "
+                "Same-pass company-specific open-web discovery queries are being suppressed for "
                 f"{company_marker} after an earlier timeout in this pass."
             )
     if attempt_number >= 3 and "site:getro.com/companies" in lowered_query:
@@ -3910,9 +3935,9 @@ def _select_focus_companies(settings: Settings, diagnostics: SearchDiagnostics, 
             continue
         if not _failure_supports_adaptive_focus(failure):
             continue
-        if failure.company_name:
+        if failure.company_name and _focus_company_name_is_timeout_safe(failure.company_name):
             candidates[failure.company_name] += 1
-    return [company for company, _ in candidates.most_common(8)]
+    return _sanitize_focus_companies([company for company, _ in candidates.most_common(8)])
 
 
 def _normalize_role_title_to_focus_queries(role_title: str) -> list[str]:

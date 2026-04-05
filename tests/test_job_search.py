@@ -91,6 +91,7 @@ from job_agent.job_search import (
     _search_single_query,
     _search_single_query_local,
     _seed_lead_from_failure,
+    _select_focus_companies,
     _select_watchlist_focus_companies,
     _select_focus_roles,
     _should_force_ollama_refinement_sample,
@@ -2864,6 +2865,69 @@ def test_query_timeout_skip_reason_skips_company_salary_variant_after_single_tim
     assert "hopper" in skip_reason.lower()
 
 
+def test_query_timeout_skip_reason_suppresses_same_pass_company_open_web_queries() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Hopper" "AI Product Manager" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Hopper" "Principal Product Manager, AI" remote',
+        attempt_number=1,
+    )
+
+    assert skip_reason is not None
+    assert "same-pass company-specific open-web" in skip_reason.lower()
+    assert "hopper" in skip_reason.lower()
+
+
+def test_query_timeout_skip_reason_keeps_productive_company_open_web_family_open() -> None:
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="query_timeout",
+                detail="timed out",
+                source_query='"Hopper" "AI Product Manager" remote',
+                attempt_number=1,
+                round_number=1,
+            ),
+        ],
+    )
+
+    skip_reason = _query_timeout_skip_reason(
+        diagnostics,
+        '"Hopper" "Principal Product Manager, AI" remote',
+        attempt_number=1,
+        attempt_query_family_metrics={
+            "company_focus": {
+                "executed_queries": 3,
+                "timeout_count": 1,
+                "zero_yield_queries": 1,
+                "fresh_lead_count": 2,
+                "validated_job_count": 0,
+                "new_company_count": 0,
+                "new_board_count": 0,
+                "official_board_lead_count": 0,
+                "frontier_expansion_count": 0,
+            }
+        },
+    )
+
+    assert skip_reason is None
+
+
 def test_query_timeout_skip_reason_suppresses_late_pass_company_open_web_queries() -> None:
     diagnostics = SearchDiagnostics(
         minimum_qualifying_jobs=5,
@@ -4364,6 +4428,57 @@ def test_local_query_rounds_use_site_scoped_focus_queries_on_late_attempts() -> 
     assert flat_queries
     assert any('"Tiny AI"' in query and "site:" in query for query in flat_queries)
     assert not any(query == "AI product manager remote" for query in flat_queries)
+
+
+def test_local_query_rounds_ignore_builtin_focus_company_aliases() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    rounds = _build_local_query_rounds(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            focus_companies=["BuiltinBoston", "Tiny AI"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    flat_queries = [query for query_round in rounds for query in query_round]
+    assert flat_queries
+    assert any('"Tiny AI"' in query for query in flat_queries)
+    assert not any("BuiltinBoston" in query for query in flat_queries)
+
+
+def test_select_focus_companies_skips_builtin_portal_aliases() -> None:
+    settings = build_settings()
+    diagnostics = SearchDiagnostics(
+        minimum_qualifying_jobs=5,
+        failures=[
+            SearchFailure(
+                stage="discovery",
+                reason_code="missing_salary",
+                detail="missing salary",
+                attempt_number=1,
+                round_number=1,
+                company_name="BuiltinBoston",
+                role_title="Senior Product Manager, AI",
+                source_url="https://builtin.com/job/example/123",
+                is_remote=True,
+            ),
+            SearchFailure(
+                stage="discovery",
+                reason_code="missing_salary",
+                detail="missing salary",
+                attempt_number=1,
+                round_number=1,
+                company_name="Tiny AI",
+                role_title="Senior Product Manager, AI",
+                source_url="https://jobs.ashbyhq.com/tinyai/123",
+                is_remote=True,
+            ),
+        ],
+    )
+
+    assert _select_focus_companies(settings, diagnostics, 1) == ["Tiny AI"]
 
 
 def test_lead_priority_prefers_small_company_hosts_over_enterprise_ats() -> None:
