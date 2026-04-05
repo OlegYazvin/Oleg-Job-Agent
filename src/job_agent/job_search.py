@@ -6859,6 +6859,43 @@ def _extract_builtin_apply_url(html: str) -> str | None:
     return None
 
 
+def _extract_builtin_company_followup_urls(html: str) -> list[str]:
+    payload = _extract_builtin_jobposting_payload(html)
+    if not isinstance(payload, dict):
+        return []
+    hiring_org = payload.get("hiringOrganization")
+    if not isinstance(hiring_org, dict):
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def maybe_add(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                maybe_add(item)
+            return
+        candidate = _decode_embedded_absolute_url(value)
+        if not candidate:
+            return
+        parsed = urlparse(candidate)
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return
+        if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+            return
+        if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
+            return
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    for key in ("sameAs", "url", "careerSiteUrl", "careersUrl", "careerUrl", "jobUrl"):
+        maybe_add(hiring_org.get(key))
+
+    return candidates
+
+
 def _extract_builtin_jobposting_payload(html: str) -> dict[str, object] | None:
     soup = BeautifulSoup(html, "html.parser")
     for script in soup.select('script[type="application/ld+json"]'):
@@ -9215,6 +9252,7 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
 
     resolved_source = _normalize_direct_job_url(str(response.url))
     candidates: dict[str, tuple[int, int]] = {}
+    directory_candidates: list[str] = []
 
     def maybe_add(url: str | None, anchor_text: str = "") -> None:
         if not url:
@@ -9242,8 +9280,28 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
         if previous is None or score > previous:
             candidates[normalized_url] = score
 
+    def maybe_add_directory_seed(url: str | None) -> None:
+        normalized_url = _normalize_direct_job_url(str(url or "").strip())
+        if not normalized_url or normalized_url == resolved_source:
+            return
+        if normalized_url in directory_candidates:
+            return
+        if not is_company_discovery_seed_url(normalized_url):
+            return
+        directory_candidates.append(normalized_url)
+
     if _normalize_source_type(lead.source_url) == "builtin":
         maybe_add(_extract_builtin_apply_url(response.text), "Apply")
+        for company_url in _extract_builtin_company_followup_urls(response.text):
+            maybe_add(company_url, "Company website")
+        for task in extract_directory_company_tasks(lead.source_url, response.text):
+            task_url = str(task.get("url") or "").strip()
+            task_company_name = str(task.get("company_name") or "").strip()
+            if task_company_name and not _company_names_match(lead.company_name, task_company_name):
+                continue
+            maybe_add_directory_seed(task_url)
+            for followup_url in default_careers_candidate_urls(task_url):
+                maybe_add_directory_seed(followup_url)
 
     soup = BeautifulSoup(response.text, "html.parser")
     for link in soup.select("a[href]"):
@@ -9253,7 +9311,8 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
         maybe_add(raw_url, "")
 
     ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
-    return [url for url, score in ranked if score[0] > 0][:8]
+    ordered = [*directory_candidates, *[url for url, score in ranked if score[0] > 0]]
+    return list(dict.fromkeys(ordered))[:8]
 
 
 async def _resolve_lead_via_company_careers_pages(lead: JobLead) -> DirectJobResolution | None:
