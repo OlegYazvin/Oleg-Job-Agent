@@ -6080,31 +6080,48 @@ def _repair_company_scoped_board_frontier_tasks(
     for task in frontier:
         if str(task.get("task_type") or "").strip() != "board_url":
             continue
-        if str(task.get("board_identifier") or "").strip():
-            continue
         task_url = str(task.get("url") or "").strip()
         if not task_url:
             continue
         company_name = str(task.get("company_name") or "").strip() or None
         company_key = str(task.get("company_key") or "").strip() or None
-        inferred_board_identifier = _infer_company_scoped_board_identifier(
-            task_url,
-            company_name=company_name,
-            company_key=company_key,
-            entries=entries,
+        raw_board_identifier = str(task.get("board_identifier") or "").strip()
+        normalized_board_identifier = (
+            None if not raw_board_identifier or raw_board_identifier.lower() in {"none", "null"} else raw_board_identifier
         )
-        if not inferred_board_identifier:
+        repaired_board_identifier = str(normalized_board_identifier or board_identifier_from_url(task_url) or "").strip()
+        if not repaired_board_identifier:
+            repaired_board_identifier = str(
+                _infer_company_scoped_board_identifier(
+                    task_url,
+                    company_name=company_name,
+                    company_key=company_key,
+                    entries=entries,
+                )
+                or ""
+            ).strip()
+        if not repaired_board_identifier:
             continue
-        prefix, _, token = inferred_board_identifier.partition(":")
+        prefix, _, token = repaired_board_identifier.partition(":")
         canonical_task_url = task_url
         if prefix == "smartrecruiters" and token:
             canonical_task_url = f"https://jobs.smartrecruiters.com/{token}"
-        task["board_identifier"] = inferred_board_identifier
+        elif prefix == "workday":
+            canonical_task_url = _repair_workday_board_task_url(
+                task_url,
+                company_key=company_key,
+                entries=entries,
+            )
+            repaired_board_identifier = str(board_identifier_from_url(canonical_task_url) or repaired_board_identifier).strip()
+        else:
+            continue
+
+        task["board_identifier"] = repaired_board_identifier
         task["url"] = canonical_task_url
         task["task_key"] = frontier_task_key(
             "board_url",
             canonical_task_url,
-            board_identifier=inferred_board_identifier,
+            board_identifier=repaired_board_identifier,
         )
         task["status"] = "pending"
         task["next_retry_at"] = None

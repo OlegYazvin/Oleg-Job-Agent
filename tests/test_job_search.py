@@ -90,6 +90,7 @@ from job_agent.job_search import (
     _query_timeout_seconds_for_query,
     _query_timeout_skip_reason,
     _repair_direct_job_url,
+    _repair_company_scoped_board_frontier_tasks,
     _repair_workday_board_task_url,
     _replay_seed_leads,
     _refine_local_leads_with_ollama,
@@ -1827,6 +1828,88 @@ def test_repair_workday_board_task_url_uses_entry_board_url_root() -> None:
     )
 
     assert repaired == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
+
+
+def test_repair_company_scoped_board_frontier_tasks_normalizes_literal_none_smartrecruiters_tasks() -> None:
+    frontier = [
+        {
+            "task_key": "board_url:https://jobs.smartrecruiters.com:None",
+            "task_type": "board_url",
+            "url": "https://jobs.smartrecruiters.com",
+            "company_name": "ServiceNow",
+            "company_key": "servicenow",
+            "board_identifier": "None",
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 10,
+            "attempts": 1,
+            "status": "pending",
+            "discovered_from": "company_discovery_index",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "unsupported_adapter",
+        }
+    ]
+
+    _repair_company_scoped_board_frontier_tasks(
+        frontier,
+        entries={
+            "servicenow": {
+                "ats_types": ["SmartRecruiters"],
+                "board_urls": ["https://jobs.smartrecruiters.com"],
+                "careers_roots": [],
+                "source_hosts": ["careers.servicenow.com"],
+            }
+        },
+    )
+
+    task = frontier[0]
+    assert task["board_identifier"] == "smartrecruiters:servicenow"
+    assert task["url"] == "https://jobs.smartrecruiters.com/servicenow"
+    assert task["task_key"] == "board_url:https://jobs.smartrecruiters.com/servicenow:smartrecruiters:servicenow"
+    assert task["next_retry_at"] is None
+    assert task["last_error"] is None
+
+
+def test_repair_company_scoped_board_frontier_tasks_repairs_root_only_workday_tasks() -> None:
+    frontier = [
+        {
+            "task_key": "board_url:https://hpe.wd5.myworkdayjobs.com:workday:hpe.wd5",
+            "task_type": "board_url",
+            "url": "https://hpe.wd5.myworkdayjobs.com",
+            "company_name": "Hewlett Packard Enterprise",
+            "company_key": "hewlettpackardenterprise",
+            "board_identifier": "workday:hpe.wd5",
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 10,
+            "attempts": 1,
+            "status": "pending",
+            "discovered_from": "seed",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "unsupported_adapter",
+        }
+    ]
+
+    _repair_company_scoped_board_frontier_tasks(
+        frontier,
+        entries={
+            "hewlettpackardenterprise": {
+                "ats_types": ["Workday"],
+                "board_urls": [
+                    "https://hpe.wd5.myworkdayjobs.com/ACJobSite/job/Sunnyvale-California-United-States-of-America/Principal-Product-Hardware-Manager--Cloud-Infrastructure-and-AI-Networking_1201888-2"
+                ],
+                "careers_roots": [],
+                "source_hosts": [],
+            }
+        },
+    )
+
+    task = frontier[0]
+    assert task["board_identifier"] == "workday:hpe.wd5"
+    assert task["url"] == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
+    assert task["task_key"] == "board_url:https://hpe.wd5.myworkdayjobs.com/ACJobSite:workday:hpe.wd5"
+    assert task["next_retry_at"] is None
+    assert task["last_error"] is None
 
 
 def test_upsert_company_discovery_from_lead_stores_canonical_workday_board_root() -> None:
