@@ -103,6 +103,8 @@ from job_agent.job_search import (
     _should_refine_local_leads_with_ollama,
     _should_stop_after_dead_attempt,
     _should_accept_trusted_source_fallback_on_fetch_failure,
+    _upsert_company_discovery_from_lead,
+    _upsert_company_discovery_from_validated_job,
     _url_has_strong_expected_company_hint,
     _url_candidate_score,
 )
@@ -1820,6 +1822,48 @@ def test_repair_workday_board_task_url_uses_entry_board_url_root() -> None:
     )
 
     assert repaired == "https://hpe.wd5.myworkdayjobs.com/ACJobSite"
+
+
+def test_upsert_company_discovery_from_lead_stores_canonical_workday_board_root() -> None:
+    entries: dict[str, dict[str, object]] = {}
+    lead = JobLead(
+        company_name="Capital Group",
+        role_title="Principal Product Manager, AI",
+        source_url="https://builtin.com/company/capital-group/jobs",
+        source_type="company_site",
+        direct_job_url="https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Remote-USA/Principal-Product-Manager-AI_R-123456",
+        evidence_notes="Seeded from a trusted direct ATS lead.",
+    )
+
+    _upsert_company_discovery_from_lead(entries, lead, run_id="run-1", ai_pm_candidate_delta=1)
+
+    entry = entries["capitalgroup"]
+    assert entry["board_urls"] == ["https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers"]
+
+
+def test_upsert_company_discovery_from_validated_job_stores_canonical_workday_board_root() -> None:
+    entries: dict[str, dict[str, object]] = {}
+    job = JobPosting(
+        company_name="TigerConnect",
+        role_title="Senior Product Manager - AI & Analytics",
+        direct_job_url="https://tigerconnect.wd1.myworkdayjobs.com/TC/job/Remote---United-States/Senior-Product-Manager---AI---Analytics_R003222",
+        resolved_job_url="https://tigerconnect.wd1.myworkdayjobs.com/TC/job/Remote---United-States/Senior-Product-Manager---AI---Analytics_R003222",
+        ats_platform="Workday",
+        location_text="Remote - United States",
+        is_fully_remote=True,
+        posted_date_text="2026-04-01",
+        posted_date_iso="2026-04-01",
+        base_salary_min_usd=220000,
+        base_salary_max_usd=260000,
+        salary_text="$220,000 - $260,000",
+        evidence_notes="Validated from the direct page.",
+        validation_evidence=[],
+    )
+
+    _upsert_company_discovery_from_validated_job(entries, job, run_id="run-1")
+
+    entry = entries["tigerconnect"]
+    assert entry["board_urls"] == ["https://tigerconnect.wd1.myworkdayjobs.com/TC"]
 
 
 def test_is_ai_related_product_manager_ignores_discovery_snippet_noise() -> None:

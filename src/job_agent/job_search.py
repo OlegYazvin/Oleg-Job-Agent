@@ -6038,6 +6038,20 @@ def _company_name_for_frontier_task(
     return "Unknown Company"
 
 
+def _company_discovery_board_urls_from_sources(*urls: str | None) -> list[str]:
+    board_urls: list[str] = []
+    for raw_url in urls:
+        normalized_url = str(raw_url or "").strip()
+        if not board_identifier_from_url(normalized_url):
+            continue
+        canonical_board_url = str(infer_careers_root(normalized_url) or normalized_url).strip()
+        if board_identifier_from_url(canonical_board_url):
+            board_urls.append(canonical_board_url)
+        else:
+            board_urls.append(normalized_url)
+    return _dedupe_queries(board_urls)
+
+
 def _upsert_company_discovery_from_lead(
     entries: dict[str, dict[str, object]],
     lead: JobLead,
@@ -6046,11 +6060,7 @@ def _upsert_company_discovery_from_lead(
     ai_pm_candidate_delta: int = 0,
     official_board_lead_delta: int = 0,
 ) -> tuple[bool, int]:
-    board_urls = [
-        url
-        for url in (lead.direct_job_url, lead.source_url)
-        if board_identifier_from_url(url)
-    ]
+    board_urls = _company_discovery_board_urls_from_sources(lead.direct_job_url, lead.source_url)
     return upsert_company_discovery_entry(
         entries,
         company_name=lead.company_name,
@@ -6076,7 +6086,7 @@ def _upsert_company_discovery_from_validated_job(
     if not job_url:
         return False, 0
     board_identifier = _extract_company_board_identifier(job_url)
-    board_urls = [job_url] if board_identifier else []
+    board_urls = _company_discovery_board_urls_from_sources(job_url) if board_identifier else []
     return upsert_company_discovery_entry(
         entries,
         company_name=job.company_name,
