@@ -10,6 +10,7 @@ from job_agent.company_discovery import (
     load_company_discovery_frontier,
     make_frontier_task,
     save_company_discovery_entries,
+    save_company_discovery_frontier,
     select_frontier_tasks,
     is_low_value_company_discovery_entry,
     upsert_frontier_task,
@@ -346,6 +347,65 @@ def test_load_company_discovery_frontier_dedupes_normalized_board_tasks(tmp_path
     assert tasks[0]["url"] == "https://jobs.ashbyhq.com/butterflymx"
     assert tasks[0]["board_identifier"] == "ashby:butterflymx"
     assert tasks[0]["status"] == "completed"
+
+
+def test_save_company_discovery_frontier_sanitizes_directory_company_leaks(tmp_path: Path) -> None:
+    save_company_discovery_frontier(
+        tmp_path,
+        [
+            {
+                "task_key": "careers_root:https://www.builtin.com/company/boeing/articles/jobs",
+                "task_type": "careers_root",
+                "url": "https://www.builtin.com/company/boeing/articles/jobs",
+                "company_name": "Boeing",
+                "company_key": "boeing",
+                "board_identifier": None,
+                "source_kind": "careers_root",
+                "source_trust": 5,
+                "priority": 8,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "https://www.builtin.com/company/boeing",
+                "next_retry_at": None,
+            },
+            {
+                "task_key": "careers_root:https://www.builtin.com/company/boeing/jobs",
+                "task_type": "careers_root",
+                "url": "https://www.builtin.com/company/boeing/jobs",
+                "company_name": "Boeing",
+                "company_key": "boeing",
+                "board_identifier": None,
+                "source_kind": "careers_root",
+                "source_trust": 5,
+                "priority": 6,
+                "attempts": 1,
+                "status": "completed",
+                "discovered_from": "https://www.builtin.com/company/boeing",
+                "next_retry_at": None,
+            },
+            {
+                "task_key": "careers_root:https://www.builtin.com/company/comcast-3/jobs",
+                "task_type": "careers_root",
+                "url": "https://www.builtin.com/company/comcast-3/jobs",
+                "company_name": "FreeWheel",
+                "company_key": "freewheel",
+                "board_identifier": None,
+                "source_kind": "careers_root",
+                "source_trust": 5,
+                "priority": 8,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "https://www.builtin.com/company/freewheel",
+                "next_retry_at": None,
+            },
+        ],
+    )
+
+    payload = json.loads(company_discovery_frontier_path(tmp_path).read_text(encoding="utf-8"))
+
+    assert len(payload) == 1
+    assert payload[0]["url"] == "https://www.builtin.com/company/boeing/jobs"
+    assert payload[0]["status"] == "completed"
 
 
 def test_load_company_discovery_entries_sanitizes_directory_careers_roots(tmp_path: Path) -> None:

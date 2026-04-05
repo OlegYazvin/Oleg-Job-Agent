@@ -6228,6 +6228,89 @@ def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandar
     assert any(task["url"] == "https://acme.example/join-the-team" for task in frontier)
 
 
+def test_collect_company_discovery_seed_leads_sidecar_skips_conflicting_directory_company_urls(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.llm_provider = "ollama"
+    settings.ollama_inline_lead_refinement_enabled = False
+    settings.ollama_sidecar_discovery_enabled = True
+    settings.ollama_sidecar_max_requests_per_run = 1
+    settings.company_discovery_frontier_budget_per_run = 1
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 0
+
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "company_page:https://www.builtin.com/company/capital-one",
+                "task_type": "company_page",
+                "url": "https://www.builtin.com/company/capital-one",
+                "company_name": "Capital One",
+                "company_key": "capitalone",
+                "source_kind": "company_page",
+                "source_trust": 5,
+                "priority": 8,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "test",
+            }
+        ],
+    )
+
+    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: [])
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return """
+        <html>
+          <body>
+            <a href="/company/capital-one/about">About Capital One</a>
+            <a href="/company/velocity-black/about">About Velocity Black</a>
+          </body>
+        </html>
+        """
+
+    async def fake_suggest_frontier_urls(*_args, **_kwargs) -> list[dict[str, object]]:
+        return [
+            {
+                "url": "https://www.builtin.com/company/velocity-black/jobs",
+                "task_type": "careers_root",
+                "priority_boost": 2,
+                "reason": "Suggested related company page.",
+            },
+            {
+                "url": "https://www.builtin.com/company/capital-one/jobs",
+                "task_type": "careers_root",
+                "priority_boost": 1,
+                "reason": "Suggested careers page for the active company.",
+            },
+        ]
+
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+    monkeypatch.setattr("job_agent.job_search._suggest_frontier_urls_with_ollama_sidecar", fake_suggest_frontier_urls)
+
+    _leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-sidecar-conflict",
+        )
+    )
+
+    assert metrics["source_adapter_yields"]["ollama_sidecar"] == 1
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    assert any(task["url"] == "https://www.builtin.com/company/capital-one/jobs" for task in frontier)
+    assert not any(task["url"] == "https://www.builtin.com/company/velocity-black/jobs" for task in frontier)
+
+
 def test_collect_company_discovery_seed_leads_skips_recursive_discovery_detail_pages(
     monkeypatch,
     tmp_path: Path,

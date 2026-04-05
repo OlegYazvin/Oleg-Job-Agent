@@ -384,12 +384,9 @@ def save_company_discovery_entries(data_dir: Path, entries: Mapping[str, Mapping
     _write_json(company_discovery_index_path(data_dir), rendered)
 
 
-def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
-    payload = _load_json(company_discovery_frontier_path(data_dir), default=[])
-    if not isinstance(payload, list):
-        return []
+def _sanitize_company_discovery_frontier_tasks(tasks: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     deduped_tasks: dict[str, dict[str, Any]] = {}
-    for raw_task in payload:
+    for raw_task in tasks:
         if not isinstance(raw_task, Mapping):
             continue
         try:
@@ -450,8 +447,15 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
     return list(deduped_tasks.values())
 
 
+def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
+    payload = _load_json(company_discovery_frontier_path(data_dir), default=[])
+    if not isinstance(payload, list):
+        return []
+    return _sanitize_company_discovery_frontier_tasks(payload)
+
+
 def save_company_discovery_frontier(data_dir: Path, tasks: list[Mapping[str, Any]]) -> None:
-    rendered = [CompanyDiscoveryFrontierTask.model_validate(task).model_dump(mode="json") for task in tasks]
+    rendered = _sanitize_company_discovery_frontier_tasks(tasks)
     _write_json(company_discovery_frontier_path(data_dir), rendered)
 
 

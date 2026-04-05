@@ -4361,9 +4361,15 @@ def _company_hint_from_url(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
     path_segments = [segment for segment in parsed.path.split("/") if segment]
+    if "builtin" in host and len(path_segments) >= 2 and path_segments[0] == "company":
+        return path_segments[1].replace("-", " ").title()
     if "dynamitejobs.com" in host and len(path_segments) >= 2 and path_segments[0] == "company":
         return path_segments[1].replace("-", " ").title()
     if "ycombinator.com" in host and len(path_segments) >= 3 and path_segments[0] == "companies":
+        return path_segments[1].replace("-", " ").title()
+    if "workatastartup.com" in host and len(path_segments) >= 2 and path_segments[0] in {"company", "companies"}:
+        return path_segments[1].replace("-", " ").title()
+    if "wellfound.com" in host and len(path_segments) >= 2 and path_segments[0] in {"company", "companies", "organization", "organizations"}:
         return path_segments[1].replace("-", " ").title()
     if "remoterocketship.com" in host and len(path_segments) >= 2 and path_segments[0] == "company":
         return path_segments[1].replace("-", " ").title()
@@ -5865,6 +5871,13 @@ async def _collect_company_discovery_seed_leads(
             preferred_task_type=task_type,
         ):
             return False
+        if task_type in {"company_page", "careers_root"} and company_name:
+            candidate_company_hint = _company_hint_from_url(normalized_url)
+            if (
+                not _is_weak_company_hint(candidate_company_hint)
+                and not _company_names_match(company_name, candidate_company_hint)
+            ):
+                return False
         return upsert_frontier_task(
             frontier,
             task_type=task_type,
