@@ -108,3 +108,27 @@ def test_load_settings_prefers_project_env_over_inherited_firefox_profile_dir(
     settings = load_settings(tmp_path)
 
     assert settings.firefox_extension_profile_dir == tmp_path / "profiles/default-release"
+
+
+def test_load_settings_uses_discovery_first_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("USE_OPENAI_FALLBACK", "false")
+    _write_env(
+        tmp_path,
+        "\n".join(
+            [
+                "OPENAI_API_KEY=",
+                "LLM_PROVIDER=ollama",
+                "USE_OPENAI_FALLBACK=false",
+            ]
+        ),
+    )
+
+    settings = load_settings(tmp_path)
+
+    assert settings.search_round_query_limit == 8
+    assert settings.reacquisition_attempt_cap == 4
+    assert settings.company_discovery_frontier_budget_per_run == 24
+    assert settings.company_discovery_board_crawl_budget_per_run == 24
+    assert settings.company_discovery_directory_crawl_budget_per_run == 16

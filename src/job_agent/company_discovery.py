@@ -101,6 +101,27 @@ LOW_TRUST_SCOUT_HOST_FRAGMENTS = (
 )
 
 DEFAULT_FRONTIER_RETRY_DELAY = timedelta(hours=6)
+GENERIC_DIRECTORY_COMPANY_KEYS = {
+    "about",
+    "career",
+    "careers",
+    "companies",
+    "company",
+    "employer",
+    "employers",
+    "hire",
+    "hiring",
+    "job",
+    "jobs",
+    "location",
+    "locations",
+    "remote",
+    "role",
+    "roles",
+    "search",
+    "team",
+    "teams",
+}
 
 
 def _utc_now_iso() -> str:
@@ -203,8 +224,15 @@ def _directory_company_candidate(
 
     if not slug:
         return None
-    company_name = _slug_to_company_name(slug, company_name_hint=company_name_hint)
+    cleaned_slug = re.sub(r"[-_](?:\d+)$", "", str(slug or "").strip())
+    slug_key = _normalize_company_key(cleaned_slug)
+    if not slug_key or slug_key in GENERIC_DIRECTORY_COMPANY_KEYS:
+        return None
+    company_name = _slug_to_company_name(cleaned_slug, company_name_hint=company_name_hint)
     if not company_name:
+        return None
+    company_key = _normalize_company_key(company_name)
+    if not company_key or company_key in GENERIC_DIRECTORY_COMPANY_KEYS:
         return None
     return {
         "url": normalized.rstrip("/"),
@@ -278,7 +306,7 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
     payload = _load_json(company_discovery_frontier_path(data_dir), default=[])
     if not isinstance(payload, list):
         return []
-    tasks: list[dict[str, Any]] = []
+    deduped_tasks: dict[str, dict[str, Any]] = {}
     for raw_task in payload:
         if not isinstance(raw_task, Mapping):
             continue
@@ -288,6 +316,18 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
             continue
         rendered = task.model_dump(mode="json")
         task_type = str(rendered.get("task_type") or "")
+        normalized_url = _normalize_frontier_task_url(task_type, str(rendered.get("url") or ""))
+        board_identifier = (
+            str(rendered.get("board_identifier") or "").strip()
+            or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
+        )
+        rendered["url"] = normalized_url
+        rendered["board_identifier"] = board_identifier or None
+        rendered["task_key"] = frontier_task_key(
+            task_type,
+            normalized_url,
+            board_identifier=board_identifier or None,
+        )
         candidate = _directory_company_candidate(
             str(rendered.get("url") or ""),
             company_name_hint=str(rendered.get("company_name") or "").strip() or None,
@@ -299,8 +339,26 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
         if candidate is not None:
             rendered["company_name"] = candidate["company_name"]
             rendered["company_key"] = _normalize_company_key(candidate["company_name"]) or None
-        tasks.append(rendered)
-    return tasks
+        task_key = str(rendered.get("task_key") or "")
+        existing = deduped_tasks.get(task_key)
+        if existing is None:
+            deduped_tasks[task_key] = rendered
+            continue
+        existing["priority"] = max(int(existing.get("priority") or 0), int(rendered.get("priority") or 0))
+        existing["source_trust"] = max(int(existing.get("source_trust") or 0), int(rendered.get("source_trust") or 0))
+        existing["attempts"] = max(int(existing.get("attempts") or 0), int(rendered.get("attempts") or 0))
+        if not existing.get("company_name") and rendered.get("company_name"):
+            existing["company_name"] = rendered["company_name"]
+        if not existing.get("company_key") and rendered.get("company_key"):
+            existing["company_key"] = rendered["company_key"]
+        if str(existing.get("status") or "") != "completed" and str(rendered.get("status") or "") == "completed":
+            existing["status"] = "completed"
+            existing["next_retry_at"] = None
+            existing["last_error"] = None
+        elif str(existing.get("status") or "") == "completed":
+            existing["next_retry_at"] = None
+            existing["last_error"] = None
+    return list(deduped_tasks.values())
 
 
 def save_company_discovery_frontier(data_dir: Path, tasks: list[Mapping[str, Any]]) -> None:
@@ -363,6 +421,22 @@ def infer_careers_root(url: str | None) -> str | None:
             return f"{parsed.scheme}://{host}/{segments[0]}"
         return f"{parsed.scheme}://{host}"
     return f"{parsed.scheme}://{host}/careers"
+
+
+def _normalize_board_root_url(url: str | None) -> str | None:
+    normalized = str(url or "").strip().rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    if not board_identifier_from_url(normalized):
+        return normalized
+    return (infer_careers_root(normalized) or normalized).rstrip("/")
+
+
+def _normalize_frontier_task_url(task_type: str, url: str | None) -> str:
+    normalized = str(url or "").strip().rstrip("/")
+    if task_type == "board_url":
+        return _normalize_board_root_url(normalized) or normalized
+    return normalized
 
 
 def board_identifier_from_url(url: str | None) -> str | None:
@@ -509,6 +583,7 @@ def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
     candidates: list[str] = []
     parsed_page = urlparse(page_url) if page_url.startswith(("http://", "https://")) else None
     page_host = (parsed_page.netloc or "").lower() if parsed_page else ""
+    page_uses_directory_routing = _is_blocked_external_company_homepage_host(page_host)
 
     def maybe_add(raw_url: str | None) -> None:
         normalized = str(raw_url or "").strip()
@@ -521,6 +596,15 @@ def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
         host = (parsed.netloc or "").lower()
         path = (parsed.path or "").lower()
         if page_host and host != page_host:
+            return
+        if page_uses_directory_routing:
+            candidate = _directory_company_candidate(resolved)
+            if candidate is None:
+                return
+            candidate_url = str(candidate["url"]).rstrip("/")
+            if candidate["task_type"] == "company_page":
+                candidate_url = f"{candidate_url}/jobs"
+            candidates.append(candidate_url.rstrip("/"))
             return
         if any(path.startswith(candidate) or candidate in path for candidate in COMMON_CAREERS_PATHS):
             candidates.append(resolved.rstrip("/"))
@@ -582,7 +666,15 @@ def default_careers_candidate_urls(source_url: str | None) -> list[str]:
     normalized = str(source_url or "").strip()
     if not normalized.startswith(("http://", "https://")):
         return []
+    directory_candidate = _directory_company_candidate(normalized)
+    if directory_candidate is not None:
+        directory_url = str(directory_candidate["url"]).rstrip("/")
+        if directory_candidate["task_type"] == "careers_root":
+            return [directory_url]
+        return [f"{directory_url}/jobs"]
     parsed = urlparse(normalized)
+    if _is_blocked_external_company_homepage_host((parsed.netloc or "").lower()):
+        return []
     base = f"{parsed.scheme}://{parsed.netloc}"
     candidates = [f"{base}{path}" for path in COMMON_CAREERS_PATHS]
     return _dedupe_strings(candidates, limit=8)
@@ -614,15 +706,18 @@ def make_frontier_task(
     status: str = "pending",
     next_retry_at: str | None = None,
 ) -> dict[str, Any]:
-    normalized_url = str(url or "").strip().rstrip("/")
+    normalized_url = _normalize_frontier_task_url(task_type, url)
     normalized_company_key = company_key or _normalize_company_key(company_name)
+    effective_board_identifier = str(
+        board_identifier or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
+    ).strip()
     return CompanyDiscoveryFrontierTask(
-        task_key=frontier_task_key(task_type, normalized_url, board_identifier=board_identifier),
+        task_key=frontier_task_key(task_type, normalized_url, board_identifier=effective_board_identifier or None),
         task_type=task_type,
         url=normalized_url,
         company_name=company_name,
         company_key=normalized_company_key or None,
-        board_identifier=board_identifier,
+        board_identifier=effective_board_identifier or None,
         source_kind=source_kind or classify_source_kind(normalized_url, explicit_task_type=task_type),
         source_trust=int(source_trust if source_trust is not None else trust_score_for_url(normalized_url, explicit_task_type=task_type)),
         priority=int(priority),
@@ -645,6 +740,7 @@ def upsert_frontier_task(
     source_trust: int | None = None,
     priority: int = 0,
     discovered_from: str | None = None,
+    reactivate_completed: bool = False,
 ) -> bool:
     task = make_frontier_task(
         task_type=task_type,
@@ -667,7 +763,7 @@ def upsert_frontier_task(
             existing["company_name"] = task["company_name"]
         if not existing.get("company_key") and task.get("company_key"):
             existing["company_key"] = task["company_key"]
-        if existing.get("status") == "completed":
+        if existing.get("status") == "completed" and reactivate_completed:
             existing["status"] = "pending"
         return False
     tasks.append(task)
@@ -702,7 +798,43 @@ def select_frontier_tasks(
             str(task.get("url") or ""),
         )
     )
-    return [dict(task) for task in candidates[:budget]]
+
+    def selection_group_key(task: dict[str, Any]) -> str:
+        company_key = str(task.get("company_key") or "").strip()
+        if company_key:
+            return f"company:{company_key}"
+        board_identifier = str(task.get("board_identifier") or "").strip()
+        if board_identifier:
+            return f"board:{board_identifier}"
+        host = (urlparse(str(task.get("url") or "")).netloc or "").lower()
+        if host:
+            return f"host:{host}"
+        return f"task:{str(task.get('task_key') or '')}"
+
+    grouped_candidates: dict[str, list[dict[str, Any]]] = {}
+    ordered_groups: list[str] = []
+    for task in candidates:
+        group_key = selection_group_key(task)
+        if group_key not in grouped_candidates:
+            grouped_candidates[group_key] = []
+            ordered_groups.append(group_key)
+        grouped_candidates[group_key].append(task)
+
+    selected: list[dict[str, Any]] = []
+    active_groups = list(ordered_groups)
+    while active_groups and len(selected) < budget:
+        next_round_groups: list[str] = []
+        for group_key in active_groups:
+            queue = grouped_candidates.get(group_key) or []
+            if not queue:
+                continue
+            selected.append(dict(queue.pop(0)))
+            if queue and len(selected) < budget:
+                next_round_groups.append(group_key)
+            if len(selected) >= budget:
+                break
+        active_groups = next_round_groups
+    return selected
 
 
 def update_frontier_task_state(
@@ -821,9 +953,15 @@ def is_low_value_company_discovery_entry(entry: Mapping[str, Any]) -> bool:
     if [item for item in entry.get("board_urls") or [] if str(item).strip()]:
         return False
     source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
-    if not source_hosts:
+    careers_root_hosts = [
+        (urlparse(str(item).strip()).netloc or "").lower()
+        for item in entry.get("careers_roots") or []
+        if str(item).strip().startswith(("http://", "https://"))
+    ]
+    recursive_hosts = [host for host in [*source_hosts, *careers_root_hosts] if host]
+    if not recursive_hosts:
         return False
-    return all(_is_recursive_platform_host(host) for host in source_hosts)
+    return all(_is_recursive_platform_host(host) for host in recursive_hosts)
 
 
 def upsert_company_discovery_entry(
@@ -852,7 +990,8 @@ def upsert_company_discovery_entry(
     entry = dict(entries.get(company_key) or {})
     existing_board_identifiers = [str(item) for item in entry.get("board_identifiers", []) if str(item).strip()]
     new_board_identifiers = list(board_identifiers or [])
-    for board_url in board_urls or []:
+    normalized_board_urls = [normalized for url in board_urls or [] if (normalized := _normalize_board_root_url(url))]
+    for board_url in normalized_board_urls:
         identifier = board_identifier_from_url(board_url)
         if identifier:
             new_board_identifiers.append(identifier)
@@ -875,11 +1014,11 @@ def upsert_company_discovery_entry(
             "company_name": company_name,
             "careers_roots": _dedupe_strings([*existing.careers_roots, *([careers_root] if careers_root else [])], limit=12),
             "ats_types": _dedupe_strings(
-                [*existing.ats_types, *(ats_types or []), *[value for value in (board_url_ats_type(url) for url in board_urls or []) if value]],
+                [*existing.ats_types, *(ats_types or []), *[value for value in (board_url_ats_type(url) for url in normalized_board_urls) if value]],
                 limit=12,
             ),
             "board_identifiers": deduped_board_identifiers,
-            "board_urls": _dedupe_strings([*existing.board_urls, *(board_urls or [])], limit=24),
+            "board_urls": _dedupe_strings([*existing.board_urls, *normalized_board_urls], limit=24),
             "source_hosts": _dedupe_strings(
                 [
                     *existing.source_hosts,

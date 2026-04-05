@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter, deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from html import unescape
@@ -2169,6 +2170,30 @@ def _company_looks_small_from_hosts(hosts: list[str]) -> bool:
     return any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts)
 
 
+def _company_discovery_entry_seed_priority(entry: Mapping[str, object]) -> tuple[int, int, int, int, int, str]:
+    source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
+    board_identifiers = [str(item).strip() for item in entry.get("board_identifiers") or [] if str(item).strip()]
+    careers_roots = [str(item).strip() for item in entry.get("careers_roots") or [] if str(item).strip()]
+    official_board_lead_count = max(0, int(entry.get("official_board_lead_count") or 0))
+    recent_fresh_role_count = max(0, int(entry.get("recent_fresh_role_count") or 0))
+    board_crawl_success_count = max(0, int(entry.get("board_crawl_success_count") or 0))
+    saturation_score = official_board_lead_count + recent_fresh_role_count + board_crawl_success_count * 4
+    if board_identifiers and official_board_lead_count == 0:
+        exploration_stage = 0
+    elif careers_roots and official_board_lead_count == 0:
+        exploration_stage = 1
+    else:
+        exploration_stage = 2
+    return (
+        exploration_stage,
+        0 if _company_looks_small_from_hosts(source_hosts) else 1,
+        saturation_score,
+        -int(entry.get("source_trust") or 0),
+        -len(board_identifiers),
+        str(entry.get("company_name") or "").lower(),
+    )
+
+
 def _watchlist_reason_count(entry: dict[str, object], reason_code: str) -> int:
     reasons = entry.get("recent_rejection_reasons")
     if not isinstance(reasons, dict):
@@ -2565,10 +2590,15 @@ def _build_company_discovery_seed_queries(settings: Settings, tuning: SearchTuni
         "\"Principal Product Manager\" AI remote",
         "\"Principal Product Manager\" \"machine learning\" remote",
         "\"Principal Product Manager\" GenAI remote",
+        "\"Principal Product Manager\" \"agentic AI\" remote",
+        "\"Principal Product Manager\" \"applied AI\" remote",
+        "\"Principal Product Manager\" LLM remote",
         "\"Staff Product Manager\" AI remote",
+        "\"Staff Product Manager\" \"machine learning platform\" remote",
         "\"Group Product Manager\" AI remote",
         "\"Lead Product Manager\" AI remote",
         "\"Senior Product Manager\" AI remote",
+        "\"Technical Product Manager\" AI remote",
         "\"AI Product Manager\" remote",
         "\"AI platform product manager\" remote",
         "\"agentic AI\" \"product manager\" remote",
@@ -2604,7 +2634,8 @@ def _build_company_discovery_seed_queries(settings: Settings, tuning: SearchTuni
             queries.append(f"{role_term} site:{domain} {recency_terms[0]}")
         for domain in directory_domains:
             queries.append(f"{role_term} site:{domain}")
-    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 3, 18)]
+            queries.append(f"{role_term} site:{domain} {recency_terms[0]}")
+    return _dedupe_queries(queries)[: max(settings.search_round_query_limit * 4, 28)]
 
 
 def _build_local_small_company_scout_queries(settings: Settings, tuning: SearchTuning) -> list[str]:
@@ -6085,22 +6116,17 @@ async def _collect_company_discovery_seed_leads(
 
     if settings.company_discovery_indexer_enabled:
         for seeded_task in source_directory_seed_tasks():
-            upsert_frontier_task(frontier, **_frontier_task_kwargs(seeded_task))
+            upsert_frontier_task(frontier, reactivate_completed=True, **_frontier_task_kwargs(seeded_task))
 
         ranked_entries = [
             (company_key, entry)
             for company_key, entry in sorted(
                 entries.items(),
-                key=lambda item: (
-                    -int(item[1].get("official_board_lead_count") or 0),
-                    -int(item[1].get("recent_fresh_role_count") or 0),
-                    -int(item[1].get("source_trust") or 0),
-                    str(item[1].get("company_name") or ""),
-                ),
+                key=lambda item: _company_discovery_entry_seed_priority(item[1]),
             )
             if not is_low_value_company_discovery_entry(entry)
         ]
-        for company_key, entry in ranked_entries[:40]:
+        for company_key, entry in ranked_entries[: max(60, settings.company_discovery_frontier_budget_per_run * 4)]:
             company_name = str(entry.get("company_name") or "").strip() or _title_case_company_name(company_key)
             priority = max(
                 4,
@@ -6267,7 +6293,7 @@ async def _collect_company_discovery_seed_leads(
         )
 
     if settings.company_discovery_enabled:
-        query_budget = max(6, settings.search_round_query_limit * 2)
+        query_budget = max(12, settings.search_round_query_limit * 3)
         for query in _build_company_discovery_seed_queries(settings, SearchTuning(attempt_number=1))[:query_budget]:
             try:
                 _, discovered = await _search_query_with_context(
@@ -6286,7 +6312,7 @@ async def _collect_company_discovery_seed_leads(
                 query_leads.append(lead)
                 fresh_for_query += 1
 
-        query_followup_budget = min(max(0, settings.company_discovery_frontier_budget_per_run), 6)
+        query_followup_budget = min(max(0, settings.company_discovery_frontier_budget_per_run), 12)
         for task in select_frontier_tasks(frontier, budget=query_followup_budget, task_types={"company_page", "careers_root"}):
             task_key = str(task.get("task_key") or "")
             task_url = str(task.get("url") or "").strip()

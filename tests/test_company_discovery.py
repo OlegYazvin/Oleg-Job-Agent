@@ -9,6 +9,7 @@ from job_agent.company_discovery import (
     save_company_discovery_entries,
     select_frontier_tasks,
     is_low_value_company_discovery_entry,
+    upsert_frontier_task,
     upsert_company_discovery_entry,
     company_discovery_frontier_path,
     extract_company_homepage_urls,
@@ -85,6 +86,38 @@ def test_select_frontier_tasks_only_returns_pending_ready_items() -> None:
 
     assert len(selected) == 1
     assert selected[0]["task_type"] == "directory_source"
+
+
+def test_select_frontier_tasks_round_robins_across_companies() -> None:
+    tasks = [
+        make_frontier_task(task_type="company_page", url="https://alpha.example", company_name="Alpha", priority=10),
+        make_frontier_task(task_type="careers_root", url="https://alpha.example/careers", company_name="Alpha", priority=9),
+        make_frontier_task(task_type="company_page", url="https://beta.example", company_name="Beta", priority=8),
+    ]
+
+    selected = select_frontier_tasks(tasks, budget=3)
+
+    assert [task["company_key"] for task in selected] == ["alpha", "beta", "alpha"]
+
+
+def test_upsert_frontier_task_does_not_reactivate_completed_entries_by_default() -> None:
+    tasks = [
+        {
+            **make_frontier_task(task_type="company_page", url="https://alpha.example", company_name="Alpha", priority=6),
+            "status": "completed",
+        }
+    ]
+
+    created = upsert_frontier_task(
+        tasks,
+        task_type="company_page",
+        url="https://alpha.example",
+        company_name="Alpha",
+        priority=9,
+    )
+
+    assert created is False
+    assert tasks[0]["status"] == "completed"
 
 
 def test_extract_directory_company_tasks_preserves_company_identity_for_directory_pages() -> None:
@@ -181,6 +214,54 @@ def test_load_company_discovery_frontier_repairs_directory_identity_and_filters_
     assert tasks[0]["company_name"] == "Bilt Rewards"
     assert tasks[0]["company_key"] == "biltrewards"
     assert {task["task_type"] for task in tasks} == {"careers_root", "directory_source"}
+
+
+def test_load_company_discovery_frontier_dedupes_normalized_board_tasks(tmp_path: Path) -> None:
+    frontier_path = company_discovery_frontier_path(tmp_path)
+    frontier_path.write_text(
+        """
+        [
+          {
+            "task_key": "board_url:https://jobs.ashbyhq.com/butterflymx/jobs/123",
+            "task_type": "board_url",
+            "url": "https://jobs.ashbyhq.com/butterflymx/jobs/123",
+            "company_name": "ButterflyMX",
+            "company_key": "butterflymx",
+            "board_identifier": null,
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 9,
+            "attempts": 0,
+            "status": "pending",
+            "discovered_from": null,
+            "next_retry_at": null
+          },
+          {
+            "task_key": "board_url:https://jobs.ashbyhq.com/butterflymx",
+            "task_type": "board_url",
+            "url": "https://jobs.ashbyhq.com/butterflymx",
+            "company_name": "ButterflyMX",
+            "company_key": "butterflymx",
+            "board_identifier": "ashby:butterflymx",
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 8,
+            "attempts": 1,
+            "status": "completed",
+            "discovered_from": null,
+            "next_retry_at": null
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+
+    tasks = load_company_discovery_frontier(tmp_path)
+
+    assert len(tasks) == 1
+    assert tasks[0]["url"] == "https://jobs.ashbyhq.com/butterflymx"
+    assert tasks[0]["board_identifier"] == "ashby:butterflymx"
+    assert tasks[0]["status"] == "completed"
 
 
 def test_is_low_value_company_discovery_entry_flags_recursive_platform_only_entries() -> None:

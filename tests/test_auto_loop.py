@@ -514,6 +514,76 @@ def test_build_run_improvement_analysis_detects_coverage_regression(tmp_path: Pa
     assert analysis.metric_deltas["total_current_validated_jobs_delta"] < 0
 
 
+def test_build_run_improvement_analysis_prefers_discovery_over_small_coverage_dip(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    older = _make_scorecard(
+        run_id="run-older",
+        status="completed",
+        generated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        novel_validated_jobs_count=0,
+        reacquired_validated_jobs_count=3,
+        total_current_validated_jobs_count=3,
+        fresh_new_leads_count=8,
+    ).model_copy(
+        update={
+            "discovery": RunDiscoveryMetrics(
+                unique_leads_discovered_count=8,
+                fresh_new_leads_count=8,
+                replayed_seed_leads_count=0,
+                repeated_failed_leads_suppressed_count=0,
+                executed_query_count=10,
+                query_timeout_count=1,
+                query_skipped_timeout_budget_count=0,
+                zero_yield_pass_count=0,
+                discovery_efficiency=0.8,
+                new_companies_discovered_count=0,
+                new_boards_discovered_count=0,
+                official_board_leads_count=140,
+                companies_with_ai_pm_leads_count=3,
+                company_discovery_yield=0.0,
+                company_concentration_top_10_share=0.82,
+            )
+        }
+    )
+    current = _make_scorecard(
+        run_id="run-current",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
+        novel_validated_jobs_count=0,
+        reacquired_validated_jobs_count=2,
+        total_current_validated_jobs_count=2,
+        fresh_new_leads_count=9,
+    ).model_copy(
+        update={
+            "discovery": RunDiscoveryMetrics(
+                unique_leads_discovered_count=9,
+                fresh_new_leads_count=9,
+                replayed_seed_leads_count=0,
+                repeated_failed_leads_suppressed_count=0,
+                executed_query_count=11,
+                query_timeout_count=2,
+                query_skipped_timeout_budget_count=0,
+                zero_yield_pass_count=0,
+                discovery_efficiency=0.818,
+                new_companies_discovered_count=0,
+                new_boards_discovered_count=0,
+                official_board_leads_count=150,
+                companies_with_ai_pm_leads_count=3,
+                company_discovery_yield=0.0,
+                company_concentration_top_10_share=0.83,
+            )
+        }
+    )
+    save_run_scorecard(settings.data_dir, older)
+    save_run_scorecard(settings.data_dir, current)
+
+    analysis = build_run_improvement_analysis(settings, iteration_number=2, run_id="run-current")
+
+    assert analysis.selected_theme in {"company_concentration_gap", "diversification_gap", "company_discovery_gap"}
+    assert analysis.selected_theme != "coverage_regression"
+
+
 def test_ensure_baseline_commit_commits_dirty_main(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "config", "user.name", "Oleg Y"], cwd=tmp_path, check=True, capture_output=True, text=True)
@@ -846,6 +916,10 @@ def test_build_run_improvement_analysis_can_prioritize_company_discovery_gap(tmp
     analysis = build_run_improvement_analysis(settings, iteration_number=1, run_id="run-current")
 
     assert analysis.selected_theme == "company_discovery_gap"
+
+
+def test_coverage_regression_does_not_require_full_workflow_rerun() -> None:
+    assert _theme_requires_full_workflow_rerun("coverage_regression") is False
 
 
 def test_run_autonomous_loop_records_workflow_rerun_evidence(tmp_path: Path, monkeypatch) -> None:

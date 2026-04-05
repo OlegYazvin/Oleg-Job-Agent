@@ -60,7 +60,6 @@ FULL_WORKFLOW_RERUN_THEMES = {
     "low_fresh_discovery",
     "linkedin_message_gap",
     "plateau_breaker",
-    "coverage_regression",
     "diversification_gap",
     "company_discovery_gap",
     "official_board_coverage_gap",
@@ -544,6 +543,11 @@ def _build_patterns(
     recent_selected_themes = recent_selected_themes or []
     repeated_theme, repeated_theme_streak = _theme_streak(recent_selected_themes)
     recent_window = window[:5]
+    zero_discovery_recent_count = sum(
+        1
+        for entry in recent_window
+        if entry.discovery.new_companies_discovered_count == 0 and entry.discovery.new_boards_discovered_count == 0
+    )
 
     if current.status == "failed":
         patterns.append(
@@ -621,30 +625,37 @@ def _build_patterns(
         current.discovery.new_companies_discovered_count == 0
         and current.discovery.new_boards_discovered_count == 0
         and current.outcome.total_current_validated_jobs_count == 0
-        and current.outcome.fresh_new_leads_count <= 6
+        and timeout_burden < 8
+        and validation_hard_filter_burden < 3
+        and (current.outcome.fresh_new_leads_count <= 8 or zero_discovery_recent_count >= 2)
     ):
         patterns.append(
             _pattern(
                 "company_discovery_gap",
                 "The workflow is not expanding its company/board universe enough; improve built-in company discovery instead of relying on replay seeds and known companies.",
-                42.0,
+                36.0 + zero_discovery_recent_count * 3.0,
                 new_companies_discovered_count=current.discovery.new_companies_discovered_count,
                 new_boards_discovered_count=current.discovery.new_boards_discovered_count,
                 fresh_new_leads_count=current.outcome.fresh_new_leads_count,
+                zero_discovery_recent_count=zero_discovery_recent_count,
             )
         )
 
     if (
         current.discovery.new_companies_discovered_count == 0
         and current.discovery.new_boards_discovered_count == 0
+        and current.outcome.total_current_validated_jobs_count == 0
         and current.discovery.frontier_backlog_count <= 2
-        and current.outcome.fresh_new_leads_count <= 6
+        and current.outcome.fresh_new_leads_count <= 8
+        and zero_discovery_recent_count >= 2
+        and timeout_burden < 8
+        and validation_hard_filter_burden < 3
     ):
         patterns.append(
             _pattern(
                 "discovery_starvation",
                 "The discovery frontier is not growing and fresh lead generation is starved; expand source adapters, frontier seeding, or board enumeration.",
-                40.0,
+                42.0 + zero_discovery_recent_count * 2.0,
                 fresh_new_leads_count=current.outcome.fresh_new_leads_count,
                 frontier_backlog_count=current.discovery.frontier_backlog_count,
                 new_companies_discovered_count=current.discovery.new_companies_discovered_count,
@@ -669,14 +680,15 @@ def _build_patterns(
             )
         )
 
-    if current.discovery.company_concentration_top_10_share >= 0.75 and current.outcome.fresh_new_leads_count <= 8:
+    if current.discovery.company_concentration_top_10_share >= 0.65 and current.outcome.fresh_new_leads_count <= 12:
         patterns.append(
             _pattern(
                 "company_concentration_gap",
                 "Discovery is concentrating too heavily on the same small set of companies; prioritize new-company expansion and less recursive sourcing.",
-                36.0 + current.discovery.company_concentration_top_10_share * 10.0,
+                44.0 + current.discovery.company_concentration_top_10_share * 14.0 + zero_discovery_recent_count,
                 company_concentration_top_10_share=current.discovery.company_concentration_top_10_share,
                 fresh_new_leads_count=current.outcome.fresh_new_leads_count,
+                new_companies_discovered_count=current.discovery.new_companies_discovered_count,
             )
         )
 
@@ -729,12 +741,20 @@ def _build_patterns(
         previous_entries,
         lambda item: item.outcome.total_current_validated_jobs_count,
     )
-    if previous_total_current_validated > 0 and current.outcome.total_current_validated_jobs_count < previous_total_current_validated:
+    coverage_drop = max(0.0, previous_total_current_validated - current.outcome.total_current_validated_jobs_count)
+    if (
+        previous_total_current_validated > 0
+        and current.outcome.total_current_validated_jobs_count < previous_total_current_validated
+        and (
+            current.outcome.total_current_validated_jobs_count == 0
+            or coverage_drop >= 2.0
+        )
+    ):
         patterns.append(
             _pattern(
                 "coverage_regression",
                 "Current validated coverage has dropped run-over-run; preserve reacquired still-open jobs before focusing only on novelty.",
-                34.0 + max(0.0, previous_total_current_validated - current.outcome.total_current_validated_jobs_count) * 4.0,
+                18.0 + coverage_drop * 2.0,
                 total_current_validated_jobs_count=current.outcome.total_current_validated_jobs_count,
                 previous_total_current_validated=previous_total_current_validated,
                 reacquired_validated_jobs_count=current.outcome.reacquired_validated_jobs_count,
@@ -746,10 +766,12 @@ def _build_patterns(
             _pattern(
                 "diversification_gap",
                 "The system is still finding current valid jobs through coverage, but it is not adding novel validated jobs; prioritize diversification and discovery quality.",
-                32.0,
+                40.0 + zero_discovery_recent_count * 2.0,
                 total_current_validated_jobs_count=current.outcome.total_current_validated_jobs_count,
                 reacquired_validated_jobs_count=current.outcome.reacquired_validated_jobs_count,
                 fresh_new_leads_count=current.outcome.fresh_new_leads_count,
+                new_companies_discovered_count=current.discovery.new_companies_discovered_count,
+                new_boards_discovered_count=current.discovery.new_boards_discovered_count,
             )
         )
 
@@ -758,20 +780,25 @@ def _build_patterns(
         and repeated_theme_streak >= 2
         and len(recent_window) >= 4
         and all(entry.outcome.novel_validated_jobs_count == 0 for entry in recent_window)
-        and all(entry.outcome.total_current_validated_jobs_count == 0 for entry in recent_window)
         and all(entry.outcome.actionable_near_miss_count == 0 for entry in recent_window)
-        and _fresh_lead_range(recent_window) <= 1
+        and _fresh_lead_range(recent_window) <= 2
+        and all(
+            entry.discovery.new_companies_discovered_count == 0 and entry.discovery.new_boards_discovered_count == 0
+            for entry in recent_window
+        )
     ):
         repeated_theme_summary = (
             "The loop has plateaued on repeated Ollama-focused fixes without improving validated jobs; switch this iteration to discovery, replay, or validation work instead of another Ollama-only tweak."
             if repeated_theme == "ollama_idle"
+            else "The loop is repeating coverage-preservation work without adding new companies, new boards, or novel validated jobs; pivot back toward discovery expansion."
+            if repeated_theme == "coverage_regression"
             else "The loop has plateaued on the same theme without improving validated jobs; switch to a different subsystem instead of another micro-tweak in the same area."
         )
         patterns.append(
             _pattern(
                 "plateau_breaker",
                 repeated_theme_summary,
-                60.0,
+                68.0,
                 repeated_theme=repeated_theme,
                 repeated_theme_streak=repeated_theme_streak,
                 stagnant_run_count=len(recent_window),

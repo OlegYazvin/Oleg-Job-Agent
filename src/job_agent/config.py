@@ -93,9 +93,9 @@ class Settings:
     auto_loop_max_workflow_reruns_per_iteration: int = 2
     auto_loop_workflow_rerun_timeout_seconds: int = 900
     company_discovery_indexer_enabled: bool = True
-    company_discovery_frontier_budget_per_run: int = 12
-    company_discovery_board_crawl_budget_per_run: int = 12
-    company_discovery_directory_crawl_budget_per_run: int = 8
+    company_discovery_frontier_budget_per_run: int = 24
+    company_discovery_board_crawl_budget_per_run: int = 24
+    company_discovery_directory_crawl_budget_per_run: int = 16
     company_discovery_source_max_trust: int = 10
 
     @property
@@ -228,10 +228,10 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         target_job_count=int(os.getenv("TARGET_JOB_COUNT", "10")),
         max_adaptive_search_passes=int(os.getenv("MAX_ADAPTIVE_SEARCH_PASSES", "3")),
         max_search_rounds=int(os.getenv("MAX_SEARCH_ROUNDS", "3")),
-        search_round_query_limit=int(os.getenv("SEARCH_ROUND_QUERY_LIMIT", "6")),
+        search_round_query_limit=int(os.getenv("SEARCH_ROUND_QUERY_LIMIT", "8")),
         max_leads_per_query=int(os.getenv("MAX_LEADS_PER_QUERY", "6")),
         max_leads_to_resolve_per_pass=int(os.getenv("MAX_LEADS_TO_RESOLVE_PER_PASS", "60")),
-        reacquisition_attempt_cap=int(os.getenv("REACQUISITION_ATTEMPT_CAP", "10")),
+        reacquisition_attempt_cap=int(os.getenv("REACQUISITION_ATTEMPT_CAP", "4")),
         per_query_timeout_seconds=int(os.getenv("PER_QUERY_TIMEOUT_SECONDS", "35")),
         per_lead_timeout_seconds=int(os.getenv("PER_LEAD_TIMEOUT_SECONDS", "25")),
         workflow_timeout_seconds=max(0, int(os.getenv("WORKFLOW_TIMEOUT_SECONDS", "3600"))),
@@ -309,15 +309,15 @@ def load_settings(project_root: Path | None = None, *, require_openai: bool = Tr
         company_discovery_indexer_enabled=os.getenv("COMPANY_DISCOVERY_INDEXER_ENABLED", "true").lower() == "true",
         company_discovery_frontier_budget_per_run=max(
             0,
-            int(os.getenv("COMPANY_DISCOVERY_FRONTIER_BUDGET_PER_RUN", "12")),
+            int(os.getenv("COMPANY_DISCOVERY_FRONTIER_BUDGET_PER_RUN", "24")),
         ),
         company_discovery_board_crawl_budget_per_run=max(
             0,
-            int(os.getenv("COMPANY_DISCOVERY_BOARD_CRAWL_BUDGET_PER_RUN", "12")),
+            int(os.getenv("COMPANY_DISCOVERY_BOARD_CRAWL_BUDGET_PER_RUN", "24")),
         ),
         company_discovery_directory_crawl_budget_per_run=max(
             0,
-            int(os.getenv("COMPANY_DISCOVERY_DIRECTORY_CRAWL_BUDGET_PER_RUN", "8")),
+            int(os.getenv("COMPANY_DISCOVERY_DIRECTORY_CRAWL_BUDGET_PER_RUN", "16")),
         ),
         company_discovery_source_max_trust=max(
             0,
