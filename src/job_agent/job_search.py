@@ -33,6 +33,7 @@ from .company_discovery import (
     extract_company_homepage_urls,
     extract_embedded_board_urls,
     infer_careers_root,
+    is_company_discovery_seed_url,
     is_low_value_company_discovery_entry,
     load_company_discovery_audit,
     load_company_discovery_crawl_history,
@@ -5834,6 +5835,11 @@ async def _collect_company_discovery_seed_leads(
             )
             
         task_type = preferred_task_type or ("careers_root" if "/careers" in normalized_url.lower() or normalized_url.lower().endswith("/jobs") else "company_page")
+        if task_type in {"company_page", "careers_root"} and not is_company_discovery_seed_url(
+            normalized_url,
+            preferred_task_type=task_type,
+        ):
+            return False
         return upsert_frontier_task(
             frontier,
             task_type=task_type,

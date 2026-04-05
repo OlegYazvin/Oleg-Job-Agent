@@ -6046,6 +6046,65 @@ def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandar
     assert any(task["url"] == "https://acme.example/join-the-team" for task in frontier)
 
 
+def test_collect_company_discovery_seed_leads_skips_recursive_discovery_detail_pages(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 0
+
+    async def fake_search_query_with_context(*_args, **_kwargs):
+        return (
+            "company discovery query",
+            [
+                JobLead(
+                    company_name="Recurly",
+                    role_title="Principal Product Manager, AI",
+                    source_url="https://builtin.com/job/principal-product-manager-ai/8679660",
+                    source_type="builtin",
+                    direct_job_url=None,
+                    location_hint="US Remote",
+                    posted_date_hint="2026-04-01",
+                    is_remote_hint=True,
+                    evidence_notes="Built In source result for the company.",
+                )
+            ],
+        )
+
+    async def fail_fetch_page_html(_url: str) -> str | None:
+        raise AssertionError("recursive discovery detail pages should not be crawled into the frontier")
+
+    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: ["q"])
+    monkeypatch.setattr("job_agent.job_search._search_query_with_context", fake_search_query_with_context)
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fail_fetch_page_html)
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+        )
+    )
+
+    assert len(leads) == 1
+    assert leads[0].company_name == "Recurly"
+    assert metrics["source_adapter_yields"]["role_first_search"] == 1
+    assert metrics["frontier_tasks_consumed_count"] == 0
+
+    entries = load_company_discovery_entries(settings.data_dir)
+    assert entries["recurly"]["careers_roots"] == []
+
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    assert frontier == []
+
+
 def test_should_force_ollama_refinement_sample_respects_inline_refinement_flag() -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

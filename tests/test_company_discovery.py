@@ -1,8 +1,11 @@
+import json
 from pathlib import Path
 
 from job_agent.company_discovery import (
     extract_embedded_board_urls,
+    extract_careers_page_urls,
     extract_directory_company_tasks,
+    infer_careers_root,
     load_company_discovery_entries,
     load_company_discovery_frontier,
     make_frontier_task,
@@ -11,6 +14,7 @@ from job_agent.company_discovery import (
     is_low_value_company_discovery_entry,
     upsert_frontier_task,
     upsert_company_discovery_entry,
+    company_discovery_index_path,
     company_discovery_frontier_path,
     extract_company_homepage_urls,
 )
@@ -136,6 +140,24 @@ def test_extract_directory_company_tasks_preserves_company_identity_for_director
     assert {"url": "https://www.ycombinator.com/companies/dynamo-ai", "company_name": "Dynamo AI", "task_type": "company_page"} in tasks
 
 
+def test_extract_careers_page_urls_canonicalizes_directory_company_jobs_and_ignores_cross_company_links() -> None:
+    html = """
+    <html>
+      <body>
+        <a href="/company/freewheel/jobs">Jobs</a>
+        <a href="/company/freewheel/offices">Offices</a>
+        <a href="/company/freewheel/articles">Articles</a>
+        <a href="/company/freewheel/benefits">Benefits</a>
+        <a href="/company/comcast-3/jobs">Parent company jobs</a>
+      </body>
+    </html>
+    """
+
+    urls = extract_careers_page_urls("https://www.builtin.com/company/freewheel", html)
+
+    assert urls == ["https://www.builtin.com/company/freewheel/jobs"]
+
+
 def test_extract_company_homepage_urls_skips_social_and_directory_hosts() -> None:
     html = """
     <html>
@@ -216,6 +238,68 @@ def test_load_company_discovery_frontier_repairs_directory_identity_and_filters_
     assert {task["task_type"] for task in tasks} == {"careers_root", "directory_source"}
 
 
+def test_load_company_discovery_frontier_canonicalizes_directory_company_tasks_and_drops_cross_company_leaks(tmp_path: Path) -> None:
+    frontier_path = company_discovery_frontier_path(tmp_path)
+    frontier_path.write_text(
+        """
+        [
+          {
+            "task_key": "careers_root:https://www.builtin.com/company/boeing/articles/jobs",
+            "task_type": "careers_root",
+            "url": "https://www.builtin.com/company/boeing/articles/jobs",
+            "company_name": "Boeing",
+            "company_key": "boeing",
+            "board_identifier": null,
+            "source_kind": "careers_root",
+            "source_trust": 5,
+            "priority": 8,
+            "attempts": 0,
+            "status": "pending",
+            "discovered_from": "https://www.builtin.com/company/boeing",
+            "next_retry_at": null
+          },
+          {
+            "task_key": "careers_root:https://www.builtin.com/company/boeing/jobs",
+            "task_type": "careers_root",
+            "url": "https://www.builtin.com/company/boeing/jobs",
+            "company_name": "Boeing",
+            "company_key": "boeing",
+            "board_identifier": null,
+            "source_kind": "careers_root",
+            "source_trust": 5,
+            "priority": 6,
+            "attempts": 1,
+            "status": "completed",
+            "discovered_from": "https://www.builtin.com/company/boeing",
+            "next_retry_at": null
+          },
+          {
+            "task_key": "careers_root:https://www.builtin.com/company/comcast-3/jobs",
+            "task_type": "careers_root",
+            "url": "https://www.builtin.com/company/comcast-3/jobs",
+            "company_name": "FreeWheel",
+            "company_key": "freewheel",
+            "board_identifier": null,
+            "source_kind": "careers_root",
+            "source_trust": 5,
+            "priority": 8,
+            "attempts": 0,
+            "status": "pending",
+            "discovered_from": "https://www.builtin.com/company/freewheel",
+            "next_retry_at": null
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+
+    tasks = load_company_discovery_frontier(tmp_path)
+
+    assert len(tasks) == 1
+    assert tasks[0]["url"] == "https://www.builtin.com/company/boeing/jobs"
+    assert tasks[0]["status"] == "completed"
+
+
 def test_load_company_discovery_frontier_dedupes_normalized_board_tasks(tmp_path: Path) -> None:
     frontier_path = company_discovery_frontier_path(tmp_path)
     frontier_path.write_text(
@@ -262,6 +346,64 @@ def test_load_company_discovery_frontier_dedupes_normalized_board_tasks(tmp_path
     assert tasks[0]["url"] == "https://jobs.ashbyhq.com/butterflymx"
     assert tasks[0]["board_identifier"] == "ashby:butterflymx"
     assert tasks[0]["status"] == "completed"
+
+
+def test_load_company_discovery_entries_sanitizes_directory_careers_roots(tmp_path: Path) -> None:
+    company_discovery_index_path(tmp_path).write_text(
+        json.dumps(
+            {
+                "freewheel": {
+                    "company_key": "freewheel",
+                    "company_name": "FreeWheel",
+                    "careers_roots": [
+                        "https://www.builtin.com/company/freewheel/articles/jobs",
+                        "https://www.builtin.com/company/comcast-3/jobs",
+                    ],
+                    "ats_types": [],
+                    "board_identifiers": [],
+                    "board_urls": [],
+                    "source_hosts": ["www.builtin.com"],
+                    "source_trust": 5,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = load_company_discovery_entries(tmp_path)
+
+    assert entries["freewheel"]["careers_roots"] == ["https://www.builtin.com/company/freewheel/jobs"]
+
+
+def test_load_company_discovery_entries_drops_generic_portal_careers_roots(tmp_path: Path) -> None:
+    company_discovery_index_path(tmp_path).write_text(
+        json.dumps(
+            {
+                "capitalgroup": {
+                    "company_key": "capitalgroup",
+                    "company_name": "Capital Group",
+                    "careers_roots": [
+                        "https://builtin.com/careers",
+                        "https://www.builtin.com/company/capital-group/jobs",
+                    ],
+                    "ats_types": [],
+                    "board_identifiers": [],
+                    "board_urls": [],
+                    "source_hosts": ["builtin.com"],
+                    "source_trust": 5,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = load_company_discovery_entries(tmp_path)
+
+    assert entries["capitalgroup"]["careers_roots"] == ["https://www.builtin.com/company/capital-group/jobs"]
+
+
+def test_infer_careers_root_skips_generic_discovery_portal_detail_pages() -> None:
+    assert infer_careers_root("https://builtin.com/job/principal-product-manager-ai/8679660") is None
 
 
 def test_is_low_value_company_discovery_entry_flags_recursive_platform_only_entries() -> None:

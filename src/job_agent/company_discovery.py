@@ -185,11 +185,7 @@ def _slug_to_company_name(slug: str, *, company_name_hint: str | None = None) ->
     return " ".join(word[:1].upper() + word[1:] for word in words)
 
 
-def _directory_company_candidate(
-    url: str | None,
-    *,
-    company_name_hint: str | None = None,
-) -> dict[str, str] | None:
+def _directory_company_route(url: str | None) -> dict[str, str] | None:
     normalized = str(url or "").strip()
     if not normalized.startswith(("http://", "https://")):
         return None
@@ -200,42 +196,97 @@ def _directory_company_candidate(
         return None
 
     slug: str | None = None
-    task_type = "company_page"
+    route_segments: list[str] | None = None
+    has_jobs_segment = False
+
     if any(_host_matches_fragment(host, fragment) for fragment in BUILTIN_HOST_FRAGMENTS):
         if len(segments) >= 2 and segments[0] == "company":
             slug = segments[1]
-            if len(segments) >= 3 and segments[2] == "jobs":
-                task_type = "careers_root"
+            route_segments = ["company", slug]
+            has_jobs_segment = "jobs" in segments[2:]
     elif _host_matches_fragment(host, "ycombinator.com"):
         if len(segments) >= 2 and segments[0] == "companies":
             slug = segments[1]
-            if len(segments) >= 3 and segments[2] == "jobs":
-                task_type = "careers_root"
+            route_segments = ["companies", slug]
+            has_jobs_segment = "jobs" in segments[2:]
     elif _host_matches_fragment(host, "workatastartup.com"):
         if len(segments) >= 2 and segments[0] in {"companies", "company"}:
             slug = segments[1]
-            if len(segments) >= 3 and segments[2] == "jobs":
-                task_type = "careers_root"
+            route_segments = [segments[0], slug]
+            has_jobs_segment = "jobs" in segments[2:]
     elif _host_matches_fragment(host, "wellfound.com"):
         if len(segments) >= 2 and segments[0] in {"company", "companies", "organization", "organizations"}:
             slug = segments[1]
-            if len(segments) >= 3 and segments[2] == "jobs":
-                task_type = "careers_root"
+            route_segments = [segments[0], slug]
+            has_jobs_segment = "jobs" in segments[2:]
 
-    if not slug:
+    if not slug or route_segments is None:
         return None
+
     cleaned_slug = re.sub(r"[-_](?:\d+)$", "", str(slug or "").strip())
     slug_key = _normalize_company_key(cleaned_slug)
     if not slug_key or slug_key in GENERIC_DIRECTORY_COMPANY_KEYS:
         return None
-    company_name = _slug_to_company_name(cleaned_slug, company_name_hint=company_name_hint)
+
+    base_url = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(route_segments)}".rstrip("/")
+    return {
+        "company_url": base_url,
+        "jobs_url": f"{base_url}/jobs",
+        "slug": cleaned_slug,
+        "task_type": "careers_root" if has_jobs_segment else "company_page",
+    }
+
+
+def _canonical_directory_company_url(
+    url: str | None,
+    *,
+    preferred_task_type: str | None = None,
+) -> str | None:
+    route = _directory_company_route(url)
+    if route is None:
+        return None
+    task_type = preferred_task_type if preferred_task_type in {"company_page", "careers_root"} else route["task_type"]
+    if task_type == "careers_root":
+        return str(route["jobs_url"]).rstrip("/")
+    return str(route["company_url"]).rstrip("/")
+
+
+def _directory_company_key(url: str | None) -> str:
+    route = _directory_company_route(url)
+    if route is None:
+        return ""
+    return _normalize_company_key(str(route["slug"]))
+
+
+def _company_keys_conflict(expected_key: str | None, observed_key: str | None) -> bool:
+    normalized_expected = str(expected_key or "").strip()
+    normalized_observed = str(observed_key or "").strip()
+    if not normalized_expected or not normalized_observed:
+        return False
+    if normalized_expected == normalized_observed:
+        return False
+    if normalized_expected in normalized_observed or normalized_observed in normalized_expected:
+        return False
+    return True
+
+
+def _directory_company_candidate(
+    url: str | None,
+    *,
+    company_name_hint: str | None = None,
+) -> dict[str, str] | None:
+    route = _directory_company_route(url)
+    if route is None:
+        return None
+    company_name = _slug_to_company_name(str(route["slug"]), company_name_hint=company_name_hint)
     if not company_name:
         return None
     company_key = _normalize_company_key(company_name)
     if not company_key or company_key in GENERIC_DIRECTORY_COMPANY_KEYS:
         return None
+    task_type = str(route["task_type"])
     return {
-        "url": normalized.rstrip("/"),
+        "url": _canonical_directory_company_url(url, preferred_task_type=task_type) or str(route["company_url"]).rstrip("/"),
         "company_name": company_name,
         "task_type": task_type,
     }
@@ -247,6 +298,24 @@ def _is_blocked_external_company_homepage_host(host: str) -> bool:
 
 def _is_recursive_platform_host(host: str) -> bool:
     return any(_host_matches_fragment(host, fragment) for fragment in RECURSIVE_PLATFORM_HOST_FRAGMENTS)
+
+
+def is_company_discovery_seed_url(
+    url: str | None,
+    *,
+    preferred_task_type: str | None = None,
+) -> bool:
+    normalized = str(url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return False
+    if board_identifier_from_url(normalized):
+        return True
+    if _canonical_directory_company_url(normalized, preferred_task_type=preferred_task_type):
+        return True
+    host = (urlparse(normalized).netloc or "").lower()
+    if not host:
+        return False
+    return not _is_blocked_external_company_homepage_host(host)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -290,13 +359,26 @@ def load_company_discovery_entries(data_dir: Path) -> dict[str, dict[str, Any]]:
             entry = CompanyDiscoveryEntry.model_validate(raw_entry)
         except Exception:
             continue
-        entries[str(raw_key)] = entry.model_dump(mode="json")
+        rendered = entry.model_dump(mode="json")
+        rendered["careers_roots"] = _sanitize_company_discovery_careers_roots(
+            str(rendered.get("company_name") or "").strip() or None,
+            rendered.get("careers_roots") or [],
+        )
+        entries[str(raw_key)] = CompanyDiscoveryEntry.model_validate(rendered).model_dump(mode="json")
     return entries
 
 
 def save_company_discovery_entries(data_dir: Path, entries: Mapping[str, Mapping[str, Any]]) -> None:
     rendered = {
-        str(key): CompanyDiscoveryEntry.model_validate(value).model_dump(mode="json")
+        str(key): CompanyDiscoveryEntry.model_validate(
+            {
+                **dict(value),
+                "careers_roots": _sanitize_company_discovery_careers_roots(
+                    str((value or {}).get("company_name") or "").strip() or None,
+                    (value or {}).get("careers_roots") or [],
+                ),
+            }
+        ).model_dump(mode="json")
         for key, value in entries.items()
     }
     _write_json(company_discovery_index_path(data_dir), rendered)
@@ -317,6 +399,15 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
         rendered = task.model_dump(mode="json")
         task_type = str(rendered.get("task_type") or "")
         normalized_url = _normalize_frontier_task_url(task_type, str(rendered.get("url") or ""))
+        directory_candidate = (
+            _directory_company_candidate(normalized_url, company_name_hint=str(rendered.get("company_name") or "").strip() or None)
+            if task_type in {"company_page", "careers_root"}
+            else None
+        )
+        directory_company_key = _directory_company_key(normalized_url)
+        discovered_from_company_key = _directory_company_key(str(rendered.get("discovered_from") or "").strip())
+        if _company_keys_conflict(discovered_from_company_key, directory_company_key):
+            continue
         board_identifier = (
             str(rendered.get("board_identifier") or "").strip()
             or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
@@ -328,17 +419,15 @@ def load_company_discovery_frontier(data_dir: Path) -> list[dict[str, Any]]:
             normalized_url,
             board_identifier=board_identifier or None,
         )
-        candidate = _directory_company_candidate(
-            str(rendered.get("url") or ""),
-            company_name_hint=str(rendered.get("company_name") or "").strip() or None,
-        )
-        if task_type != "directory_source" and candidate is None:
-            host = (urlparse(str(rendered.get("url") or "")).netloc or "").lower()
-            if _is_recursive_platform_host(host):
-                continue
-        if candidate is not None:
-            rendered["company_name"] = candidate["company_name"]
-            rendered["company_key"] = _normalize_company_key(candidate["company_name"]) or None
+        if task_type in {"company_page", "careers_root"} and not is_company_discovery_seed_url(
+            normalized_url,
+            preferred_task_type=task_type,
+        ):
+            continue
+        if directory_candidate is not None:
+            rendered["company_name"] = directory_candidate["company_name"]
+            rendered["company_key"] = _normalize_company_key(directory_candidate["company_name"]) or None
+            rendered["source_kind"] = task_type
         task_key = str(rendered.get("task_key") or "")
         existing = deduped_tasks.get(task_key)
         if existing is None:
@@ -405,6 +494,9 @@ def infer_careers_root(url: str | None) -> str | None:
     normalized = str(url or "").strip()
     if not normalized.startswith(("http://", "https://")):
         return None
+    canonical_directory_url = _canonical_directory_company_url(normalized, preferred_task_type="careers_root")
+    if canonical_directory_url:
+        return canonical_directory_url
     parsed = urlparse(normalized)
     host = (parsed.netloc or "").lower()
     if not host:
@@ -420,6 +512,8 @@ def infer_careers_root(url: str | None) -> str | None:
         if "ats.rippling.com" in host and segments:
             return f"{parsed.scheme}://{host}/{segments[0]}"
         return f"{parsed.scheme}://{host}"
+    if not is_company_discovery_seed_url(normalized, preferred_task_type="careers_root"):
+        return None
     return f"{parsed.scheme}://{host}/careers"
 
 
@@ -436,6 +530,9 @@ def _normalize_frontier_task_url(task_type: str, url: str | None) -> str:
     normalized = str(url or "").strip().rstrip("/")
     if task_type == "board_url":
         return _normalize_board_root_url(normalized) or normalized
+    canonical_directory_url = _canonical_directory_company_url(normalized, preferred_task_type=task_type)
+    if canonical_directory_url:
+        return canonical_directory_url
     return normalized
 
 
@@ -584,6 +681,7 @@ def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
     parsed_page = urlparse(page_url) if page_url.startswith(("http://", "https://")) else None
     page_host = (parsed_page.netloc or "").lower() if parsed_page else ""
     page_uses_directory_routing = _is_blocked_external_company_homepage_host(page_host)
+    page_company_key = _directory_company_key(page_url)
 
     def maybe_add(raw_url: str | None) -> None:
         normalized = str(raw_url or "").strip()
@@ -600,6 +698,9 @@ def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
         if page_uses_directory_routing:
             candidate = _directory_company_candidate(resolved)
             if candidate is None:
+                return
+            candidate_company_key = _directory_company_key(resolved)
+            if _company_keys_conflict(page_company_key, candidate_company_key):
                 return
             candidate_url = str(candidate["url"]).rstrip("/")
             if candidate["task_type"] == "company_page":
@@ -678,6 +779,32 @@ def default_careers_candidate_urls(source_url: str | None) -> list[str]:
     base = f"{parsed.scheme}://{parsed.netloc}"
     candidates = [f"{base}{path}" for path in COMMON_CAREERS_PATHS]
     return _dedupe_strings(candidates, limit=8)
+
+
+def _sanitize_company_discovery_careers_roots(
+    company_name: str | None,
+    careers_roots: list[str] | tuple[str, ...],
+) -> list[str]:
+    expected_company_key = _normalize_company_key(company_name)
+    normalized_roots: list[str] = []
+    for raw_url in careers_roots:
+        normalized_url = str(raw_url or "").strip()
+        if not normalized_url:
+            continue
+        if not is_company_discovery_seed_url(normalized_url, preferred_task_type="careers_root"):
+            continue
+        canonical_directory_url = _canonical_directory_company_url(
+            normalized_url,
+            preferred_task_type="careers_root",
+        )
+        if canonical_directory_url:
+            candidate_company_key = _directory_company_key(canonical_directory_url)
+            if _company_keys_conflict(expected_company_key, candidate_company_key):
+                continue
+            normalized_roots.append(canonical_directory_url)
+            continue
+        normalized_roots.append(normalized_url.rstrip("/"))
+    return _dedupe_strings(normalized_roots, limit=12)
 
 
 def frontier_task_key(
@@ -1012,7 +1139,10 @@ def upsert_company_discovery_entry(
     updated = existing.model_copy(
         update={
             "company_name": company_name,
-            "careers_roots": _dedupe_strings([*existing.careers_roots, *([careers_root] if careers_root else [])], limit=12),
+            "careers_roots": _sanitize_company_discovery_careers_roots(
+                company_name,
+                [*existing.careers_roots, *([careers_root] if careers_root else [])],
+            ),
             "ats_types": _dedupe_strings(
                 [*existing.ats_types, *(ats_types or []), *[value for value in (board_url_ats_type(url) for url in normalized_board_urls) if value]],
                 limit=12,
