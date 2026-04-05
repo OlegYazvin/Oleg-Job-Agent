@@ -266,6 +266,61 @@ def test_load_company_discovery_frontier_repairs_directory_identity_and_filters_
     assert {task["task_type"] for task in tasks} == {"careers_root", "directory_source"}
 
 
+def test_load_company_discovery_frontier_repairs_board_identifier_strings_and_smartrecruiters_roots(
+    tmp_path: Path,
+) -> None:
+    frontier_path = company_discovery_frontier_path(tmp_path)
+    frontier_path.write_text(
+        """
+        [
+          {
+            "task_key": "board_url:https://jobs.smartrecruiters.com:smartrecruiters:acme-ai",
+            "task_type": "board_url",
+            "url": "https://jobs.smartrecruiters.com",
+            "company_name": "Acme AI",
+            "company_key": "acmeai",
+            "board_identifier": "smartrecruiters:acme-ai",
+            "source_kind": "board_url",
+            "source_trust": 10,
+            "priority": 10,
+            "attempts": 1,
+            "status": "pending",
+            "discovered_from": "seed",
+            "next_retry_at": "2999-01-01T00:00:00+00:00",
+            "last_error": "unsupported_adapter"
+          },
+          {
+            "task_key": "board_url:https://careers.example.com/jobs/123:None",
+            "task_type": "board_url",
+            "url": "https://careers.example.com/jobs/123",
+            "company_name": "Example",
+            "company_key": "example",
+            "board_identifier": "None",
+            "source_kind": "board_url",
+            "source_trust": 7,
+            "priority": 8,
+            "attempts": 1,
+            "status": "pending",
+            "discovered_from": "seed",
+            "next_retry_at": null,
+            "last_error": "missing_board_identifier"
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+
+    tasks = load_company_discovery_frontier(tmp_path)
+
+    smartrecruiters_task = next(task for task in tasks if task["company_key"] == "acmeai")
+    assert smartrecruiters_task["url"] == "https://jobs.smartrecruiters.com/acme-ai"
+    assert smartrecruiters_task["board_identifier"] == "smartrecruiters:acme-ai"
+
+    unknown_task = next(task for task in tasks if task["company_key"] == "example")
+    assert unknown_task["board_identifier"] is None
+    assert not str(unknown_task["task_key"]).endswith(":None")
+
+
 def test_load_company_discovery_frontier_canonicalizes_directory_company_tasks_and_drops_cross_company_leaks(tmp_path: Path) -> None:
     frontier_path = company_discovery_frontier_path(tmp_path)
     frontier_path.write_text(

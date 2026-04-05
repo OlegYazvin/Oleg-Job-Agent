@@ -354,6 +354,7 @@ ASHBY_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 LEVER_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 SMARTRECRUITERS_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 SMARTRECRUITERS_POSTING_DETAILS_CACHE: dict[str, dict[str, object] | None] = {}
+SUPPORTED_OFFICIAL_BOARD_PREFIXES = {"greenhouse", "ashby", "lever", "smartrecruiters"}
 SEARCH_ENGINE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -5800,6 +5801,24 @@ def _increment_metric_count(bucket: dict[str, int], key: str | None, delta: int 
     bucket[normalized_key] = int(bucket.get(normalized_key) or 0) + int(delta)
 
 
+def _reactivate_repairable_board_frontier_tasks(frontier: list[dict[str, object]]) -> None:
+    for task in frontier:
+        if str(task.get("task_type") or "") != "board_url":
+            continue
+        board_identifier = str(task.get("board_identifier") or "").strip()
+        if not board_identifier:
+            continue
+        prefix, _, _ = board_identifier.partition(":")
+        if prefix not in SUPPORTED_OFFICIAL_BOARD_PREFIXES:
+            continue
+        last_error = str(task.get("last_error") or "").strip()
+        if last_error not in {"unsupported_adapter", "missing_board_identifier"}:
+            continue
+        task["next_retry_at"] = None
+        task["last_error"] = None
+        task["status"] = "pending"
+
+
 def _frontier_task_kwargs(task: dict[str, object]) -> dict[str, object]:
     return {
         "task_type": str(task.get("task_type") or "").strip(),
@@ -6054,6 +6073,7 @@ async def _collect_company_discovery_seed_leads(
 ) -> tuple[list[JobLead], dict[str, object]]:
     entries = load_company_discovery_entries(settings.data_dir)
     frontier = load_company_discovery_frontier(settings.data_dir)
+    _reactivate_repairable_board_frontier_tasks(frontier)
     crawl_history = load_company_discovery_crawl_history(settings.data_dir)
     audit_entries = load_company_discovery_audit(settings.data_dir)
     new_company_keys: set[str] = set()

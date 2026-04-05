@@ -6327,6 +6327,106 @@ def test_collect_company_discovery_seed_leads_discovers_embedded_smartrecruiters
     assert "https://jobs.smartrecruiters.com/acme-ai" in acme_entry["board_urls"]
 
 
+def test_collect_company_discovery_seed_leads_reactivates_repairable_smartrecruiters_board_tasks(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.company_discovery_enabled = False
+    settings.company_discovery_indexer_enabled = True
+    settings.company_discovery_frontier_budget_per_run = 0
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 1
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "board_url:https://jobs.smartrecruiters.com:smartrecruiters:acme-ai",
+                "task_type": "board_url",
+                "url": "https://jobs.smartrecruiters.com",
+                "company_name": "Acme AI",
+                "company_key": "acmeai",
+                "board_identifier": "smartrecruiters:acme-ai",
+                "source_kind": "board_url",
+                "source_trust": 10,
+                "priority": 10,
+                "attempts": 1,
+                "status": "pending",
+                "discovered_from": "seed",
+                "next_retry_at": "2999-01-01T00:00:00+00:00",
+                "last_error": "unsupported_adapter",
+            }
+        ],
+    )
+
+    async def fake_fetch_smartrecruiters_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "id": "744000123456789",
+                "name": "Principal Product Manager",
+                "releasedDate": "2026-04-02T12:00:00.000Z",
+                "location": {
+                    "city": "Remote",
+                    "country": "us",
+                    "remote": True,
+                },
+                "company": {"identifier": "acme-ai", "name": "Acme AI"},
+            }
+        ]
+
+    async def fake_fetch_smartrecruiters_posting_detail(_board_token: str, _posting_id: str) -> dict[str, object] | None:
+        return {
+            "company": {"identifier": "acme-ai", "name": "Acme AI"},
+            "location": {
+                "city": "Remote",
+                "country": "us",
+                "remote": True,
+            },
+            "jobAd": {
+                "sections": {
+                    "jobDescription": {
+                        "title": "Job Description",
+                        "text": "Lead the AI platform and machine learning product roadmap for a remote-first team.",
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("job_agent.job_search._fetch_smartrecruiters_board_jobs", fake_fetch_smartrecruiters_board_jobs)
+    monkeypatch.setattr(
+        "job_agent.job_search._fetch_smartrecruiters_posting_detail",
+        fake_fetch_smartrecruiters_posting_detail,
+    )
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+        )
+    )
+
+    assert metrics["official_board_crawl_attempt_count"] == 1
+    assert metrics["official_board_crawl_success_count"] == 1
+    assert metrics["official_board_leads_count"] == 1
+    assert any(
+        lead.direct_job_url == "https://jobs.smartrecruiters.com/acme-ai/744000123456789-principal-product-manager"
+        for lead in leads
+    )
+
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    task = next(task for task in frontier if task["task_type"] == "board_url")
+    assert task["url"] == "https://jobs.smartrecruiters.com/acme-ai"
+    assert task["status"] == "completed"
+    assert task["last_error"] is None
+
+
 def test_collect_company_discovery_seed_leads_suppresses_geo_limited_official_board_leads(
     monkeypatch,
     tmp_path: Path,

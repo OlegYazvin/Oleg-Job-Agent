@@ -395,7 +395,12 @@ def _sanitize_company_discovery_frontier_tasks(tasks: list[Mapping[str, Any]]) -
             continue
         rendered = task.model_dump(mode="json")
         task_type = str(rendered.get("task_type") or "")
-        normalized_url = _normalize_frontier_task_url(task_type, str(rendered.get("url") or ""))
+        raw_board_identifier = _normalize_frontier_board_identifier(rendered.get("board_identifier"))
+        normalized_url = _normalize_frontier_task_url(
+            task_type,
+            str(rendered.get("url") or ""),
+            board_identifier=raw_board_identifier,
+        )
         directory_candidate = (
             _directory_company_candidate(normalized_url, company_name_hint=str(rendered.get("company_name") or "").strip() or None)
             if task_type in {"company_page", "careers_root"}
@@ -405,10 +410,7 @@ def _sanitize_company_discovery_frontier_tasks(tasks: list[Mapping[str, Any]]) -
         discovered_from_company_key = _directory_company_key(str(rendered.get("discovered_from") or "").strip())
         if _company_keys_conflict(discovered_from_company_key, directory_company_key):
             continue
-        board_identifier = (
-            str(rendered.get("board_identifier") or "").strip()
-            or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
-        )
+        board_identifier = raw_board_identifier or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
         rendered["url"] = normalized_url
         rendered["board_identifier"] = board_identifier or None
         rendered["task_key"] = frontier_task_key(
@@ -544,10 +546,44 @@ def _normalize_board_root_url(url: str | None) -> str | None:
     return (infer_careers_root(normalized) or normalized).rstrip("/")
 
 
-def _normalize_frontier_task_url(task_type: str, url: str | None) -> str:
+def _normalize_frontier_board_identifier(raw_value: object | None) -> str | None:
+    normalized = str(raw_value or "").strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
+        return None
+    return normalized
+
+
+def _canonical_board_root_url_from_identifier(
+    url: str | None,
+    board_identifier: str | None,
+) -> str | None:
+    normalized = str(url or "").strip().rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    normalized_board_identifier = _normalize_frontier_board_identifier(board_identifier)
+    if not normalized_board_identifier:
+        return _normalize_board_root_url(normalized) or normalized
+    prefix, _, token = normalized_board_identifier.partition(":")
+    if prefix == "smartrecruiters" and token:
+        return f"https://jobs.smartrecruiters.com/{token}"
+    if prefix == "ashby" and token:
+        return f"https://jobs.ashbyhq.com/{token}"
+    if prefix == "lever" and token:
+        return f"https://jobs.lever.co/{token}"
+    if prefix == "greenhouse" and token:
+        return f"https://job-boards.greenhouse.io/{token}"
+    return _normalize_board_root_url(normalized) or normalized
+
+
+def _normalize_frontier_task_url(
+    task_type: str,
+    url: str | None,
+    *,
+    board_identifier: str | None = None,
+) -> str:
     normalized = str(url or "").strip().rstrip("/")
     if task_type == "board_url":
-        return _normalize_board_root_url(normalized) or normalized
+        return _canonical_board_root_url_from_identifier(normalized, board_identifier) or normalized
     canonical_directory_url = _canonical_directory_company_url(normalized, preferred_task_type=task_type)
     if canonical_directory_url:
         return canonical_directory_url
@@ -861,10 +897,15 @@ def make_frontier_task(
     status: str = "pending",
     next_retry_at: str | None = None,
 ) -> dict[str, Any]:
-    normalized_url = _normalize_frontier_task_url(task_type, url)
+    normalized_board_identifier = _normalize_frontier_board_identifier(board_identifier)
+    normalized_url = _normalize_frontier_task_url(
+        task_type,
+        url,
+        board_identifier=normalized_board_identifier,
+    )
     normalized_company_key = company_key or _normalize_company_key(company_name)
     effective_board_identifier = str(
-        board_identifier or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
+        normalized_board_identifier or (board_identifier_from_url(normalized_url) if task_type == "board_url" else "")
     ).strip()
     return CompanyDiscoveryFrontierTask(
         task_key=frontier_task_key(task_type, normalized_url, board_identifier=effective_board_identifier or None),
