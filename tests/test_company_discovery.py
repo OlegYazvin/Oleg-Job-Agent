@@ -13,6 +13,7 @@ from job_agent.company_discovery import (
     save_company_discovery_entries,
     save_company_discovery_frontier,
     select_frontier_tasks,
+    source_directory_seed_tasks,
     is_low_value_company_discovery_entry,
     upsert_frontier_task,
     upsert_company_discovery_entry,
@@ -197,6 +198,22 @@ def test_extract_directory_company_tasks_preserves_company_identity_for_director
     assert {"url": "https://www.ycombinator.com/companies/dynamo-ai", "company_name": "Dynamo AI", "task_type": "company_page"} in tasks
 
 
+def test_extract_directory_company_tasks_supports_welcome_to_the_jungle_company_routes() -> None:
+    html = """
+    <html>
+      <body>
+        <a href="/en/companies/figma/jobs">Figma jobs</a>
+        <a href="/en/companies/linear">Linear</a>
+      </body>
+    </html>
+    """
+
+    tasks = extract_directory_company_tasks("https://www.welcometothejungle.com/en/companies", html)
+
+    assert {"url": "https://www.welcometothejungle.com/en/companies/figma/jobs", "company_name": "Figma", "task_type": "careers_root"} in tasks
+    assert {"url": "https://www.welcometothejungle.com/en/companies/linear", "company_name": "Linear", "task_type": "company_page"} in tasks
+
+
 def test_extract_careers_page_urls_canonicalizes_directory_company_jobs_and_ignores_cross_company_links() -> None:
     html = """
     <html>
@@ -215,6 +232,22 @@ def test_extract_careers_page_urls_canonicalizes_directory_company_jobs_and_igno
     assert urls == ["https://www.builtin.com/company/freewheel/jobs"]
 
 
+def test_extract_careers_page_urls_collapses_non_directory_detail_filter_and_saved_jobs_links() -> None:
+    html = """
+    <html>
+      <body>
+        <a href="/jobs?page=2#results">Page 2</a>
+        <a href="/jobs/saved-jobs">Saved jobs</a>
+        <a href="/jobs/744000107435185/principal-inbound-product-manager-ai-assistant#content">Job detail</a>
+      </body>
+    </html>
+    """
+
+    urls = extract_careers_page_urls("https://careers.servicenow.com/jobs", html)
+
+    assert urls == ["https://careers.servicenow.com/jobs"]
+
+
 def test_extract_company_homepage_urls_skips_social_and_directory_hosts() -> None:
     html = """
     <html>
@@ -230,6 +263,12 @@ def test_extract_company_homepage_urls_skips_social_and_directory_hosts() -> Non
     urls = extract_company_homepage_urls("https://www.ycombinator.com/companies", html)
 
     assert urls == ["https://acme.example"]
+
+
+def test_source_directory_seed_tasks_include_welcome_to_the_jungle() -> None:
+    tasks = source_directory_seed_tasks()
+
+    assert any(task["url"] == "https://www.welcometothejungle.com/en/companies" for task in tasks)
 
 
 def test_load_company_discovery_frontier_repairs_directory_identity_and_filters_recursive_platforms(tmp_path: Path) -> None:
@@ -293,6 +332,65 @@ def test_load_company_discovery_frontier_repairs_directory_identity_and_filters_
     assert tasks[0]["company_name"] == "Bilt Rewards"
     assert tasks[0]["company_key"] == "biltrewards"
     assert {task["task_type"] for task in tasks} == {"careers_root", "directory_source"}
+
+
+def test_load_company_discovery_frontier_collapses_non_directory_careers_root_variants(tmp_path: Path) -> None:
+    save_company_discovery_frontier(
+        tmp_path,
+        [
+            {
+                "task_key": "careers_root:https://careers.servicenow.com/jobs?page=2#results",
+                "task_type": "careers_root",
+                "url": "https://careers.servicenow.com/jobs?page=2#results",
+                "company_name": "ServiceNow",
+                "company_key": "servicenow",
+                "board_identifier": None,
+                "source_kind": "careers_root",
+                "source_trust": 7,
+                "priority": 7,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "https://careers.servicenow.com/jobs",
+                "next_retry_at": None,
+            },
+            {
+                "task_key": "careers_root:https://careers.servicenow.com/jobs/saved-jobs",
+                "task_type": "careers_root",
+                "url": "https://careers.servicenow.com/jobs/saved-jobs",
+                "company_name": "ServiceNow",
+                "company_key": "servicenow",
+                "board_identifier": None,
+                "source_kind": "careers_root",
+                "source_trust": 7,
+                "priority": 7,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "https://careers.servicenow.com/jobs",
+                "next_retry_at": None,
+            },
+            {
+                "task_key": "careers_root:https://careers.servicenow.com/jobs/744000107435185/principal-inbound-product-manager-ai-assistant#content",
+                "task_type": "careers_root",
+                "url": "https://careers.servicenow.com/jobs/744000107435185/principal-inbound-product-manager-ai-assistant#content",
+                "company_name": "ServiceNow",
+                "company_key": "servicenow",
+                "board_identifier": None,
+                "source_kind": "careers_root",
+                "source_trust": 7,
+                "priority": 7,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "https://careers.servicenow.com/jobs",
+                "next_retry_at": None,
+            },
+        ],
+    )
+
+    tasks = load_company_discovery_frontier(tmp_path)
+
+    assert len(tasks) == 1
+    assert tasks[0]["task_type"] == "careers_root"
+    assert tasks[0]["url"] == "https://careers.servicenow.com/jobs"
 
 
 def test_load_company_discovery_frontier_repairs_board_identifier_strings_and_smartrecruiters_roots(

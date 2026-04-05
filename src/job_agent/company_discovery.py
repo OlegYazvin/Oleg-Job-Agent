@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
@@ -63,6 +63,7 @@ DIRECTORY_PORTAL_HOST_FRAGMENTS = (
     "ycombinator.com",
     "workatastartup.com",
     "wellfound.com",
+    "welcometothejungle.com",
     "knowledgebase.builtin.com",
     "employers.builtin.com",
     *BUILTIN_HOST_FRAGMENTS,
@@ -89,6 +90,7 @@ DIRECTORY_SOURCE_URLS = (
     "https://www.workatastartup.com/companies",
     "https://wellfound.com/jobs",
     "https://www.builtin.com/jobs",
+    "https://www.welcometothejungle.com/en/companies",
 )
 
 LOW_TRUST_SCOUT_HOST_FRAGMENTS = (
@@ -219,6 +221,11 @@ def _directory_company_route(url: str | None) -> dict[str, str] | None:
             slug = segments[1]
             route_segments = [segments[0], slug]
             has_jobs_segment = "jobs" in segments[2:]
+    elif _host_matches_fragment(host, "welcometothejungle.com"):
+        if len(segments) >= 3 and segments[1] == "companies":
+            slug = segments[2]
+            route_segments = [segments[0], "companies", slug]
+            has_jobs_segment = "jobs" in segments[3:]
 
     if not slug or route_segments is None:
         return None
@@ -249,6 +256,25 @@ def _canonical_directory_company_url(
     if task_type == "careers_root":
         return str(route["jobs_url"]).rstrip("/")
     return str(route["company_url"]).rstrip("/")
+
+
+def _canonical_non_directory_careers_root_url(url: str | None) -> str | None:
+    normalized = str(url or "").strip()
+    if not normalized.startswith(("http://", "https://")):
+        return None
+    if board_identifier_from_url(normalized):
+        return None
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    if not host:
+        return None
+    normalized_path = "/" + "/".join(segment for segment in (parsed.path or "").split("/") if segment)
+    normalized_path = normalized_path.rstrip("/") or "/"
+    lower_path = normalized_path.lower()
+    for candidate in sorted(COMMON_CAREERS_PATHS, key=len, reverse=True):
+        if lower_path == candidate or lower_path.startswith(f"{candidate}/"):
+            return urlunparse(parsed._replace(path=candidate, query="", fragment="")).rstrip("/")
+    return None
 
 
 def _directory_company_key(url: str | None) -> str:
@@ -614,6 +640,10 @@ def _normalize_frontier_task_url(
     canonical_directory_url = _canonical_directory_company_url(normalized, preferred_task_type=task_type)
     if canonical_directory_url:
         return canonical_directory_url
+    if task_type == "careers_root":
+        canonical_careers_url = _canonical_non_directory_careers_root_url(normalized)
+        if canonical_careers_url:
+            return canonical_careers_url
     return normalized
 
 
@@ -783,7 +813,6 @@ def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
             return
         parsed = urlparse(resolved)
         host = (parsed.netloc or "").lower()
-        path = (parsed.path or "").lower()
         if page_host and host != page_host:
             return
         if page_uses_directory_routing:
@@ -798,8 +827,9 @@ def extract_careers_page_urls(page_url: str, html: str) -> list[str]:
                 candidate_url = f"{candidate_url}/jobs"
             candidates.append(candidate_url.rstrip("/"))
             return
-        if any(path.startswith(candidate) or candidate in path for candidate in COMMON_CAREERS_PATHS):
-            candidates.append(resolved.rstrip("/"))
+        canonical_careers_url = _canonical_non_directory_careers_root_url(resolved)
+        if canonical_careers_url:
+            candidates.append(canonical_careers_url)
 
     for tag in soup.find_all("a"):
         maybe_add(tag.get("href"))
