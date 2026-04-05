@@ -513,6 +513,20 @@ def infer_careers_root(url: str | None) -> str | None:
             return f"{parsed.scheme}://{host}/{segments[0]}"
         if "greenhouse.io" in host and segments:
             return f"{parsed.scheme}://{host}/{segments[0]}"
+        if "jobs.smartrecruiters.com" in host and segments:
+            return f"{parsed.scheme}://{host}/{segments[0]}"
+        if "careers.smartrecruiters.com" in host and segments:
+            return f"{parsed.scheme}://jobs.smartrecruiters.com/{segments[0]}"
+        if ("jobs.recruitee.com" in host or "careers.tellent.com" in host) and segments:
+            if segments[0] == "o" and len(segments) >= 2:
+                return f"{parsed.scheme}://{host}/o/{segments[1]}"
+            return f"{parsed.scheme}://{host}/{segments[0]}"
+        if "jobs.workable.com" in host and segments:
+            return f"{parsed.scheme}://{host}/{segments[0]}"
+        if "jobs.jobvite.com" in host and segments:
+            return f"{parsed.scheme}://{host}/{segments[0]}"
+        if "jobs.icims.com" in host and len(segments) >= 2:
+            return f"{parsed.scheme}://{host}/{segments[0]}/{segments[1]}"
         if "ats.rippling.com" in host and segments:
             return f"{parsed.scheme}://{host}/{segments[0]}"
         return f"{parsed.scheme}://{host}"
@@ -561,6 +575,8 @@ def board_identifier_from_url(url: str | None) -> str | None:
     if "careers.workday.com" in host and segments:
         return f"workday:{segments[0].lower()}"
     if "jobs.smartrecruiters.com" in host and segments:
+        return f"smartrecruiters:{segments[0].lower()}"
+    if "careers.smartrecruiters.com" in host and segments:
         return f"smartrecruiters:{segments[0].lower()}"
     if ("jobs.recruitee.com" in host or "careers.tellent.com" in host) and segments:
         if segments[0] == "o" and len(segments) >= 2:
@@ -648,6 +664,7 @@ def trust_score_for_url(url: str | None, *, explicit_task_type: str | None = Non
 def extract_embedded_board_urls(page_url: str, html: str) -> list[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     candidates: list[str] = []
+    attribute_markers = ("href", "src", "url", "link", "action")
 
     def maybe_add(raw_url: str | None) -> None:
         normalized = str(raw_url or "").strip()
@@ -660,8 +677,14 @@ def extract_embedded_board_urls(page_url: str, html: str) -> list[str]:
         if any(fragment in host for fragment in KNOWN_BOARD_HOST_FRAGMENTS):
             candidates.append(resolved)
 
-    for tag in soup.find_all(["a", "iframe", "script"]):
-        maybe_add(tag.get("href") or tag.get("src"))
+    for tag in soup.find_all(True):
+        for attribute_name, attribute_value in tag.attrs.items():
+            lowered_name = str(attribute_name or "").strip().lower()
+            if not lowered_name or not any(marker in lowered_name for marker in attribute_markers):
+                continue
+            raw_values = attribute_value if isinstance(attribute_value, list) else [attribute_value]
+            for raw_value in raw_values:
+                maybe_add(str(raw_value or ""))
 
     raw_html = html or ""
     greenhouse_embed_match = re.finditer(r"boards\.greenhouse\.io/embed/job_board/js\?for=([a-z0-9_-]+)", raw_html, re.I)
@@ -670,7 +693,8 @@ def extract_embedded_board_urls(page_url: str, html: str) -> list[str]:
         if token:
             candidates.append(f"https://boards.greenhouse.io/{token}")
 
-    for raw_url in re.findall(r"https?://[^\s\"'<>]+", raw_html):
+    decoded_html = raw_html.replace("\\/", "/")
+    for raw_url in re.findall(r"https?://[^\s\"'<>]+", decoded_html):
         maybe_add(raw_url)
 
     if page_url.startswith(("http://", "https://")):

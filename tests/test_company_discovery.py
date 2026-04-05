@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from job_agent.company_discovery import (
+    board_identifier_from_url,
     extract_embedded_board_urls,
     extract_careers_page_urls,
     extract_directory_company_tasks,
@@ -35,6 +36,32 @@ def test_extract_embedded_board_urls_finds_embedded_ashby_and_greenhouse_links()
 
     assert "https://jobs.ashbyhq.com/butterflymx" in urls
     assert "https://boards.greenhouse.io/acme" in urls
+
+
+def test_extract_embedded_board_urls_finds_smartrecruiters_urls_in_data_attributes_and_escaped_json() -> None:
+    html = r"""
+    <html>
+      <body>
+        <div data-board-url="https://careers.smartrecruiters.com/acme-ai"></div>
+        <script>
+          window.__JOBS__ = {"careersUrl":"https:\/\/jobs.smartrecruiters.com\/acme-ai"};
+        </script>
+      </body>
+    </html>
+    """
+
+    urls = extract_embedded_board_urls("https://acme.example/careers", html)
+
+    assert "https://careers.smartrecruiters.com/acme-ai" in urls
+    assert "https://jobs.smartrecruiters.com/acme-ai" in urls
+
+
+def test_smartrecruiters_board_urls_preserve_company_token() -> None:
+    assert board_identifier_from_url("https://careers.smartrecruiters.com/acme-ai") == "smartrecruiters:acme-ai"
+    assert (
+        infer_careers_root("https://jobs.smartrecruiters.com/acme-ai/744000123456789-principal-product-manager-ai")
+        == "https://jobs.smartrecruiters.com/acme-ai"
+    )
 
 
 def test_upsert_company_discovery_entry_merges_repeated_board_discoveries(tmp_path: Path) -> None:

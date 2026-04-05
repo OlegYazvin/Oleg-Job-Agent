@@ -352,6 +352,8 @@ BUILTIN_LEAD_CACHE: dict[str, JobLead | None] = {}
 GREENHOUSE_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 ASHBY_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
 LEVER_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
+SMARTRECRUITERS_BOARD_JOBS_CACHE: dict[str, list[dict[str, object]]] = {}
+SMARTRECRUITERS_POSTING_DETAILS_CACHE: dict[str, dict[str, object] | None] = {}
 SEARCH_ENGINE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -5330,6 +5332,238 @@ async def _fetch_lever_board_jobs(board_token: str) -> list[dict[str, object]]:
     return jobs
 
 
+def _extract_smartrecruiters_board_token(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if "jobs.smartrecruiters.com" not in host and "careers.smartrecruiters.com" not in host:
+        return None
+    segments = _path_segments(parsed.path)
+    if not segments:
+        return None
+    return segments[0].lower()
+
+
+async def _fetch_smartrecruiters_board_jobs(board_token: str) -> list[dict[str, object]]:
+    cached = SMARTRECRUITERS_BOARD_JOBS_CACHE.get(board_token)
+    if cached is not None:
+        return cached
+
+    jobs: list[dict[str, object]] = []
+    offset = 0
+    limit = 100
+    api_url = f"https://api.smartrecruiters.com/v1/companies/{board_token}/postings"
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20.0,
+        ) as client:
+            while True:
+                response = await client.get(api_url, params={"offset": offset, "limit": limit})
+                if response.status_code != 200:
+                    SMARTRECRUITERS_BOARD_JOBS_CACHE[board_token] = []
+                    return []
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError:
+                    SMARTRECRUITERS_BOARD_JOBS_CACHE[board_token] = []
+                    return []
+                if not isinstance(payload, dict):
+                    SMARTRECRUITERS_BOARD_JOBS_CACHE[board_token] = []
+                    return []
+                content = payload.get("content")
+                if not isinstance(content, list):
+                    SMARTRECRUITERS_BOARD_JOBS_CACHE[board_token] = []
+                    return []
+                normalized_jobs = [job for job in content if isinstance(job, dict)]
+                jobs.extend(normalized_jobs)
+                total_found = payload.get("totalFound")
+                if len(normalized_jobs) < limit:
+                    break
+                if isinstance(total_found, int) and offset + len(normalized_jobs) >= total_found:
+                    break
+                offset += len(normalized_jobs)
+                if offset >= 500:
+                    break
+    except httpx.RequestError:
+        SMARTRECRUITERS_BOARD_JOBS_CACHE[board_token] = []
+        return []
+
+    SMARTRECRUITERS_BOARD_JOBS_CACHE[board_token] = jobs
+    return jobs
+
+
+async def _fetch_smartrecruiters_posting_detail(
+    board_token: str,
+    posting_id: str,
+) -> dict[str, object] | None:
+    cache_key = f"{board_token}:{posting_id}"
+    if cache_key in SMARTRECRUITERS_POSTING_DETAILS_CACHE:
+        return SMARTRECRUITERS_POSTING_DETAILS_CACHE[cache_key]
+
+    api_url = f"https://api.smartrecruiters.com/v1/companies/{board_token}/postings/{posting_id}"
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20.0,
+        ) as client:
+            response = await client.get(api_url)
+    except httpx.RequestError:
+        SMARTRECRUITERS_POSTING_DETAILS_CACHE[cache_key] = None
+        return None
+    if response.status_code != 200:
+        SMARTRECRUITERS_POSTING_DETAILS_CACHE[cache_key] = None
+        return None
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        SMARTRECRUITERS_POSTING_DETAILS_CACHE[cache_key] = None
+        return None
+    if not isinstance(payload, dict):
+        SMARTRECRUITERS_POSTING_DETAILS_CACHE[cache_key] = None
+        return None
+    SMARTRECRUITERS_POSTING_DETAILS_CACHE[cache_key] = payload
+    return payload
+
+
+def _slugify_url_title(title: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return normalized[:96]
+
+
+def _looks_like_product_manager_title(title: str) -> bool:
+    lowered = str(title or "").strip().lower()
+    return "product manager" in lowered or bool(re.search(r"\bproduct\b", lowered) and re.search(r"\bmanager\b", lowered))
+
+
+def _smartrecruiters_company_identifier(
+    board_token: str,
+    job: dict[str, object],
+    detail: dict[str, object] | None = None,
+) -> str:
+    for payload in (detail, job):
+        if not isinstance(payload, dict):
+            continue
+        company = payload.get("company")
+        if not isinstance(company, dict):
+            continue
+        identifier = str(company.get("identifier") or "").strip()
+        if identifier:
+            return identifier
+    return board_token
+
+
+def _smartrecruiters_location_text(
+    *payloads: dict[str, object] | None,
+) -> str:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        location = payload.get("location")
+        if not isinstance(location, dict):
+            continue
+        parts = [
+            str(location.get("city") or "").strip(),
+            str(location.get("region") or "").strip(),
+            str(location.get("country") or "").strip().upper(),
+        ]
+        location_text = ", ".join(part for part in parts if part)
+        if location.get("remote") is True:
+            return f"{location_text} Remote".strip() if location_text else "Remote"
+        if location_text:
+            return location_text
+    return ""
+
+
+def _smartrecruiters_job_description_text(detail: dict[str, object] | None) -> str:
+    if not isinstance(detail, dict):
+        return ""
+    job_ad = detail.get("jobAd")
+    if not isinstance(job_ad, dict):
+        return ""
+    sections = job_ad.get("sections")
+    if not isinstance(sections, dict):
+        return ""
+    parts: list[str] = []
+    for value in sections.values():
+        if not isinstance(value, dict):
+            continue
+        title = str(value.get("title") or "").strip()
+        text = str(value.get("text") or "").strip()
+        if title:
+            parts.append(title)
+        if text:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def _smartrecruiters_public_job_url(
+    company_identifier: str,
+    job: dict[str, object],
+) -> str:
+    posting_id = str(job.get("id") or job.get("uuid") or "").strip()
+    if not posting_id:
+        return ""
+    title = str(job.get("name") or job.get("title") or "").strip()
+    slug = _slugify_url_title(title)
+    path = f"/{company_identifier}/{posting_id}"
+    if slug:
+        path = f"{path}-{slug}"
+    return _normalize_direct_job_url(f"https://jobs.smartrecruiters.com{path}")
+
+
+async def _smartrecruiters_board_jobs_to_leads(
+    board_token: str,
+    company_name: str,
+) -> list[JobLead]:
+    leads: list[JobLead] = []
+    for job in await _fetch_smartrecruiters_board_jobs(board_token):
+        title = str(job.get("name") or job.get("title") or "").strip()
+        if not title or not _looks_like_product_manager_title(title):
+            continue
+        posting_id = str(job.get("id") or job.get("uuid") or "").strip()
+        detail = await _fetch_smartrecruiters_posting_detail(board_token, posting_id) if posting_id else None
+        description_text = _smartrecruiters_job_description_text(detail)
+        location_text = _smartrecruiters_location_text(detail, job)
+        content_text = " ".join(part for part in (title, description_text, location_text) if part)
+        if not _is_ai_related_product_manager_text(content_text):
+            continue
+        company_identifier = _smartrecruiters_company_identifier(board_token, job, detail)
+        direct_job_url = _smartrecruiters_public_job_url(company_identifier, job)
+        if not direct_job_url.startswith(("http://", "https://")):
+            continue
+        location_hint = _lead_location_hint_with_remote_restriction(location_text, title, description_text)
+        remote_restriction_note = _remote_restriction_note(title, location_text, description_text)
+        location = detail.get("location") if isinstance(detail, dict) and isinstance(detail.get("location"), dict) else job.get("location")
+        is_remote_hint = True if isinstance(location, dict) and location.get("remote") is True else ("remote" in location_text.lower() if location_text else None)
+        evidence_notes = " ".join(
+            part
+            for part in (
+                "Discovered via official SmartRecruiters board enumeration.",
+                remote_restriction_note,
+            )
+            if part
+        )
+        leads.append(
+            JobLead(
+                company_name=company_name,
+                role_title=title,
+                source_url=f"https://jobs.smartrecruiters.com/{company_identifier}",
+                source_type="direct_ats",
+                direct_job_url=direct_job_url,
+                location_hint=location_hint,
+                posted_date_hint=str(job.get("releasedDate") or "").strip()[:10] or None,
+                is_remote_hint=is_remote_hint,
+                source_query=f"company_discovery:smartrecruiters:{board_token}",
+                evidence_notes=evidence_notes,
+                source_quality_score_hint=10,
+            )
+        )
+    return leads
+
+
 def _greenhouse_board_job_match_score(lead: JobLead, job: dict[str, object]) -> int:
     title = str(job.get("title") or "").strip()
     absolute_url = str(job.get("absolute_url") or "").strip()
@@ -6033,6 +6267,8 @@ async def _collect_company_discovery_seed_leads(
                         )
                         if lead is not None
                     ]
+                elif prefix == "smartrecruiters" and token:
+                    leads_for_task = await _smartrecruiters_board_jobs_to_leads(token, company_name)
                 else:
                     append_company_discovery_audit_entry(
                         audit_entries,

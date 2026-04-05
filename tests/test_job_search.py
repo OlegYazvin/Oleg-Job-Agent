@@ -6224,6 +6224,109 @@ def test_collect_company_discovery_seed_leads_discovers_embedded_ashby_board(mon
     assert (settings.data_dir / "company-discovery-audit.json").exists()
 
 
+def test_collect_company_discovery_seed_leads_discovers_embedded_smartrecruiters_board(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_search_query_with_context(*_args, **_kwargs):
+        return (
+            "company discovery query",
+            [
+                JobLead(
+                    company_name="Acme AI",
+                    role_title="Principal Product Manager, AI",
+                    source_url="https://acme.example/careers",
+                    source_type="company_site",
+                    direct_job_url=None,
+                    location_hint="US Remote",
+                    posted_date_hint="2026-04-01",
+                    is_remote_hint=True,
+                    evidence_notes="Official company careers page mentions the AI PM role.",
+                )
+            ],
+        )
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return (
+            '<html><body><div data-board-url="https://careers.smartrecruiters.com/acme-ai"></div>'
+            '<script>window.__JOBS__={"careersUrl":"https:\\/\\/jobs.smartrecruiters.com\\/acme-ai"};</script>'
+            "</body></html>"
+        )
+
+    async def fake_fetch_smartrecruiters_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "id": "744000123456789",
+                "name": "Principal Product Manager",
+                "releasedDate": "2026-04-02T12:00:00.000Z",
+                "location": {
+                    "city": "Remote",
+                    "country": "us",
+                    "remote": True,
+                },
+                "company": {"identifier": "acme-ai", "name": "Acme AI"},
+            }
+        ]
+
+    async def fake_fetch_smartrecruiters_posting_detail(_board_token: str, _posting_id: str) -> dict[str, object] | None:
+        return {
+            "company": {"identifier": "acme-ai", "name": "Acme AI"},
+            "location": {
+                "city": "Remote",
+                "country": "us",
+                "remote": True,
+            },
+            "jobAd": {
+                "sections": {
+                    "jobDescription": {
+                        "title": "Job Description",
+                        "text": "Lead the AI platform and machine learning product roadmap for a remote-first team.",
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: ["q"])
+    monkeypatch.setattr("job_agent.job_search._search_query_with_context", fake_search_query_with_context)
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+    monkeypatch.setattr("job_agent.job_search._fetch_smartrecruiters_board_jobs", fake_fetch_smartrecruiters_board_jobs)
+    monkeypatch.setattr(
+        "job_agent.job_search._fetch_smartrecruiters_posting_detail",
+        fake_fetch_smartrecruiters_posting_detail,
+    )
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+        )
+    )
+
+    assert any(
+        lead.direct_job_url == "https://jobs.smartrecruiters.com/acme-ai/744000123456789-principal-product-manager"
+        for lead in leads
+    )
+    assert metrics["new_companies_discovered_count"] == 1
+    assert metrics["new_boards_discovered_count"] >= 1
+    assert metrics["official_board_leads_count"] == 1
+    assert metrics["official_board_crawl_attempt_count"] >= 1
+    assert metrics["official_board_crawl_success_count"] == 1
+    assert metrics["source_adapter_yields"]["smartrecruiters"] == 1
+
+    entries = load_company_discovery_entries(settings.data_dir)
+    acme_entry = entries["acmeai"]
+    assert "smartrecruiters:acme-ai" in acme_entry["board_identifiers"]
+    assert "https://jobs.smartrecruiters.com/acme-ai" in acme_entry["board_urls"]
+
+
 def test_collect_company_discovery_seed_leads_suppresses_geo_limited_official_board_leads(
     monkeypatch,
     tmp_path: Path,
