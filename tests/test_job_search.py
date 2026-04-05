@@ -562,6 +562,42 @@ def test_collect_replay_seed_leads_ignores_non_dict_run_artifacts(tmp_path: Path
     assert leads == []
 
 
+def test_collect_replay_seed_leads_includes_fixable_resolution_failure_without_direct_url(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    (settings.data_dir / "run-20260325-000000.json").write_text(
+        json.dumps(
+            {
+                "bundles": [],
+                "search_diagnostics": {
+                    "failures": [
+                        {
+                            "stage": "resolution",
+                            "reason_code": "resolution_missing",
+                            "detail": "Built In source did not expose a direct ATS URL during the first pass.",
+                            "company_name": "Capital Group",
+                            "role_title": "Principal Product Manager, AI",
+                            "source_url": "https://builtinla.com/job/principal-product-manager-ai/123456",
+                            "direct_job_url": None,
+                            "posted_date_text": "2026-04-03",
+                            "salary_text": "$200,000 - $240,000",
+                            "is_remote": True,
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    leads = _collect_replay_seed_leads(settings)
+
+    assert len(leads) == 1
+    assert leads[0].company_name == "Capital Group"
+    assert leads[0].source_type == "builtin"
+    assert leads[0].direct_job_url is None
+    assert leads[0].source_url == "https://builtinla.com/job/principal-product-manager-ai/123456"
+
+
 def test_extract_posted_hint_parses_absolute_month_dates() -> None:
     assert _extract_posted_hint("Mar 14, 2026 · Senior PM role") == "2026-03-14"
 
@@ -2476,7 +2512,11 @@ def test_replay_seed_leads_runs_seed_refinement_before_failed_history_suppressio
         refinement_calls.append([candidate.source_url for candidate in leads])
         return leads
 
+    async def fake_resolve_lead_to_direct_job_url(agent, unresolved_lead):
+        return None
+
     monkeypatch.setattr("job_agent.job_search._maybe_force_seed_lead_refinement_with_ollama", fake_seed_refinement)
+    monkeypatch.setattr("job_agent.job_search._resolve_lead_to_direct_job_url", fake_resolve_lead_to_direct_job_url)
 
     diagnostics = SearchDiagnostics(run_id="run-seed-refine-order", minimum_qualifying_jobs=5)
 
@@ -2512,7 +2552,104 @@ def test_replay_seed_leads_runs_seed_refinement_before_failed_history_suppressio
 
     assert refinement_calls == [[lead.source_url]]
     assert total_unique_leads == 1
-    assert resolved_leads == 0
+    assert resolved_leads == 1
+    assert diagnostics.failures[-1].reason_code == "resolution_missing"
+
+
+def test_replay_seed_leads_resolves_missing_direct_url_before_validation(monkeypatch, tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    lead = JobLead(
+        company_name="Capital Group",
+        role_title="Principal Product Manager, AI",
+        source_url="https://builtinla.com/job/principal-product-manager-ai/123456",
+        source_type="builtin",
+        direct_job_url=None,
+        location_hint="Remote",
+        posted_date_hint=(date.today() - timedelta(days=1)).isoformat(),
+        is_remote_hint=True,
+        salary_text_hint="$200,000 - $240,000",
+        evidence_notes="Historical Built In lead with a recoverable direct ATS URL.",
+    )
+    resolved_direct_url = "https://capitalgroup.wd1.myworkdayjobs.com/en-US/CGCareers/job/Principal-Product-Manager-AI_R-123456"
+    resolution_calls: list[str] = []
+
+    async def fake_seed_refinement(settings_arg, leads, *, run_id=None):
+        return leads
+
+    async def fake_resolve_lead_to_direct_job_url(agent, unresolved_lead):
+        resolution_calls.append(unresolved_lead.source_url)
+        return DirectJobResolution(
+            accepted=True,
+            direct_job_url=resolved_direct_url,
+            ats_platform="capitalgroup.wd1.myworkdayjobs.com",
+            evidence_notes="Resolved from the Built In source page during replay.",
+        )
+
+    validated_job = JobPosting(
+        company_name="Capital Group",
+        role_title="Principal Product Manager, AI",
+        direct_job_url=resolved_direct_url,
+        resolved_job_url=resolved_direct_url,
+        ats_platform="capitalgroup.wd1.myworkdayjobs.com",
+        location_text="Remote",
+        is_fully_remote=True,
+        posted_date_text=(date.today() - timedelta(days=1)).isoformat(),
+        posted_date_iso=(date.today() - timedelta(days=1)).isoformat(),
+        base_salary_min_usd=200000,
+        base_salary_max_usd=240000,
+        salary_text="$200,000 - $240,000",
+        evidence_notes="Validated from replay after URL recovery.",
+        validation_evidence=["Remote, current, and salary-qualified."],
+    )
+
+    async def fake_validate_candidate(replay_lead, candidate, *args, **kwargs):
+        assert replay_lead.direct_job_url == resolved_direct_url
+        assert candidate.direct_job_url == resolved_direct_url
+        return validated_job, None, None, None
+
+    monkeypatch.setattr("job_agent.job_search._maybe_force_seed_lead_refinement_with_ollama", fake_seed_refinement)
+    monkeypatch.setattr("job_agent.job_search._resolve_lead_to_direct_job_url", fake_resolve_lead_to_direct_job_url)
+    monkeypatch.setattr("job_agent.job_search._validate_candidate", fake_validate_candidate)
+
+    diagnostics = SearchDiagnostics(run_id="run-replay-resolve", minimum_qualifying_jobs=5)
+    jobs_by_url: dict[str, JobPosting] = {}
+    reacquired_jobs_by_url: dict[str, JobPosting] = {}
+
+    total_unique_leads, resolved_leads = asyncio.run(
+        _replay_seed_leads(
+            [lead],
+            settings=settings,
+            diagnostics=diagnostics,
+            company_watchlist={},
+            failed_lead_history={},
+            jobs_by_url=jobs_by_url,
+            reacquired_jobs_by_url=reacquired_jobs_by_url,
+            previously_reported_company_keys=set(),
+            validated_job_history_index={},
+            reacquisition_attempted_keys=set(),
+            reacquisition_suppressed_keys=set(),
+            seen_lead_keys=set(),
+            total_unique_leads=0,
+            resolved_leads_this_attempt=0,
+            stop_goal=5,
+            lead_timeout_seconds=10,
+            resolution_agent=None,
+            attempt_number=1,
+            status=None,
+            run_id="run-replay-resolve",
+        )
+    )
+
+    assert resolution_calls == [lead.source_url]
+    assert total_unique_leads == 1
+    assert resolved_leads == 1
+    assert len(jobs_by_url) == 1
+    assert reacquired_jobs_by_url == {}
 
 
 def test_replay_seed_leads_retries_seed_refinement_after_failed_history_narrows_window(monkeypatch, tmp_path: Path) -> None:
@@ -2549,6 +2686,10 @@ def test_replay_seed_leads_retries_seed_refinement_after_failed_history_narrows_
         return leads
 
     monkeypatch.setattr("job_agent.job_search._maybe_force_seed_lead_refinement_with_ollama", fake_seed_refinement)
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_to_direct_job_url",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("suppressed replay seed should not resolve")),
+    )
     monkeypatch.setattr(
         "job_agent.job_search._validate_candidate",
         lambda *args, **kwargs: asyncio.sleep(0, result=(None, None, None, None)),

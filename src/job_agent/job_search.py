@@ -7187,18 +7187,25 @@ def _load_seed_leads_from_file(settings: Settings) -> list[JobLead]:
 def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
     if failure.reason_code not in REPLAYABLE_FAILURE_REASON_CODES:
         return None
-    if not failure.company_name or not failure.role_title or not failure.direct_job_url:
+    if not failure.company_name or not failure.role_title:
         return None
-    if _is_low_trust_replay_source_url(failure.source_url) or _is_low_trust_replay_source_url(failure.direct_job_url):
+    direct_job_url = _normalize_direct_job_url(failure.direct_job_url or "")
+    if direct_job_url and _is_low_trust_replay_source_url(direct_job_url):
+        direct_job_url = ""
+    source_url = str(failure.source_url or direct_job_url).strip()
+    if _is_low_trust_replay_source_url(source_url):
         return None
-    direct_job_url = _normalize_direct_job_url(failure.direct_job_url)
-    if not _is_allowed_direct_job_url(direct_job_url):
-        return None
-    source_url = failure.source_url or direct_job_url
     if not source_url.startswith(("http://", "https://")):
-        source_url = direct_job_url
+        if direct_job_url:
+            source_url = direct_job_url
+        else:
+            return None
+    if direct_job_url and (not _is_allowed_direct_job_url(direct_job_url) or _looks_like_generic_job_url(direct_job_url)):
+        direct_job_url = ""
+    if not direct_job_url and failure.reason_code not in RESOLUTION_REASON_CODES:
+        return None
     salary_min, salary_max, salary_text = _hydrate_salary_hint_values(None, None, failure.salary_text, failure.detail)
-    source_type = _normalize_source_type(direct_job_url)
+    source_type = _normalize_source_type(direct_job_url or source_url)
     replay_remote_haystack = " ".join(
         part
         for part in (
@@ -7222,7 +7229,7 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
         failure.role_title,
         failure.detail,
         source_url,
-        direct_job_url,
+        direct_job_url or None,
     )
     location_hint: str | None = None
     if is_remote_hint:
@@ -7234,7 +7241,7 @@ def _seed_lead_from_failure(failure: SearchFailure) -> JobLead | None:
         role_title=failure.role_title,
         source_url=source_url,
         source_type=source_type,
-        direct_job_url=direct_job_url,
+        direct_job_url=direct_job_url or None,
         location_hint=location_hint,
         posted_date_hint=failure.posted_date_text,
         is_remote_hint=is_remote_hint,
@@ -7478,42 +7485,30 @@ async def _replay_seed_leads(
             )
             continue
 
-        if not lead.direct_job_url or not _is_allowed_direct_job_url(lead.direct_job_url):
-            failure = _make_failure(
-                stage="resolution",
-                reason_code="resolution_missing",
-                detail="Seeded lead did not contain a valid direct ATS URL.",
-                lead=lead,
-                attempt_number=attempt_number,
-                round_number=0,
-            )
-            candidate = _build_candidate_job(
-                lead,
-                DirectJobResolution(
-                    accepted=True,
-                    direct_job_url=lead.source_url,
-                    ats_platform=urlparse(lead.source_url).netloc or "Unknown",
-                    evidence_notes="Near-miss fallback from seed replay.",
-                ),
-            )
-            near_miss = _build_near_miss(lead, candidate, failure, settings)
-            _record_failure_with_followups(
-                settings,
-                diagnostics,
-                failure,
-                unique_leads_discovered=total_unique_leads,
-                lead=lead,
-                candidate=candidate,
-                near_miss=near_miss,
-                audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate, near_miss=near_miss),
-                run_id=run_id,
-            )
-            continue
+        replay_lead = lead
+        replay_resolution: DirectJobResolution | None = None
 
-        reacquisition_entry = _validated_job_history_entry_for_url(lead.direct_job_url, validated_job_history_index)
+        if lead.direct_job_url and _is_allowed_direct_job_url(lead.direct_job_url):
+            replay_resolution = DirectJobResolution(
+                accepted=True,
+                direct_job_url=lead.direct_job_url,
+                ats_platform=urlparse(lead.direct_job_url).netloc or "Unknown",
+                evidence_notes="Revalidated from replayed seed leads.",
+            )
+
+        if replay_resolution is not None:
+            replay_lead = lead.model_copy(
+                update={"direct_job_url": _normalize_direct_job_url(replay_resolution.direct_job_url or lead.direct_job_url)}
+            )
+
+        reacquisition_entry = (
+            _validated_job_history_entry_for_url(replay_lead.direct_job_url, validated_job_history_index)
+            if replay_lead.direct_job_url
+            else None
+        )
         reacquisition_key = str((reacquisition_entry or {}).get("canonical_job_key") or (reacquisition_entry or {}).get("job_key") or "").strip()
         if reacquisition_entry is not None:
-            if not _lead_is_reacquisition_eligible(lead, settings, direct_job_url=lead.direct_job_url):
+            if not _lead_is_reacquisition_eligible(replay_lead, settings, direct_job_url=replay_lead.direct_job_url):
                 if reacquisition_key and reacquisition_key not in reacquisition_suppressed_keys:
                     reacquisition_suppressed_keys.add(reacquisition_key)
                     diagnostics.reacquired_jobs_suppressed_count += 1
@@ -7524,8 +7519,8 @@ async def _replay_seed_leads(
                         stage="filter",
                         reason_code="reacquisition_suppressed",
                         detail="Skipping a previously validated job because the repeat hit came from a low-trust or non-direct source.",
-                        lead=lead,
-                        direct_job_url=lead.direct_job_url,
+                        lead=replay_lead,
+                        direct_job_url=replay_lead.direct_job_url,
                         attempt_number=attempt_number,
                         round_number=0,
                     ),
@@ -7548,8 +7543,8 @@ async def _replay_seed_leads(
                             "Skipping a previously validated job because the per-run reacquisition cap "
                             f"({settings.reacquisition_attempt_cap}) was reached."
                         ),
-                        lead=lead,
-                        direct_job_url=lead.direct_job_url,
+                        lead=replay_lead,
+                        direct_job_url=replay_lead.direct_job_url,
                         attempt_number=attempt_number,
                         round_number=0,
                     ),
@@ -7573,19 +7568,109 @@ async def _replay_seed_leads(
             )
 
         resolved_leads_this_attempt += 1
-        candidate = _build_candidate_job(
-            lead,
-            DirectJobResolution(
-                accepted=True,
-                direct_job_url=lead.direct_job_url,
-                ats_platform=urlparse(lead.direct_job_url).netloc or "Unknown",
-                evidence_notes="Revalidated from replayed seed leads.",
-            ),
-        )
+        if replay_resolution is None:
+            try:
+                replay_resolution = await asyncio.wait_for(
+                    _resolve_lead_to_direct_job_url(resolution_agent, lead),
+                    timeout=lead_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                failure = _make_failure(
+                    stage="resolution",
+                    reason_code="resolution_timeout",
+                    detail=f"Resolution timed out after {lead_timeout_seconds}s.",
+                    lead=lead,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                )
+                _record_failure_with_followups(
+                    settings,
+                    diagnostics,
+                    failure,
+                    unique_leads_discovered=total_unique_leads,
+                    lead=lead,
+                    audit_entry=_build_false_negative_audit_entry(lead, failure),
+                    run_id=run_id,
+                )
+                continue
+            except Exception as exc:
+                if _is_insufficient_quota_error(exc):
+                    _record_failure_live(
+                        settings,
+                        diagnostics,
+                        _make_failure(
+                            stage="resolution",
+                            reason_code="openai_insufficient_quota",
+                            detail=f"Resolution failed because the OpenAI API quota was exhausted: {exc}",
+                            lead=lead,
+                            attempt_number=attempt_number,
+                            round_number=0,
+                        ),
+                        unique_leads_discovered=total_unique_leads,
+                    )
+                    raise OpenAIQuotaExceededError(
+                        "OpenAI API quota is exhausted. Add billing or increase quota, then rerun the workflow."
+                    ) from exc
+                failure = _make_failure(
+                    stage="resolution",
+                    reason_code="resolution_error",
+                    detail=f"Resolution failed with an exception: {exc}",
+                    lead=lead,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                )
+                _record_failure_with_followups(
+                    settings,
+                    diagnostics,
+                    failure,
+                    unique_leads_discovered=total_unique_leads,
+                    lead=lead,
+                    audit_entry=_build_false_negative_audit_entry(lead, failure),
+                    run_id=run_id,
+                )
+                continue
+
+            resolved_direct_job_url = _normalize_direct_job_url(replay_resolution.direct_job_url if replay_resolution else "")
+            if not resolved_direct_job_url or not _is_allowed_direct_job_url(resolved_direct_job_url):
+                failure = _make_failure(
+                    stage="resolution",
+                    reason_code="resolution_missing",
+                    detail="Seeded lead could not be resolved to a valid direct ATS URL.",
+                    lead=lead,
+                    attempt_number=attempt_number,
+                    round_number=0,
+                )
+                candidate = _build_candidate_job(
+                    lead,
+                    DirectJobResolution(
+                        accepted=True,
+                        direct_job_url=lead.source_url,
+                        ats_platform=urlparse(lead.source_url).netloc or "Unknown",
+                        evidence_notes="Near-miss fallback from seed replay.",
+                    ),
+                )
+                near_miss = _build_near_miss(lead, candidate, failure, settings)
+                _record_failure_with_followups(
+                    settings,
+                    diagnostics,
+                    failure,
+                    unique_leads_discovered=total_unique_leads,
+                    lead=lead,
+                    candidate=candidate,
+                    near_miss=near_miss,
+                    audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate, near_miss=near_miss),
+                    run_id=run_id,
+                )
+                continue
+
+            replay_lead = lead.model_copy(update={"direct_job_url": resolved_direct_job_url})
+            replay_resolution = replay_resolution.model_copy(update={"direct_job_url": resolved_direct_job_url})
+
+        candidate = _build_candidate_job(replay_lead, replay_resolution)
         try:
             validated, validation_failure, near_miss, audit_entry = await asyncio.wait_for(
                 _validate_candidate(
-                    lead,
+                    replay_lead,
                     candidate,
                     settings,
                     resolution_agent=resolution_agent,
@@ -7599,7 +7684,7 @@ async def _replay_seed_leads(
                 stage="validation",
                 reason_code="validation_timeout",
                 detail=f"Validation timed out after {lead_timeout_seconds}s.",
-                lead=lead,
+                lead=replay_lead,
                 direct_job_url=str(candidate.direct_job_url),
                 candidate=candidate,
                 attempt_number=attempt_number,
@@ -7610,9 +7695,9 @@ async def _replay_seed_leads(
                 diagnostics,
                 failure,
                 unique_leads_discovered=total_unique_leads,
-                lead=lead,
+                lead=replay_lead,
                 candidate=candidate,
-                audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate),
+                audit_entry=_build_false_negative_audit_entry(replay_lead, failure, candidate=candidate),
                 run_id=run_id,
             )
             continue
@@ -7621,7 +7706,7 @@ async def _replay_seed_leads(
                 stage="validation",
                 reason_code="validation_error",
                 detail=f"Validation failed with an exception: {exc}",
-                lead=lead,
+                lead=replay_lead,
                 direct_job_url=str(candidate.direct_job_url),
                 candidate=candidate,
                 attempt_number=attempt_number,
@@ -7632,9 +7717,9 @@ async def _replay_seed_leads(
                 diagnostics,
                 failure,
                 unique_leads_discovered=total_unique_leads,
-                lead=lead,
+                lead=replay_lead,
                 candidate=candidate,
-                audit_entry=_build_false_negative_audit_entry(lead, failure, candidate=candidate),
+                audit_entry=_build_false_negative_audit_entry(replay_lead, failure, candidate=candidate),
                 run_id=run_id,
             )
             continue
@@ -7645,7 +7730,7 @@ async def _replay_seed_leads(
                 diagnostics,
                 validation_failure,
                 unique_leads_discovered=total_unique_leads,
-                lead=lead,
+                lead=replay_lead,
                 candidate=candidate,
                 near_miss=near_miss,
                 audit_entry=audit_entry,
