@@ -1051,7 +1051,7 @@ def select_frontier_tasks(
             queue = grouped_candidates.get(group_key) or []
             if not queue:
                 continue
-            selected.append(dict(queue.pop(0)))
+            selected.append(queue.pop(0))
             if queue and len(selected) < budget:
                 next_round_groups.append(group_key)
             if len(selected) >= budget:

@@ -3,7 +3,12 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 
-from job_agent.company_discovery import load_company_discovery_entries, load_company_discovery_frontier, save_company_discovery_frontier
+from job_agent.company_discovery import (
+    load_company_discovery_entries,
+    load_company_discovery_frontier,
+    save_company_discovery_entries,
+    save_company_discovery_frontier,
+)
 from job_agent.config import Settings
 from job_agent.history import load_validated_job_history_index
 from job_agent.job_search import (
@@ -6630,6 +6635,135 @@ def test_collect_company_discovery_seed_leads_reactivates_repairable_smartrecrui
     frontier = load_company_discovery_frontier(settings.data_dir)
     task = next(task for task in frontier if task["task_type"] == "board_url")
     assert task["url"] == "https://jobs.smartrecruiters.com/acme-ai"
+    assert task["status"] == "completed"
+    assert task["last_error"] is None
+
+
+def test_collect_company_discovery_seed_leads_infers_smartrecruiters_board_from_branded_company_host(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.company_discovery_enabled = False
+    settings.company_discovery_indexer_enabled = True
+    settings.company_discovery_frontier_budget_per_run = 0
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 1
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "servicenow": {
+                "company_key": "servicenow",
+                "company_name": "ServiceNow",
+                "careers_roots": ["https://careers.servicenow.com/careers"],
+                "ats_types": ["SmartRecruiters"],
+                "board_identifiers": [],
+                "board_urls": ["https://jobs.smartrecruiters.com"],
+                "source_hosts": ["careers.servicenow.com"],
+                "source_trust": 8,
+                "first_seen_at": "2026-04-05T00:00:00+00:00",
+                "last_seen_at": "2026-04-05T00:00:00+00:00",
+                "last_successful_discovery_run": "run-0",
+                "ai_pm_candidate_count": 0,
+                "official_board_lead_count": 0,
+                "source_type_counts": {"careers_root": 1},
+                "board_crawl_success_count": 0,
+                "board_crawl_failure_count": 0,
+                "recent_fresh_role_count": 0,
+                "last_crawl_status": None,
+                "last_attempted_at": None,
+                "next_retry_at": None,
+            }
+        },
+    )
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "board_url:https://careers.servicenow.com/jobs/744000107435185/principal-inbound-product-manager-ai-assistant-agentic-workflows-moveworks",
+                "task_type": "board_url",
+                "url": "https://careers.servicenow.com/jobs/744000107435185/principal-inbound-product-manager-ai-assistant-agentic-workflows-moveworks",
+                "company_name": "ServiceNow",
+                "company_key": "servicenow",
+                "board_identifier": None,
+                "source_kind": "board_url",
+                "source_trust": 7,
+                "priority": 10,
+                "attempts": 1,
+                "status": "pending",
+                "discovered_from": "seed",
+                "next_retry_at": "2999-01-01T00:00:00+00:00",
+                "last_error": "missing_board_identifier",
+            }
+        ],
+    )
+
+    async def fake_fetch_smartrecruiters_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "id": "744000107435185",
+                "name": "Principal Inbound Product Manager, AI Assistant",
+                "releasedDate": "2026-04-02T12:00:00.000Z",
+                "location": {
+                    "city": "Remote",
+                    "country": "us",
+                    "remote": True,
+                },
+                "company": {"identifier": "servicenow", "name": "ServiceNow"},
+            }
+        ]
+
+    async def fake_fetch_smartrecruiters_posting_detail(_board_token: str, _posting_id: str) -> dict[str, object] | None:
+        return {
+            "company": {"identifier": "servicenow", "name": "ServiceNow"},
+            "location": {
+                "city": "Remote",
+                "country": "us",
+                "remote": True,
+            },
+            "jobAd": {
+                "sections": {
+                    "jobDescription": {
+                        "title": "Job Description",
+                        "text": "Lead agentic AI assistant product strategy for a remote-first team.",
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("job_agent.job_search._fetch_smartrecruiters_board_jobs", fake_fetch_smartrecruiters_board_jobs)
+    monkeypatch.setattr(
+        "job_agent.job_search._fetch_smartrecruiters_posting_detail",
+        fake_fetch_smartrecruiters_posting_detail,
+    )
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+        )
+    )
+
+    assert metrics["official_board_crawl_attempt_count"] == 1
+    assert metrics["official_board_crawl_success_count"] == 1
+    assert metrics["official_board_leads_count"] == 1
+    assert metrics["source_adapter_yields"]["smartrecruiters"] == 1
+    assert any(
+        lead.direct_job_url == "https://jobs.smartrecruiters.com/servicenow/744000107435185-principal-inbound-product-manager-ai-assistant"
+        for lead in leads
+    )
+
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    task = next(task for task in frontier if task["task_type"] == "board_url")
+    assert task["board_identifier"] == "smartrecruiters:servicenow"
+    assert task["url"] == "https://jobs.smartrecruiters.com/servicenow"
     assert task["status"] == "completed"
     assert task["last_error"] is None
 

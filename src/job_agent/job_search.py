@@ -32,6 +32,7 @@ from .company_discovery import (
     extract_directory_company_tasks,
     extract_company_homepage_urls,
     extract_embedded_board_urls,
+    frontier_task_key,
     infer_careers_root,
     is_company_discovery_seed_url,
     is_low_value_company_discovery_entry,
@@ -6038,6 +6039,78 @@ def _company_name_for_frontier_task(
     return "Unknown Company"
 
 
+def _infer_company_scoped_board_identifier(
+    url: str | None,
+    *,
+    company_name: str | None,
+    company_key: str | None,
+    entries: Mapping[str, dict[str, object]],
+) -> str | None:
+    normalized_url = str(url or "").strip()
+    if not normalized_url.startswith(("http://", "https://")):
+        return None
+    candidate_company_key = str(company_key or _normalize_company_key(company_name)).strip()
+    if not candidate_company_key:
+        return None
+    entry = entries.get(candidate_company_key)
+    if not isinstance(entry, Mapping):
+        return None
+
+    ats_types = {str(value or "").strip().lower() for value in entry.get("ats_types") or [] if str(value or "").strip()}
+    if "smartrecruiters" not in ats_types:
+        return None
+
+    parsed = urlparse(normalized_url)
+    host = (parsed.netloc or "").lower()
+    segments = _path_segments(parsed.path)
+    source_hosts = {str(value or "").strip().lower() for value in entry.get("source_hosts") or [] if str(value or "").strip()}
+
+    if "jobs.smartrecruiters.com" in host:
+        return f"smartrecruiters:{candidate_company_key}"
+    if host in source_hosts and segments and segments[0] == "jobs":
+        return f"smartrecruiters:{candidate_company_key}"
+    return None
+
+
+def _repair_company_scoped_board_frontier_tasks(
+    frontier: list[dict[str, object]],
+    *,
+    entries: Mapping[str, dict[str, object]],
+) -> None:
+    for task in frontier:
+        if str(task.get("task_type") or "").strip() != "board_url":
+            continue
+        if str(task.get("board_identifier") or "").strip():
+            continue
+        task_url = str(task.get("url") or "").strip()
+        if not task_url:
+            continue
+        company_name = str(task.get("company_name") or "").strip() or None
+        company_key = str(task.get("company_key") or "").strip() or None
+        inferred_board_identifier = _infer_company_scoped_board_identifier(
+            task_url,
+            company_name=company_name,
+            company_key=company_key,
+            entries=entries,
+        )
+        if not inferred_board_identifier:
+            continue
+        prefix, _, token = inferred_board_identifier.partition(":")
+        canonical_task_url = task_url
+        if prefix == "smartrecruiters" and token:
+            canonical_task_url = f"https://jobs.smartrecruiters.com/{token}"
+        task["board_identifier"] = inferred_board_identifier
+        task["url"] = canonical_task_url
+        task["task_key"] = frontier_task_key(
+            "board_url",
+            canonical_task_url,
+            board_identifier=inferred_board_identifier,
+        )
+        task["status"] = "pending"
+        task["next_retry_at"] = None
+        task["last_error"] = None
+
+
 def _company_discovery_board_urls_from_sources(*urls: str | None) -> list[str]:
     board_urls: list[str] = []
     for raw_url in urls:
@@ -6267,6 +6340,7 @@ async def _collect_company_discovery_seed_leads(
     entries = load_company_discovery_entries(settings.data_dir)
     frontier = load_company_discovery_frontier(settings.data_dir)
     _reactivate_repairable_board_frontier_tasks(frontier)
+    _repair_company_scoped_board_frontier_tasks(frontier, entries=entries)
     crawl_history = load_company_discovery_crawl_history(settings.data_dir)
     audit_entries = load_company_discovery_audit(settings.data_dir)
     new_company_keys: set[str] = set()
@@ -6297,14 +6371,20 @@ async def _collect_company_discovery_seed_leads(
         source_trust = trust_score_for_url(normalized_url, explicit_task_type=preferred_task_type)
         if source_trust <= 0 or source_trust > settings.company_discovery_source_max_trust:
             return False
-        board_identifier = board_identifier_from_url(normalized_url)
+        company_key = _normalize_company_key(company_name)
+        board_identifier = board_identifier_from_url(normalized_url) or _infer_company_scoped_board_identifier(
+            normalized_url,
+            company_name=company_name,
+            company_key=company_key,
+            entries=entries,
+        )
         if board_identifier:
             return upsert_frontier_task(
                 frontier,
                 task_type="board_url",
                 url=normalized_url,
                 company_name=company_name,
-                company_key=_normalize_company_key(company_name),
+                company_key=company_key,
                 board_identifier=board_identifier,
                 source_kind="board_url",
                 source_trust=source_trust,
@@ -6330,7 +6410,7 @@ async def _collect_company_discovery_seed_leads(
             task_type=task_type,
             url=normalized_url,
             company_name=company_name,
-            company_key=_normalize_company_key(company_name),
+            company_key=company_key,
             source_kind=task_type,
             source_trust=source_trust,
             priority=priority,
@@ -6430,6 +6510,24 @@ async def _collect_company_discovery_seed_leads(
             task_key = str(task.get("task_key") or "")
             task_url = str(task.get("url") or "").strip()
             board_identifier = str(task.get("board_identifier") or board_identifier_from_url(task_url) or "").strip()
+            if not board_identifier:
+                inferred_company_name = str(task.get("company_name") or "").strip() or None
+                inferred_company_key = str(task.get("company_key") or "").strip() or None
+                inferred_board_identifier = _infer_company_scoped_board_identifier(
+                    task_url,
+                    company_name=inferred_company_name,
+                    company_key=inferred_company_key,
+                    entries=entries,
+                )
+                if inferred_board_identifier:
+                    task["board_identifier"] = inferred_board_identifier
+                    board_identifier = inferred_board_identifier
+                    prefix, _, token = board_identifier.partition(":")
+                    if prefix == "smartrecruiters" and token:
+                        task_url = f"https://jobs.smartrecruiters.com/{token}"
+                        task["url"] = task_url
+                    task["task_key"] = frontier_task_key("board_url", task_url, board_identifier=board_identifier or None)
+                    task_key = str(task["task_key"])
             if not task_url or not board_identifier:
                 update_frontier_task_state(frontier, task_key=task_key, success=False, error="missing_board_identifier")
                 record_crawl_result(

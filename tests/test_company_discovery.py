@@ -150,6 +150,17 @@ def test_select_frontier_tasks_round_robins_across_companies() -> None:
     assert [task["company_key"] for task in selected] == ["alpha", "beta", "alpha"]
 
 
+def test_select_frontier_tasks_returns_live_task_references() -> None:
+    tasks = [
+        make_frontier_task(task_type="board_url", url="https://jobs.smartrecruiters.com/acme-ai", priority=10),
+    ]
+
+    selected = select_frontier_tasks(tasks, budget=1)
+    selected[0]["status"] = "completed"
+
+    assert tasks[0]["status"] == "completed"
+
+
 def test_upsert_frontier_task_does_not_reactivate_completed_entries_by_default() -> None:
     tasks = [
         {
