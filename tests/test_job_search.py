@@ -3983,6 +3983,32 @@ def test_failed_lead_history_skip_reason_suppresses_repeat_not_remote_without_br
     assert skip_reason[0] == "not_remote"
 
 
+def test_failed_lead_history_skip_reason_suppresses_single_exact_not_remote_url_without_broad_remote_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="FloQast",
+        role_title="Product Manager, Close Automation - Journal Entry Management",
+        source_url="https://builtin.com/job/product-manager-close-automation-journal-entry-management/8966454",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/floqast/78e79592-ad95-4fe5-9ab4-f21dc73484d5",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Remote AI product manager role from a Built In listing.",
+    )
+    history = {
+        "url:https://jobs.lever.co/floqast/78e79592-ad95-4fe5-9ab4-f21dc73484d5": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"not_remote": 1},
+        }
+    }
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "not_remote"
+
+
 def test_failed_lead_history_skip_reason_allows_repeat_not_remote_with_direct_remote_override() -> None:
     settings = build_settings()
     lead = JobLead(
@@ -4001,6 +4027,30 @@ def test_failed_lead_history_skip_reason_allows_repeat_not_remote_with_direct_re
         "url:https://jobs.lever.co/acme/123": {
             "watch_count": 2,
             "recent_rejection_reasons": {"not_remote": 2},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, history) is None
+
+
+def test_failed_lead_history_skip_reason_allows_single_exact_not_remote_url_with_broad_remote_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="FloQast",
+        role_title="Product Manager, AI Close Automation - Journal Entry Management",
+        source_url="https://jobs.lever.co/floqast/78e79592-ad95-4fe5-9ab4-f21dc73484d5",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/floqast/78e79592-ad95-4fe5-9ab4-f21dc73484d5",
+        location_hint="Remote - United States",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="This role is fully remote with published salary.",
+    )
+    history = {
+        "url:https://jobs.lever.co/floqast/78e79592-ad95-4fe5-9ab4-f21dc73484d5": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"not_remote": 1},
         }
     }
 
