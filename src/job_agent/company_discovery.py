@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
@@ -103,6 +103,11 @@ LOW_TRUST_SCOUT_HOST_FRAGMENTS = (
 )
 
 DEFAULT_FRONTIER_RETRY_DELAY = timedelta(hours=6)
+REPEATED_FRONTIER_FAILURE_PRIORITY_PENALTIES = {
+    "fetch_failed": 6,
+    "missing_board_identifier": 6,
+    "unsupported_adapter": 8,
+}
 GENERIC_DIRECTORY_COMPANY_KEYS = {
     "about",
     "career",
@@ -160,6 +165,18 @@ def _dedupe_strings(values: list[str], *, limit: int) -> list[str]:
         if len(ordered) >= limit:
             break
     return ordered
+
+
+T = TypeVar("T")
+
+
+def _paged_window(values: list[T], *, attempt_count: int, limit: int) -> list[T]:
+    if limit <= 0 or not values:
+        return []
+    page_count = max(1, (len(values) + limit - 1) // limit)
+    page_index = max(0, int(attempt_count)) % page_count
+    start = page_index * limit
+    return values[start : start + limit]
 
 
 def _host_matches_fragment(host: str, fragment: str) -> bool:
@@ -861,7 +878,12 @@ def extract_company_homepage_urls(page_url: str, html: str) -> list[str]:
     return _dedupe_strings(candidates, limit=16)
 
 
-def extract_directory_company_tasks(page_url: str, html: str) -> list[dict[str, str]]:
+def extract_directory_company_tasks(
+    page_url: str,
+    html: str,
+    *,
+    limit: int | None = 24,
+) -> list[dict[str, str]]:
     soup = BeautifulSoup(html or "", "html.parser")
     candidates_by_url: dict[str, dict[str, str]] = {}
 
@@ -881,7 +903,49 @@ def extract_directory_company_tasks(page_url: str, html: str) -> list[dict[str, 
             candidates_by_url[candidate["url"]] = candidate
 
     ordered = sorted(candidates_by_url.values(), key=lambda item: (item["task_type"] != "careers_root", item["url"]))
-    return ordered[:24]
+    if limit is None or limit < 0:
+        return ordered
+    return ordered[:limit]
+
+
+def select_directory_company_tasks(
+    tasks: list[Mapping[str, str]],
+    *,
+    known_company_keys: set[str] | None = None,
+    attempt_count: int = 0,
+    limit: int = 24,
+) -> list[dict[str, str]]:
+    if limit <= 0:
+        return []
+
+    normalized_known_company_keys = {
+        _normalize_company_key(company_key)
+        for company_key in known_company_keys or set()
+        if _normalize_company_key(company_key)
+    }
+    unseen_tasks: list[dict[str, str]] = []
+    seen_tasks: list[dict[str, str]] = []
+
+    for raw_task in tasks:
+        url = str(raw_task.get("url") or "").strip()
+        company_name = str(raw_task.get("company_name") or "").strip()
+        task_type = str(raw_task.get("task_type") or "").strip() or "company_page"
+        if not url or not company_name:
+            continue
+        task = {
+            "url": url,
+            "company_name": company_name,
+            "task_type": task_type,
+        }
+        company_key = _normalize_company_key(company_name) or _directory_company_key(url)
+        if company_key and company_key in normalized_known_company_keys:
+            seen_tasks.append(task)
+        else:
+            unseen_tasks.append(task)
+
+    if unseen_tasks:
+        return _paged_window(unseen_tasks, attempt_count=attempt_count, limit=limit)
+    return _paged_window(seen_tasks, attempt_count=attempt_count, limit=limit)
 
 
 def default_careers_candidate_urls(source_url: str | None) -> list[str]:
@@ -1034,6 +1098,17 @@ def select_frontier_tasks(
         return []
     moment = now or datetime.now(UTC)
 
+    def effective_priority(task: dict[str, Any]) -> int:
+        base_priority = int(task.get("priority") or 0)
+        attempts = int(task.get("attempts") or 0)
+        if attempts <= 0:
+            return base_priority
+        last_error = str(task.get("last_error") or "").strip().lower()
+        penalty = REPEATED_FRONTIER_FAILURE_PRIORITY_PENALTIES.get(last_error, 0)
+        if penalty <= 0:
+            return base_priority
+        return max(0, base_priority - penalty)
+
     def is_ready(task: dict[str, Any]) -> bool:
         if task_types and str(task.get("task_type") or "") not in task_types:
             return False
@@ -1045,7 +1120,7 @@ def select_frontier_tasks(
     candidates = [task for task in tasks if is_ready(task)]
     candidates.sort(
         key=lambda task: (
-            -int(task.get("priority") or 0),
+            -effective_priority(task),
             -int(task.get("source_trust") or 0),
             int(task.get("attempts") or 0),
             str(task.get("url") or ""),

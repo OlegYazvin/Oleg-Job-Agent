@@ -10,6 +10,7 @@ from job_agent.company_discovery import (
     load_company_discovery_entries,
     load_company_discovery_frontier,
     make_frontier_task,
+    select_directory_company_tasks,
     save_company_discovery_entries,
     save_company_discovery_frontier,
     select_frontier_tasks,
@@ -162,6 +163,32 @@ def test_select_frontier_tasks_returns_live_task_references() -> None:
     assert tasks[0]["status"] == "completed"
 
 
+def test_select_frontier_tasks_demotes_repeated_hard_failures_below_fresh_candidates() -> None:
+    tasks = [
+        {
+            **make_frontier_task(
+                task_type="board_url",
+                url="https://capgroup.wd1.myworkdayjobs.com",
+                company_name="Capital Group",
+                priority=10,
+            ),
+            "attempts": 20,
+            "last_error": "missing_board_identifier",
+        },
+        make_frontier_task(
+            task_type="company_page",
+            url="https://www.builtin.com/company/coreweave",
+            company_name="CoreWeave",
+            priority=8,
+        ),
+    ]
+
+    selected = select_frontier_tasks(tasks, budget=1)
+
+    assert len(selected) == 1
+    assert selected[0]["company_key"] == "coreweave"
+
+
 def test_upsert_frontier_task_does_not_reactivate_completed_entries_by_default() -> None:
     tasks = [
         {
@@ -212,6 +239,43 @@ def test_extract_directory_company_tasks_supports_welcome_to_the_jungle_company_
 
     assert {"url": "https://www.welcometothejungle.com/en/companies/figma/jobs", "company_name": "Figma", "task_type": "careers_root"} in tasks
     assert {"url": "https://www.welcometothejungle.com/en/companies/linear", "company_name": "Linear", "task_type": "company_page"} in tasks
+
+
+def test_select_directory_company_tasks_prefers_unseen_companies() -> None:
+    tasks = [
+        {"url": "https://www.builtin.com/company/acme/jobs", "company_name": "Acme", "task_type": "careers_root"},
+        {"url": "https://www.builtin.com/company/bravo/jobs", "company_name": "Bravo", "task_type": "careers_root"},
+        {"url": "https://www.builtin.com/company/charlie/jobs", "company_name": "Charlie", "task_type": "careers_root"},
+        {"url": "https://www.builtin.com/company/delta/jobs", "company_name": "Delta", "task_type": "careers_root"},
+    ]
+
+    selected = select_directory_company_tasks(
+        tasks,
+        known_company_keys={"acme", "bravo"},
+        attempt_count=0,
+        limit=2,
+    )
+
+    assert [task["company_name"] for task in selected] == ["Charlie", "Delta"]
+
+
+def test_select_directory_company_tasks_rotates_directory_windows_between_attempts() -> None:
+    tasks = [
+        {
+            "url": f"https://www.builtin.com/company/company-{index}/jobs",
+            "company_name": f"Company {index}",
+            "task_type": "careers_root",
+        }
+        for index in range(7)
+    ]
+
+    first_window = select_directory_company_tasks(tasks, attempt_count=0, limit=3)
+    second_window = select_directory_company_tasks(tasks, attempt_count=1, limit=3)
+    third_window = select_directory_company_tasks(tasks, attempt_count=2, limit=3)
+
+    assert [task["company_name"] for task in first_window] == ["Company 0", "Company 1", "Company 2"]
+    assert [task["company_name"] for task in second_window] == ["Company 3", "Company 4", "Company 5"]
+    assert [task["company_name"] for task in third_window] == ["Company 6"]
 
 
 def test_extract_careers_page_urls_canonicalizes_directory_company_jobs_and_ignores_cross_company_links() -> None:

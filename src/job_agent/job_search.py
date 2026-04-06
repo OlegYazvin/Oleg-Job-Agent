@@ -46,6 +46,7 @@ from .company_discovery import (
     save_company_discovery_entries,
     save_company_discovery_frontier,
     select_frontier_tasks,
+    select_directory_company_tasks,
     source_directory_seed_tasks,
     trust_score_for_url,
     update_frontier_task_state,
@@ -7111,7 +7112,21 @@ async def _collect_company_discovery_seed_leads(
                 )
                 continue
             discovered_count = 0
-            for candidate in extract_directory_company_tasks(task_url, html):
+            known_company_keys = {
+                str(company_key).strip()
+                for company_key in (
+                    *entries.keys(),
+                    *previously_reported_company_keys,
+                    *(task.get("company_key") for task in frontier),
+                )
+                if str(company_key).strip()
+            }
+            directory_company_candidates = select_directory_company_tasks(
+                extract_directory_company_tasks(task_url, html, limit=None),
+                known_company_keys=known_company_keys,
+                attempt_count=int(task.get("attempts") or 0),
+            )
+            for candidate in directory_company_candidates:
                 if _queue_frontier_url(
                     url=str(candidate.get("url") or "").strip(),
                     company_name=str(candidate.get("company_name") or "").strip() or None,

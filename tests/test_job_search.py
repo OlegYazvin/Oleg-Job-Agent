@@ -7753,6 +7753,143 @@ def test_collect_company_discovery_seed_leads_sidecar_skips_conflicting_director
     assert not any(task["url"] == "https://www.builtin.com/company/velocity-black/jobs" for task in frontier)
 
 
+def test_collect_company_discovery_seed_leads_rotates_large_directory_candidate_windows(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.company_discovery_directory_crawl_budget_per_run = 1
+    settings.company_discovery_frontier_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 0
+
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "directory_source:https://www.builtin.com/jobs",
+                "task_type": "directory_source",
+                "url": "https://www.builtin.com/jobs",
+                "company_name": None,
+                "company_key": None,
+                "source_kind": "directory_source",
+                "source_trust": 5,
+                "priority": 3,
+                "attempts": 1,
+                "status": "pending",
+                "discovered_from": None,
+            }
+        ],
+    )
+
+    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: [])
+
+    slugs = [f"{chr(97 + (index // 26))}{chr(97 + (index % 26))}-labs" for index in range(30)]
+    directory_links = "\n".join(
+        f'<a href="/company/{slug}/jobs">{slug.replace("-", " ").title()} Jobs</a>'
+        for slug in slugs
+    )
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return f"<html><body>{directory_links}</body></html>"
+
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+
+    _leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-directory-window",
+        )
+    )
+
+    assert metrics["source_adapter_yields"]["directory_source"] == 6
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    queued_urls = {
+        task["url"]
+        for task in frontier
+        if task["task_type"] == "careers_root" and str(task.get("url") or "").startswith("https://www.builtin.com/company/")
+    }
+    expected_window = {f"https://www.builtin.com/company/{slug}/jobs" for slug in slugs[24:]}
+    assert queued_urls == expected_window
+
+
+def test_collect_company_discovery_seed_leads_directory_window_skips_previously_reported_companies(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.company_discovery_directory_crawl_budget_per_run = 1
+    settings.company_discovery_frontier_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 0
+
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "directory_source:https://www.builtin.com/jobs",
+                "task_type": "directory_source",
+                "url": "https://www.builtin.com/jobs",
+                "company_name": None,
+                "company_key": None,
+                "source_kind": "directory_source",
+                "source_trust": 5,
+                "priority": 3,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": None,
+            }
+        ],
+    )
+
+    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: [])
+
+    directory_links = """
+    <html><body>
+      <a href="/company/acme-ai/jobs">Acme AI Jobs</a>
+      <a href="/company/bravo-ai/jobs">Bravo AI Jobs</a>
+      <a href="/company/charlie-ai/jobs">Charlie AI Jobs</a>
+      <a href="/company/delta-ai/jobs">Delta AI Jobs</a>
+    </body></html>
+    """
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return directory_links
+
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+
+    _leads, _metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-directory-known-filter",
+            previously_reported_company_keys={"acmeai", "bravoai"},
+        )
+    )
+
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    queued_urls = {
+        task["url"]
+        for task in frontier
+        if task["task_type"] == "careers_root" and str(task.get("url") or "").startswith("https://www.builtin.com/company/")
+    }
+    assert "https://www.builtin.com/company/acme-ai/jobs" not in queued_urls
+    assert "https://www.builtin.com/company/bravo-ai/jobs" not in queued_urls
+    assert "https://www.builtin.com/company/charlie-ai/jobs" in queued_urls
+    assert "https://www.builtin.com/company/delta-ai/jobs" in queued_urls
+
+
 def test_collect_company_discovery_seed_leads_skips_recursive_discovery_detail_pages(
     monkeypatch,
     tmp_path: Path,
