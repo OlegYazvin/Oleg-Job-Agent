@@ -4383,6 +4383,7 @@ def _normalize_and_filter_discovery_leads(leads: list[JobLead], query: str) -> l
     )
     for lead in leads:
         normalized_direct = _normalize_direct_job_url(lead.direct_job_url) if lead.direct_job_url else None
+        source_page_type = _normalize_source_type(lead.source_url)
         normalized = lead.model_copy(
             update={
                 "source_query": query,
@@ -4396,11 +4397,7 @@ def _normalize_and_filter_discovery_leads(leads: list[JobLead], query: str) -> l
 
         if not normalized.direct_job_url and not _is_supported_discovery_source_url(normalized.source_url):
             continue
-        if (
-            expected_company_marker
-            and normalized.source_type in {"builtin", "linkedin", "glassdoor", "other"}
-            and not normalized.direct_job_url
-        ):
+        if expected_company_marker and source_page_type in {"builtin", "linkedin", "glassdoor", "other"}:
             continue
         if "product manager" not in normalized.role_title.lower():
             continue
