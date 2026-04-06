@@ -7593,6 +7593,103 @@ def test_collect_company_discovery_seed_leads_demotes_saturated_reported_board_t
     assert leads[0].direct_job_url == "https://jobs.smartrecruiters.com/novel-co/novel-co-1-principal-product-manager-ai"
 
 
+def test_collect_company_discovery_seed_leads_defers_saturated_reported_board_crawls_while_novel_expansion_remains(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.company_discovery_enabled = False
+    settings.company_discovery_indexer_enabled = True
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_frontier_budget_per_run = 1
+    settings.company_discovery_board_crawl_budget_per_run = 1
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "knownco": {
+                "company_key": "knownco",
+                "company_name": "Known Co",
+                "board_urls": ["https://jobs.smartrecruiters.com/known-co"],
+                "board_identifiers": ["smartrecruiters:known-co"],
+                "source_hosts": ["jobs.smartrecruiters.com"],
+                "source_trust": 9,
+                "official_board_lead_count": 120,
+                "recent_fresh_role_count": 120,
+                "board_crawl_success_count": 8,
+            }
+        },
+    )
+    save_company_discovery_frontier(
+        settings.data_dir,
+        [
+            {
+                "task_key": "board_url:https://jobs.smartrecruiters.com/known-co:smartrecruiters:known-co",
+                "task_type": "board_url",
+                "url": "https://jobs.smartrecruiters.com/known-co",
+                "company_name": "Known Co",
+                "company_key": "knownco",
+                "board_identifier": "smartrecruiters:known-co",
+                "source_kind": "board_url",
+                "source_trust": 9,
+                "priority": 10,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "test",
+            },
+            {
+                "task_key": "company_page:https://novel.example",
+                "task_type": "company_page",
+                "url": "https://novel.example",
+                "company_name": "Novel Co",
+                "company_key": "novelco",
+                "source_kind": "company_page",
+                "source_trust": 7,
+                "priority": 8,
+                "attempts": 0,
+                "status": "pending",
+                "discovered_from": "test",
+            },
+        ],
+    )
+
+    monkeypatch.setattr("job_agent.job_search.source_directory_seed_tasks", lambda: [])
+    monkeypatch.setattr("job_agent.job_search._build_company_discovery_seed_queries", lambda *_args, **_kwargs: [])
+
+    async def fake_fetch_page_html(_url: str) -> str | None:
+        return "<html><body><p>No embedded board.</p></body></html>"
+
+    async def fail_fetch_smartrecruiters_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        raise AssertionError("saturated reported board crawl should have been deferred")
+
+    monkeypatch.setattr("job_agent.job_search._fetch_page_html", fake_fetch_page_html)
+    monkeypatch.setattr("job_agent.job_search._fetch_smartrecruiters_board_jobs", fail_fetch_smartrecruiters_board_jobs)
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+            previously_reported_company_keys={"knownco"},
+        )
+    )
+
+    assert leads == []
+    assert metrics["official_board_crawl_attempt_count"] == 0
+    frontier = load_company_discovery_frontier(settings.data_dir)
+    known_board_task = next(task for task in frontier if task["task_type"] == "board_url")
+    assert known_board_task["status"] == "pending"
+    assert int(known_board_task["attempts"] or 0) == 0
+    novel_company_task = next(task for task in frontier if task["company_key"] == "novelco")
+    assert novel_company_task["status"] == "completed"
+    assert int(novel_company_task["attempts"] or 0) == 1
+
+
 def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandard_careers_links(
     monkeypatch,
     tmp_path: Path,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter, deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from html import unescape
@@ -2303,6 +2303,9 @@ def _company_discovery_entry_saturation_score(entry: Mapping[str, object]) -> in
     return official_board_lead_count + recent_fresh_role_count + board_crawl_success_count * 4
 
 
+REPORTED_BOARD_RECRAWL_SATURATION_THRESHOLD = 12
+
+
 def _company_discovery_entry_seed_priority(entry: Mapping[str, object]) -> tuple[int, int, int, int, int, str]:
     source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
     board_identifiers = [str(item).strip() for item in entry.get("board_identifiers") or [] if str(item).strip()]
@@ -2336,6 +2339,42 @@ def _company_discovery_entry_frontier_priority(
     exploration_boost = 2 if official_board_lead_count == 0 else 0
     saturation_penalty = min(5, _company_discovery_entry_saturation_score(entry))
     return max(4, min(12, 7 + novelty_boost + exploration_boost - saturation_penalty))
+
+
+def _frontier_has_pending_novel_company_expansion(
+    frontier: Sequence[Mapping[str, object]],
+    *,
+    previously_reported_company_keys: set[str],
+) -> bool:
+    for task in frontier:
+        if str(task.get("status") or "pending") != "pending":
+            continue
+        task_type = str(task.get("task_type") or "").strip()
+        if task_type in {"directory_source", "portfolio_source"}:
+            return True
+        if task_type not in {"company_page", "careers_root"}:
+            continue
+        company_key = _normalize_company_key(str(task.get("company_key") or task.get("company_name") or ""))
+        if not company_key or company_key not in previously_reported_company_keys:
+            return True
+    return False
+
+
+def _should_defer_reported_saturated_board_task(
+    task: Mapping[str, object],
+    *,
+    entries: Mapping[str, Mapping[str, object]],
+    previously_reported_company_keys: set[str],
+) -> bool:
+    company_key = _normalize_company_key(str(task.get("company_key") or task.get("company_name") or ""))
+    if not company_key:
+        return False
+    if company_key not in previously_reported_company_keys:
+        return False
+    entry = entries.get(company_key)
+    if not isinstance(entry, Mapping):
+        return False
+    return _company_discovery_entry_saturation_score(entry) >= REPORTED_BOARD_RECRAWL_SATURATION_THRESHOLD
 
 
 def _watchlist_reason_count(entry: dict[str, object], reason_code: str) -> int:
@@ -6819,7 +6858,22 @@ async def _collect_company_discovery_seed_leads(
         nonlocal official_board_crawl_attempt_count
         nonlocal official_board_crawl_success_count
 
-        for task in select_frontier_tasks(frontier, budget=budget, task_types={"board_url"}):
+        board_tasks = select_frontier_tasks(frontier, budget=len(frontier), task_types={"board_url"})
+        if _frontier_has_pending_novel_company_expansion(
+            frontier,
+            previously_reported_company_keys=previously_reported_company_keys,
+        ):
+            board_tasks = [
+                task
+                for task in board_tasks
+                if not _should_defer_reported_saturated_board_task(
+                    task,
+                    entries=entries,
+                    previously_reported_company_keys=previously_reported_company_keys,
+                )
+            ]
+
+        for task in board_tasks[:budget]:
             task_key = str(task.get("task_key") or "")
             task_url = str(task.get("url") or "").strip()
             board_identifier = str(task.get("board_identifier") or board_identifier_from_url(task_url) or "").strip()
