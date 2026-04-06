@@ -4354,6 +4354,41 @@ def test_annotate_and_filter_resolution_leads_keeps_low_trust_direct_remote_lead
     assert ranked[0].company_name == "Explicit Remote Co"
 
 
+def test_annotate_and_filter_resolution_leads_caps_low_trust_direct_candidates() -> None:
+    settings = build_settings()
+    trusted = JobLead(
+        company_name="Trusted Co",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/trusted/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/trusted/123",
+        location_hint="Remote - United States",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$230,000 - $260,000",
+        evidence_notes="Direct ATS role with explicit remote evidence.",
+    )
+    low_trust_leads = [
+        JobLead(
+            company_name=f"Low Trust {label}",
+            role_title="Senior Product Manager, AI",
+            source_url=f"https://builtin.com/job/low-trust-{label.lower()}/1",
+            source_type="builtin",
+            direct_job_url=f"https://jobs.lever.co/lowtrust{label.lower()}/abc123",
+            location_hint="Remote - United States",
+            posted_date_hint="today",
+            is_remote_hint=True,
+            salary_text_hint="$210,000 - $240,000",
+            evidence_notes="This role is fully remote with published salary.",
+        )
+        for label in ("A", "B", "C")
+    ]
+
+    ranked = _annotate_and_filter_resolution_leads([*low_trust_leads, trusted], settings, {})
+
+    assert [lead.company_name for lead in ranked] == ["Trusted Co", "Low Trust A", "Low Trust B"]
+
+
 def test_annotate_and_filter_resolution_leads_skips_repeat_not_remote_companies_without_broad_remote_override() -> None:
     settings = build_settings()
     listing_only_remote = JobLead(

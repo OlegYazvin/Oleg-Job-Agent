@@ -352,6 +352,7 @@ TIMEOUT_SENSITIVE_QUERY_MARKERS = (
 )
 TIMEOUT_SENSITIVE_QUERY_SKIP_THRESHOLD = 2
 MAX_ROUND_LEADS_PER_COMPANY = 3
+MAX_LOW_TRUST_DIRECT_RESOLUTION_LEADS = 2
 
 LOCAL_OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
 BUILTIN_PRIMARY_BASE_URL = "https://builtin.com"
@@ -2335,7 +2336,15 @@ def _annotate_and_filter_resolution_leads(
             *_lead_priority(lead, settings),
         )
     )
-    return annotated
+    capped: list[JobLead] = []
+    low_trust_direct_count = 0
+    for lead in annotated:
+        if lead.source_type in {"builtin", "linkedin", "other"} and lead.direct_job_url:
+            if low_trust_direct_count >= MAX_LOW_TRUST_DIRECT_RESOLUTION_LEADS:
+                continue
+            low_trust_direct_count += 1
+        capped.append(lead)
+    return capped
 
 
 def _normalize_company_key(company_name: str | None) -> str:
