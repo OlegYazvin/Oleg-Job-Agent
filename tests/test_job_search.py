@@ -4261,10 +4261,11 @@ def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_witho
         source_url="https://builtin.com/job/repeatco-ai-pm/123",
         source_type="builtin",
         direct_job_url="https://jobs.lever.co/repeatco/abc123",
+        location_hint="Remote - United States",
         posted_date_hint="today",
         is_remote_hint=True,
         salary_text_hint="$210,000 - $240,000",
-        evidence_notes="Remote AI product manager role with published salary.",
+        evidence_notes="This role is fully remote with published salary.",
     )
     watchlist = {
         "repeatco": {
@@ -4290,10 +4291,11 @@ def test_annotate_and_filter_resolution_leads_prefers_explicit_remote_evidence()
         source_url="https://builtin.com/job/remote-co/1",
         source_type="builtin",
         direct_job_url="https://jobs.lever.co/remoteco/abc123",
+        location_hint="Remote - United States",
         posted_date_hint="today",
         is_remote_hint=True,
         salary_text_hint="$210,000 - $240,000",
-        evidence_notes="Remote AI product manager role with published salary.",
+        evidence_notes="This role is fully remote with published salary.",
     )
     listing_only_remote = explicit_remote.model_copy(
         update={
@@ -4309,6 +4311,47 @@ def test_annotate_and_filter_resolution_leads_prefers_explicit_remote_evidence()
 
     assert [lead.company_name for lead in ranked] == ["Remote Co", "Listing Co"]
     assert ranked[0].source_quality_score_hint > ranked[1].source_quality_score_hint
+
+
+def test_annotate_and_filter_resolution_leads_skips_low_trust_direct_remote_leads_without_broad_remote_evidence() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Weak Remote Co",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/weak-remote/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/weakremote/abc123",
+        location_hint="Remote",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="AI product manager role discovered on Built In.",
+    )
+
+    ranked = _annotate_and_filter_resolution_leads([lead], settings, {})
+
+    assert ranked == []
+
+
+def test_annotate_and_filter_resolution_leads_keeps_low_trust_direct_remote_leads_with_broad_remote_evidence() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Explicit Remote Co",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/explicit-remote/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/explicitremote/abc123",
+        location_hint="Remote - United States",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="This role is fully remote with published salary.",
+    )
+
+    ranked = _annotate_and_filter_resolution_leads([lead], settings, {})
+
+    assert len(ranked) == 1
+    assert ranked[0].company_name == "Explicit Remote Co"
 
 
 def test_annotate_and_filter_resolution_leads_skips_repeat_not_remote_companies_without_broad_remote_override() -> None:

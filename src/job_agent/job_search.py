@@ -2158,6 +2158,38 @@ def _lead_has_strong_validation_hints(lead: JobLead, settings: Settings) -> bool
     )
 
 
+def _lead_has_explicit_broad_remote_evidence(lead: JobLead) -> bool:
+    combined_remote_hint = _join_remote_restriction_context(
+        lead.location_hint,
+        lead.evidence_notes,
+        _unwrap_direct_job_url(lead.direct_job_url or ""),
+    ).lower()
+    explicit_remote_markers = (
+        *BROAD_REMOTE_OVERRIDE_MARKERS,
+        "location: remote",
+        "this role is remote",
+        "this position is remote",
+        "remote position",
+        "remote role",
+    )
+    return any(marker in combined_remote_hint for marker in explicit_remote_markers)
+
+
+def _should_skip_low_trust_direct_remote_lead(lead: JobLead) -> bool:
+    if lead.source_type not in {"builtin", "linkedin", "other"}:
+        return False
+    if not lead.direct_job_url or lead.is_remote_hint is not True:
+        return False
+    combined_remote_hint = _join_remote_restriction_context(
+        lead.location_hint,
+        lead.evidence_notes,
+        _unwrap_direct_job_url(lead.direct_job_url or ""),
+    )
+    if _extract_geo_limited_remote_region(combined_remote_hint):
+        return True
+    return not _lead_has_explicit_broad_remote_evidence(lead)
+
+
 def _lead_host_is_js_blank_prone(lead: JobLead) -> bool:
     host = (urlparse(lead.direct_job_url or lead.source_url).netloc or "").lower()
     return any(fragment in host for fragment in ("myworkdayjobs.com", "careers.workday.com", "getro.com"))
@@ -2288,6 +2320,8 @@ def _annotate_and_filter_resolution_leads(
     for lead in leads:
         watchlist_entry = company_watchlist.get(_normalize_company_key(lead.company_name), {})
         if _watchlist_entry_should_skip_resolution(lead, settings, watchlist_entry):
+            continue
+        if _should_skip_low_trust_direct_remote_lead(lead):
             continue
         source_quality_score = _lead_source_quality_score(lead, settings, watchlist_entry)
         if source_quality_score <= 0:
