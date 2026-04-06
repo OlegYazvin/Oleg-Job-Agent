@@ -1130,6 +1130,15 @@ def _failed_lead_history_skip_reason(
     }
     current_url = lead.direct_job_url or lead.source_url
     current_company_hint = _company_hint_from_url(current_url or "") if current_url else ""
+    if (
+        matched_key.startswith("url:")
+        and reason_counts.get("stale_posting", 0) >= 1
+        and not _lead_has_override_hints_for_reason(lead, settings, "stale_posting")
+    ):
+        return (
+            "stale_posting",
+            f"Lead matched prior failed lead history ({matched_key}) with an exact stale URL and no fresher date evidence.",
+        )
     for reason_code in FAILED_LEAD_IMMEDIATE_SUPPRESS_REASON_CODES:
         if reason_counts.get(reason_code, 0) >= 1:
             if reason_code == "company_mismatch" and _is_weak_company_hint(current_company_hint):

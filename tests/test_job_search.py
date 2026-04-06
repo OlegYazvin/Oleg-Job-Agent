@@ -3899,6 +3899,54 @@ def test_failed_lead_history_skip_reason_suppresses_repeat_stale_without_fresh_d
     assert skip_reason[0] == "stale_posting"
 
 
+def test_failed_lead_history_skip_reason_suppresses_single_exact_stale_url_without_fresh_date_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="SmarterDx",
+        role_title="Senior Product Manager, ML Platform",
+        source_url="https://builtin.com/job/senior-product-manager-ml-platform/8891586",
+        source_type="builtin",
+        direct_job_url="https://job-boards.greenhouse.io/smarterdx/jobs/5004750007",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Remote AI product manager role from a Built In listing.",
+    )
+    history = {
+        "url:https://job-boards.greenhouse.io/smarterdx/jobs/5004750007": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"stale_posting": 1},
+        }
+    }
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "stale_posting"
+
+
+def test_failed_lead_history_skip_reason_allows_single_exact_stale_url_with_fresh_date_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="SmarterDx",
+        role_title="Senior Product Manager, ML Platform",
+        source_url="https://builtin.com/job/senior-product-manager-ml-platform/8891586",
+        source_type="builtin",
+        direct_job_url="https://job-boards.greenhouse.io/smarterdx/jobs/5004750007",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Fully remote AI product manager role with published salary.",
+    )
+    history = {
+        "url:https://job-boards.greenhouse.io/smarterdx/jobs/5004750007": {
+            "watch_count": 1,
+            "recent_rejection_reasons": {"stale_posting": 1},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, history) is None
+
+
 def test_failed_lead_history_skip_reason_suppresses_repeat_not_remote_without_broad_remote_override() -> None:
     settings = build_settings()
     lead = JobLead(
