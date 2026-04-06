@@ -4167,6 +4167,23 @@ def test_normalize_and_filter_discovery_leads_skips_company_mismatches_for_compa
     assert [lead.company_name for lead in normalized] == ["Block"]
 
 
+def test_normalize_and_filter_discovery_leads_drops_jobicy_mirror_results() -> None:
+    url = "https://jobicy.com/jobs/141212-principal-product-manager-ai-data"
+    assert _is_allowed_direct_job_url(url) is False
+
+    lead = _build_lead_from_search_result(
+        url,
+        "141212-principal-product-manager Remote Principal Product Manager, AI & Data at phData - Jobicy",
+        "Remote role. Posted Mar 25, 2026.",
+        '"Duda Inc" "Principal Product Manager, AI" remote',
+    )
+
+    assert lead is not None
+    normalized = _normalize_and_filter_discovery_leads([lead], '"Duda Inc" "Principal Product Manager, AI" remote')
+
+    assert normalized == []
+
+
 def test_build_lead_from_search_result_uses_title_or_url_for_remote_hint() -> None:
     lead = _build_lead_from_search_result(
         "https://jobs.twilio.com/careers/job/1099549995199-senior-product-manager-enterprise-ai-remote-us",

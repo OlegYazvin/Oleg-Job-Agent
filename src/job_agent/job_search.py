@@ -408,6 +408,7 @@ COMPANY_SITE_JUNK_HOST_FRAGMENTS = (
     "youtube.com",
     "tiktok.com",
     "pinterest.com",
+    "jobicy.com",
 )
 COMPANY_RESOLUTION_URL_CACHE: dict[str, list[str]] = {}
 LOCAL_SEARCH_JOB_BOARD_DOMAIN_BATCHES = (
@@ -657,6 +658,8 @@ def _looks_like_company_job_page(url: str) -> bool:
     path = (parsed.path or "").lower()
     query = (parsed.query or "").lower()
     if any(fragment in host for fragment in BLOCKED_JOB_HOST_FRAGMENTS):
+        return False
+    if any(fragment in host for fragment in COMPANY_SITE_JUNK_HOST_FRAGMENTS):
         return False
     if any(fragment in host for fragment in ALLOWED_JOB_HOST_FRAGMENTS):
         return _looks_like_direct_ats_job_path(host, path)
