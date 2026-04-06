@@ -5927,6 +5927,54 @@ def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypa
     assert forced_calls == [(2, "forced_sample")]
 
 
+def test_search_single_query_local_filters_company_mismatched_builtin_leads_for_company_named_queries(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+    matching = JobLead(
+        company_name="Duda",
+        role_title="Principal Product Manager, AI",
+        source_url="https://builtin.com/job/duda-ai/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/duda/abc123",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        base_salary_min_usd_hint=220000,
+        evidence_notes="Remote AI product manager role.",
+    )
+    mismatched = matching.model_copy(
+        update={
+            "company_name": "Headway",
+            "source_url": "https://builtin.com/job/headway-ai/1",
+            "direct_job_url": "https://job-boards.greenhouse.io/headway/jobs/5627257004",
+        }
+    )
+
+    async def fake_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return [mismatched, matching]
+
+    async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_local_search(_query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+        return []
+
+    monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
+    monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
+    monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+
+    leads, _average_confidence = asyncio.run(
+        _search_single_query_local(
+            settings,
+            '"Duda Inc" "AI Product Manager" remote',
+            attempt_number=1,
+            run_id="run-1",
+        )
+    )
+
+    assert [lead.company_name for lead in leads] == ["Duda"]
+
+
 def test_search_single_query_local_skips_forced_ollama_sample_for_clean_direct_ats_bundle(monkeypatch) -> None:
     settings = build_settings()
     settings.llm_provider = "ollama"

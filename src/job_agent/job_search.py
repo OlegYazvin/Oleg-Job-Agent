@@ -9574,6 +9574,10 @@ async def _search_single_query_local(
             continue
         leads.append(lead)
 
+    builtin_leads = _normalize_and_filter_discovery_leads(builtin_leads, query)
+    linkedin_leads = _normalize_and_filter_discovery_leads(linkedin_leads, query)
+    leads = _normalize_and_filter_discovery_leads(leads, query)
+
     merged_leads = _merge_and_dedupe_leads(builtin_leads, linkedin_leads, leads)
     candidate_pool = _deterministic_trim_local_leads(
         settings,
