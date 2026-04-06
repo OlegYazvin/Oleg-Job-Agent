@@ -330,6 +330,18 @@ TRUSTED_DIRECT_LEAD_SUPPRESS_REASON_CODES = {
     "not_remote",
     "salary_below_min",
 }
+BROAD_REMOTE_OVERRIDE_MARKERS = (
+    "100% remote",
+    "fully remote",
+    "remote - united states",
+    "remote, united states",
+    "united states remote",
+    "remote us",
+    "remote - us",
+    "remote - usa",
+    "remote, usa",
+    "work from home",
+)
 BROAD_GENERIC_QUERY_TIMEOUT_SKIP_THRESHOLD = 6
 COMPANY_FOCUSED_QUERY_TIMEOUT_SKIP_THRESHOLD = 2
 TIMEOUT_SENSITIVE_QUERY_MARKERS = (
@@ -2458,6 +2470,24 @@ def _lead_has_strong_override_hints(lead: JobLead, settings: Settings) -> bool:
 def _lead_has_override_hints_for_reason(lead: JobLead, settings: Settings, reason_code: str) -> bool:
     if not _lead_has_strong_override_hints(lead, settings):
         return False
+    if reason_code == "stale_posting":
+        return _hint_is_recent(lead.posted_date_hint, settings) is True
+    if reason_code in {"not_remote", "remote_unclear"}:
+        combined_location_hint = _join_remote_restriction_context(
+            lead.role_title,
+            lead.location_hint,
+            lead.evidence_notes,
+            _unwrap_direct_job_url(lead.direct_job_url or ""),
+        )
+        lowered_hints = combined_location_hint.lower()
+        if any(marker in lowered_hints for marker in BROAD_REMOTE_OVERRIDE_MARKERS):
+            return True
+        direct_job_url = _normalize_direct_job_url(lead.direct_job_url or "")
+        return (
+            lead.source_type in {"direct_ats", "company_site"}
+            and bool(direct_job_url)
+            and not _direct_job_url_has_specific_location_hint(direct_job_url)
+        )
     if reason_code != "missing_salary":
         return True
     salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
@@ -2482,9 +2512,11 @@ def _watchlist_entry_should_skip_resolution(
         watchlist_entry,
         "remote_unclear",
     )
-    if max(stale_count, not_remote_count) < 4:
-        return False
-    return not _lead_has_strong_override_hints(lead, settings)
+    if stale_count >= 4 and not _lead_has_override_hints_for_reason(lead, settings, "stale_posting"):
+        return True
+    if not_remote_count >= 4 and not _lead_has_override_hints_for_reason(lead, settings, "not_remote"):
+        return True
+    return False
 
 
 def _merged_focus_company_entries(
@@ -10636,15 +10668,7 @@ def _precheck_lead_hints(
         )
     if lead.direct_job_url and _direct_job_url_has_specific_location_hint(lead.direct_job_url):
         lowered_hints = combined_location_hint.lower()
-        strong_remote_markers = (
-            "fully remote",
-            "remote - united states",
-            "remote, united states",
-            "united states remote",
-            "remote us",
-            "work from home",
-        )
-        if not any(marker in lowered_hints for marker in strong_remote_markers):
+        if not any(marker in lowered_hints for marker in BROAD_REMOTE_OVERRIDE_MARKERS):
             return _make_failure(
                 stage="filter",
                 reason_code="not_remote",

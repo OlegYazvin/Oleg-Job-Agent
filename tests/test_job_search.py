@@ -3874,6 +3874,81 @@ def test_failed_lead_history_skip_reason_allows_missing_salary_replay_with_new_s
     assert _failed_lead_history_skip_reason(lead, settings, history) is None
 
 
+def test_failed_lead_history_skip_reason_suppresses_repeat_stale_without_fresh_date_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Runway",
+        role_title="Staff Product Manager, Machine Learning",
+        source_url="https://builtin.com/job/sr-product-manager-ml-research/2246372",
+        source_type="builtin",
+        direct_job_url="https://job-boards.greenhouse.io/runwayml/jobs/4117243005",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Remote AI product manager role from a Built In listing.",
+    )
+    history = {
+        "url:greenhouse:runwayml:4117243005": {
+            "watch_count": 2,
+            "recent_rejection_reasons": {"stale_posting": 2},
+        }
+    }
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "stale_posting"
+
+
+def test_failed_lead_history_skip_reason_suppresses_repeat_not_remote_without_broad_remote_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Headway",
+        role_title="Staff Product Manager, AI Patient Experience",
+        source_url="https://builtin.com/job/staff-product-manager-health-systems/7078367",
+        source_type="builtin",
+        direct_job_url="https://job-boards.greenhouse.io/headway/jobs/5627257004",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Remote AI product manager role from a Built In listing.",
+    )
+    history = {
+        "url:greenhouse:headway:5627257004": {
+            "watch_count": 2,
+            "recent_rejection_reasons": {"not_remote": 2},
+        }
+    }
+
+    skip_reason = _failed_lead_history_skip_reason(lead, settings, history)
+
+    assert skip_reason is not None
+    assert skip_reason[0] == "not_remote"
+
+
+def test_failed_lead_history_skip_reason_allows_repeat_not_remote_with_direct_remote_override() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Acme AI",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.lever.co/acme/123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/acme/123",
+        location_hint="Remote - United States",
+        is_remote_hint=True,
+        posted_date_hint="today",
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Fully remote AI product manager role with published salary.",
+    )
+    history = {
+        "url:https://jobs.lever.co/acme/123": {
+            "watch_count": 2,
+            "recent_rejection_reasons": {"not_remote": 2},
+        }
+    }
+
+    assert _failed_lead_history_skip_reason(lead, settings, history) is None
+
+
 def test_load_failed_lead_history_tracks_missing_salary_failures(tmp_path: Path) -> None:
     settings = build_settings()
     settings.data_dir = tmp_path
@@ -4126,6 +4201,41 @@ def test_annotate_and_filter_resolution_leads_prefers_explicit_remote_evidence()
 
     assert [lead.company_name for lead in ranked] == ["Remote Co", "Listing Co"]
     assert ranked[0].source_quality_score_hint > ranked[1].source_quality_score_hint
+
+
+def test_annotate_and_filter_resolution_leads_skips_repeat_not_remote_companies_without_broad_remote_override() -> None:
+    settings = build_settings()
+    listing_only_remote = JobLead(
+        company_name="Repeat Remote Co",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/repeat-remote/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/repeatremote/abc123",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="Remote AI product manager role from a Built In listing.",
+    )
+    explicit_remote = listing_only_remote.model_copy(
+        update={
+            "location_hint": "Remote - United States",
+            "evidence_notes": "Fully remote AI product manager role with published salary.",
+        }
+    )
+    watchlist = {
+        "repeatremoteco": {
+            "company_name": "Repeat Remote Co",
+            "watch_count": 18,
+            "recent_rejection_reasons": {"not_remote": 8},
+        }
+    }
+
+    weak_only = _annotate_and_filter_resolution_leads([listing_only_remote], settings, watchlist)
+    assert weak_only == []
+
+    with_override = _annotate_and_filter_resolution_leads([explicit_remote], settings, watchlist)
+    assert len(with_override) == 1
+    assert with_override[0].company_name == "Repeat Remote Co"
 
 
 def test_normalize_and_filter_discovery_leads_keeps_supported_job_board_pages_without_direct_urls() -> None:
