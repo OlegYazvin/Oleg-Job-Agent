@@ -67,6 +67,16 @@ NON_USD_CURRENCY_MARKERS = (
     "inr",
     "₹",
 )
+SALARY_TEXT_NORMALIZATION_TABLE = str.maketrans(
+    {
+        0x2010: "-",
+        0x2011: "-",
+        0x2012: "-",
+        0x2013: "-",
+        0x2014: "-",
+        0x2212: "-",
+    }
+)
 
 
 class JobPageSnapshot(BaseModel):
@@ -124,7 +134,10 @@ async def fetch_job_page(url: str) -> JobPageSnapshot:
     plain_text = " ".join(soup.stripped_strings)
     json_ld = _extract_job_posting_json_ld(soup)
     structured_description_text = _extract_jsonld_description_text(json_ld) if json_ld else ""
-    combined_text = " ".join(part for part in (plain_text, structured_description_text) if part)
+    meta_fallback_text = " ".join(_extract_meta_text_fragments(soup))
+    combined_text = " ".join(
+        part for part in (plain_text, structured_description_text, meta_fallback_text) if part
+    )
 
     snapshot = JobPageSnapshot(
         requested_url=url,
@@ -228,6 +241,31 @@ def _extract_job_posting_json_ld(soup: BeautifulSoup) -> dict[str, Any] | None:
         if job_posting:
             return job_posting
     return None
+
+
+def _extract_meta_text_fragments(soup: BeautifulSoup) -> list[str]:
+    fragments: list[str] = []
+    if soup.title:
+        title_text = soup.title.get_text(" ", strip=True)
+        if title_text:
+            fragments.append(title_text)
+
+    target_meta_names = {
+        "description",
+        "og:description",
+        "twitter:description",
+        "title",
+        "og:title",
+        "twitter:title",
+    }
+    for meta in soup.find_all("meta"):
+        key = str(meta.get("name") or meta.get("property") or "").strip().lower()
+        if key not in target_meta_names:
+            continue
+        content = unescape(str(meta.get("content") or "")).strip()
+        if content:
+            fragments.append(content)
+    return list(dict.fromkeys(fragments))
 
 
 def _extract_json_object_after_marker(html: str, marker: str) -> dict[str, Any] | None:
@@ -693,29 +731,39 @@ def _extract_lever_fields(soup: BeautifulSoup, html: str, evidence: list[str]) -
 
 
 def _extract_jsonld_salary(payload: dict[str, Any]) -> tuple[int | None, int | None, str | None]:
-    base_salary = payload.get("baseSalary")
-    if not isinstance(base_salary, dict):
-        return None, None, None
+    salary_nodes: list[dict[str, Any]] = []
+    for field_name in ("baseSalary", "estimatedSalary"):
+        value = payload.get(field_name)
+        if isinstance(value, dict):
+            salary_nodes.append(value)
+        elif isinstance(value, list):
+            salary_nodes.extend(item for item in value if isinstance(item, dict))
 
-    value = base_salary.get("value")
-    currency = base_salary.get("currency") or "USD"
-    if isinstance(value, dict):
-        min_value = value.get("minValue")
-        max_value = value.get("maxValue")
-    else:
-        min_value = value
-        max_value = value
+    fallback_salary_min = None
+    fallback_salary_max = None
+    for salary_node in salary_nodes:
+        value = salary_node.get("value")
+        currency = str(salary_node.get("currency") or "USD").upper()
+        if currency not in {"USD", "US$", "$"}:
+            continue
+        if isinstance(value, dict):
+            min_value = value.get("minValue")
+            max_value = value.get("maxValue")
+        else:
+            min_value = value
+            max_value = value
 
-    salary_min = _parse_money(min_value)
-    salary_max = _parse_money(max_value)
-    if salary_min is None and salary_max is None:
-        return None, None, None
-
-    if salary_min is not None and salary_max is not None and currency == "USD":
-        return salary_min, salary_max, f"${salary_min:,} - ${salary_max:,}"
-    if salary_min is not None and currency == "USD":
-        return salary_min, salary_min, f"${salary_min:,}"
-    return salary_min, salary_max, None
+        salary_min = _parse_money(min_value)
+        salary_max = _parse_money(max_value)
+        if salary_min is None and salary_max is None:
+            continue
+        fallback_salary_min = salary_min
+        fallback_salary_max = salary_max
+        if salary_min is not None and salary_max is not None:
+            return salary_min, salary_max, f"${salary_min:,} - ${salary_max:,}"
+        if salary_min is not None:
+            return salary_min, salary_min, f"${salary_min:,}"
+    return fallback_salary_min, fallback_salary_max, None
 
 
 def _extract_jsonld_location(payload: dict[str, Any]) -> str | None:
@@ -762,11 +810,12 @@ def _extract_ai_context_snippets(text: str) -> list[str]:
 
 
 def _extract_salary_range(text: str) -> tuple[int | None, int | None, str | None]:
+    normalized_text = text.translate(SALARY_TEXT_NORMALIZATION_TABLE)
     range_pattern = re.compile(
         r"(?P<min>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)\s*(?:-|to)\s*(?P<max>\$?\s*\d[\d,]*(?:\.\d+)?\s*[kKmM]?)"
     )
-    for match in range_pattern.finditer(text):
-        if not _salary_match_uses_supported_currency(text, match.start("min"), match.end("max")):
+    for match in range_pattern.finditer(normalized_text):
+        if not _salary_match_uses_supported_currency(normalized_text, match.start("min"), match.end("max")):
             continue
         min_value = _parse_money(match.group("min"))
         max_value = _parse_money(match.group("max"))
@@ -796,9 +845,9 @@ def _extract_salary_range(text: str) -> tuple[int | None, int | None, str | None
         ),
     )
     for pattern in single_patterns:
-        for single_match in pattern.finditer(text):
+        for single_match in pattern.finditer(normalized_text):
             if not _salary_match_uses_supported_currency(
-                text,
+                normalized_text,
                 single_match.start("value"),
                 single_match.end("value"),
             ):

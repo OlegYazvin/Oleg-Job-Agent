@@ -10,6 +10,7 @@ from job_agent.job_pages import (
     _extract_greenhouse_fields,
     _extract_jobscore_fields,
     _extract_jsonld_location,
+    _extract_jsonld_salary,
     _extract_lever_fields,
     _extract_recruitee_fields,
     _extract_salary_range,
@@ -142,6 +143,14 @@ def test_extract_salary_range_parses_usd_ranges() -> None:
     )
 
 
+def test_extract_salary_range_supports_unicode_dash_ranges() -> None:
+    assert _extract_salary_range("Compensation: $210,000 – $260,000 base salary") == (
+        210000,
+        260000,
+        "$210,000 - $260,000",
+    )
+
+
 def test_extract_salary_range_parses_base_salary_up_to_value() -> None:
     assert _extract_salary_range(
         "The annual base salary for this position is anticipated to be up to $180,000."
@@ -150,6 +159,19 @@ def test_extract_salary_range_parses_base_salary_up_to_value() -> None:
         180000,
         "$180,000",
     )
+
+
+def test_extract_jsonld_salary_supports_estimated_salary_nodes() -> None:
+    payload = {
+        "estimatedSalary": {
+            "currency": "USD",
+            "value": {
+                "minValue": 205000,
+                "maxValue": 235000,
+            },
+        }
+    }
+    assert _extract_jsonld_salary(payload) == (205000, 235000, "$205,000 - $235,000")
 
 
 def test_extract_salary_range_ignores_demographic_form_codes() -> None:
@@ -357,4 +379,45 @@ def test_fetch_job_page_rechecks_remote_after_location_fallback(monkeypatch) -> 
 
     snapshot = asyncio.run(fetch_job_page("https://careers.example.com/jobs/123"))
     assert snapshot.location_text == "Remote"
+    assert snapshot.is_fully_remote is True
+
+
+def test_fetch_job_page_uses_meta_descriptions_for_salary_and_remote(monkeypatch) -> None:
+    html = """
+    <html>
+      <head>
+        <title>Principal Product Manager, AI &amp; Data at phData - Jobicy</title>
+        <meta property="og:title" content="Principal Product Manager, AI &amp; Data at phData - Jobicy" />
+        <meta
+          property="og:description"
+          content="Principal Product Manager, AI &amp; Data. Salary: $205,000 – $235,000 per year. This role is fully remote within the United States."
+        />
+      </head>
+      <body>
+        <div id="app">Enable JavaScript to run this app.</div>
+      </body>
+    </html>
+    """
+
+    class FakeResponse:
+        def __init__(self, url: str, text: str) -> None:
+            self.url = url
+            self.text = text
+            self.status_code = 200
+
+    class FakeAsyncClient:
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            return FakeResponse(url, html)
+
+    monkeypatch.setattr("job_agent.job_pages.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
+
+    snapshot = asyncio.run(fetch_job_page("https://jobicy.com/jobs/141212-principal-product-manager-ai-data"))
+    assert snapshot.base_salary_min_usd == 205000
+    assert snapshot.base_salary_max_usd == 235000
     assert snapshot.is_fully_remote is True
