@@ -4986,6 +4986,37 @@ def test_extract_source_followup_resolution_urls_includes_builtin_company_direct
     assert "https://www.domino.ai/" in followups
 
 
+def test_extract_source_followup_resolution_urls_falls_back_to_builtin_company_slug_when_source_fetch_fails(
+    monkeypatch,
+) -> None:
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url="https://builtin.com/job/principal-product-manager-ai-factory/8208619",
+        source_type="builtin",
+        evidence_notes="Remote AI PM role with salary disclosure.",
+    )
+
+    class FakeAsyncClient:
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str):
+            raise httpx.HTTPError("Built In source unavailable")
+
+    monkeypatch.setattr("job_agent.job_search.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
+
+    followups = asyncio.run(_extract_source_followup_resolution_urls(lead))
+
+    assert followups == [
+        "https://builtin.com/company/domino-data-lab",
+        "https://builtin.com/company/domino-data-lab/jobs",
+    ]
+
+
 def test_resolve_lead_via_company_careers_pages_walks_structured_homepage_to_workday_board(monkeypatch) -> None:
     lead = JobLead(
         company_name="Capital Group",
@@ -5293,6 +5324,66 @@ def test_resolve_lead_via_company_careers_pages_walks_builtin_company_directory_
     monkeypatch.setattr("job_agent.job_search.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
 
     resolution = asyncio.run(_resolve_lead_via_company_careers_pages(lead))
+    assert resolution is not None
+    assert resolution.direct_job_url == "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
+
+
+def test_resolve_lead_via_company_careers_pages_uses_builtin_company_slug_fallback_when_source_page_fails(
+    monkeypatch,
+) -> None:
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url="https://builtin.com/job/principal-product-manager-ai-factory/8208619",
+        source_type="builtin",
+        evidence_notes="Remote AI PM role with salary disclosure.",
+    )
+
+    async def fake_search_company_resolution_candidates(_lead: JobLead) -> list[str]:
+        return []
+
+    async def fake_extract_direct_job_url_from_source(candidate_lead: JobLead) -> str | None:
+        if candidate_lead.source_url == "https://www.domino.ai/careers":
+            return "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
+        return None
+
+    class FakeResponse:
+        def __init__(self, url: str, text: str) -> None:
+            self.url = url
+            self.text = text
+            self.status_code = 200
+
+    class FakeAsyncClient:
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str):
+            if url == lead.source_url:
+                raise httpx.HTTPError("Built In source unavailable")
+            if url in {
+                "https://builtin.com/company/domino-data-lab",
+                "https://builtin.com/company/domino-data-lab/jobs",
+            }:
+                return FakeResponse(url, '<a href="https://www.domino.ai">Company site</a>')
+            if url in {"https://www.domino.ai", "https://www.domino.ai/"}:
+                return FakeResponse(url, '<a href="/careers">Careers</a>')
+            raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(
+        "job_agent.job_search._search_company_resolution_candidates",
+        fake_search_company_resolution_candidates,
+    )
+    monkeypatch.setattr(
+        "job_agent.job_search._extract_direct_job_url_from_source",
+        fake_extract_direct_job_url_from_source,
+    )
+    monkeypatch.setattr("job_agent.job_search.httpx.AsyncClient", lambda **kwargs: FakeAsyncClient())
+
+    resolution = asyncio.run(_resolve_lead_via_company_careers_pages(lead))
+
     assert resolution is not None
     assert resolution.direct_job_url == "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
 

@@ -7722,6 +7722,21 @@ def _extract_builtin_company_followup_urls(html: str) -> list[str]:
     return candidates
 
 
+def _builtin_company_followup_urls_from_lead(lead: JobLead) -> list[str]:
+    if _normalize_source_type(lead.source_url) != "builtin":
+        return []
+    company_name = str(lead.company_name or "").strip().lower()
+    tokens = [token for token in re.findall(r"[a-z0-9]+", company_name) if token]
+    if not tokens:
+        return []
+    slug = "-".join(tokens)
+    parsed = urlparse(lead.source_url)
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc or "builtin.com"
+    base_url = f"{scheme}://{host}"
+    return [f"{base_url}/company/{slug}", f"{base_url}/company/{slug}/jobs"]
+
+
 def _extract_structured_company_followup_urls(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     candidates: list[str] = []
@@ -10173,6 +10188,7 @@ async def _extract_direct_job_url_from_source(lead: JobLead) -> str | None:
 
 
 async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
+    builtin_company_seed_urls = _builtin_company_followup_urls_from_lead(lead)
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -10181,7 +10197,7 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
         ) as client:
             response = await client.get(lead.source_url)
     except Exception:
-        return []
+        return builtin_company_seed_urls
 
     resolved_source = _normalize_direct_job_url(str(response.url))
     candidates: dict[str, tuple[int, int]] = {}
@@ -10224,6 +10240,8 @@ async def _extract_source_followup_resolution_urls(lead: JobLead) -> list[str]:
         directory_candidates.append(normalized_url)
 
     if _normalize_source_type(lead.source_url) == "builtin":
+        for builtin_seed_url in builtin_company_seed_urls:
+            maybe_add_directory_seed(builtin_seed_url)
         maybe_add(_extract_builtin_apply_url(response.text), "Apply")
         for company_url in _extract_builtin_company_followup_urls(response.text):
             maybe_add(company_url, "Company website")
