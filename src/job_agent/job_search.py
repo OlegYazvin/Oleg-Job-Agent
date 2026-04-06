@@ -543,6 +543,25 @@ SMALL_COMPANY_LOCAL_SCOUT_MODIFIERS = (
     "\"small team\"",
     "\"high growth\"",
 )
+FOCUS_COMPANY_DISCOVERY_ONLY_HOST_FRAGMENTS = (
+    "builtin",
+    "linkedin.com",
+    "glassdoor.com",
+    "wellfound.com",
+    "workatastartup.com",
+    "getro.com",
+    "ycombinator.com",
+    "startup.jobs",
+    "welcometothejungle.com",
+    "joinhandshake.com",
+    "dynamitejobs.com",
+    "dailyremote.com",
+    "remote.io",
+    "remoteai.io",
+    "jobgether.com",
+    "flexhired.com",
+    "monster.com",
+)
 ENTERPRISE_ATS_HOST_FRAGMENTS = (
     "myworkdayjobs.com",
     "careers.workday.com",
@@ -2006,6 +2025,75 @@ def _lead_has_portfolio_board_source(lead: JobLead) -> bool:
     return any(domain in source_url for domain in PORTFOLIO_BOARD_SCOUT_DOMAINS)
 
 
+def _focus_company_host_supports_search_queries(host: str | None) -> bool:
+    normalized_host = str(host or "").strip().lower()
+    if not normalized_host:
+        return False
+    return not any(fragment in normalized_host for fragment in FOCUS_COMPANY_DISCOVERY_ONLY_HOST_FRAGMENTS)
+
+
+def _focus_company_url_supports_search_queries(url: str | None) -> bool:
+    normalized_url = _normalize_direct_job_url(str(url or "").strip())
+    if not normalized_url:
+        return False
+    if (
+        _is_allowed_direct_job_url(normalized_url)
+        or _looks_like_careers_hub_url(normalized_url)
+        or _looks_like_company_homepage_url(normalized_url)
+    ):
+        return True
+    return _focus_company_host_supports_search_queries(urlparse(normalized_url).netloc or "")
+
+
+def _focus_company_entry_supports_search_queries(entry: Mapping[str, object] | None) -> bool:
+    if not entry:
+        return True
+    board_identifiers = [str(item).strip() for item in entry.get("board_identifiers") or [] if str(item).strip()]
+    if board_identifiers or int(entry.get("official_board_lead_count") or 0) > 0:
+        return True
+    careers_roots = [str(item).strip() for item in entry.get("careers_roots") or [] if str(item).strip()]
+    if any(_focus_company_url_supports_search_queries(url) for url in careers_roots):
+        return True
+    source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
+    if not source_hosts and not careers_roots:
+        return True
+    return any(_focus_company_host_supports_search_queries(host) for host in source_hosts)
+
+
+def _site_hints_from_focus_company_entry(entry: Mapping[str, object] | None) -> list[str]:
+    if not entry:
+        return []
+    hints: list[str] = []
+    seen: set[str] = set()
+
+    def _add_hint(value: str | None) -> None:
+        normalized_value = " ".join(str(value or "").split())
+        if not normalized_value or normalized_value in seen:
+            return
+        seen.add(normalized_value)
+        hints.append(normalized_value)
+
+    for hint in _site_hints_from_board_identifiers(dict(entry)):
+        _add_hint(hint)
+
+    for raw_url in entry.get("careers_roots") or []:
+        normalized_url = _normalize_direct_job_url(str(raw_url or "").strip())
+        if not normalized_url:
+            continue
+        host = (urlparse(normalized_url).netloc or "").strip().lower()
+        if not _focus_company_host_supports_search_queries(host):
+            continue
+        _add_hint(f"site:{host}")
+
+    for raw_host in entry.get("source_hosts") or []:
+        host = str(raw_host or "").strip().lower()
+        if not _focus_company_host_supports_search_queries(host):
+            continue
+        _add_hint(f"site:{host}")
+
+    return hints
+
+
 def _lead_has_strong_validation_hints(lead: JobLead, settings: Settings) -> bool:
     recent_hint = _hint_is_recent(lead.posted_date_hint, settings)
     salary_min, salary_max, _salary_text = _hydrate_salary_hint_values(
@@ -2197,14 +2285,19 @@ def _company_looks_small_from_hosts(hosts: list[str]) -> bool:
     return any(any(fragment in host for fragment in SMALL_COMPANY_SCOUT_DOMAINS) for host in normalized_hosts)
 
 
+def _company_discovery_entry_saturation_score(entry: Mapping[str, object]) -> int:
+    official_board_lead_count = max(0, int(entry.get("official_board_lead_count") or 0))
+    recent_fresh_role_count = max(0, int(entry.get("recent_fresh_role_count") or 0))
+    board_crawl_success_count = max(0, int(entry.get("board_crawl_success_count") or 0))
+    return official_board_lead_count + recent_fresh_role_count + board_crawl_success_count * 4
+
+
 def _company_discovery_entry_seed_priority(entry: Mapping[str, object]) -> tuple[int, int, int, int, int, str]:
     source_hosts = [str(item).strip().lower() for item in entry.get("source_hosts") or [] if str(item).strip()]
     board_identifiers = [str(item).strip() for item in entry.get("board_identifiers") or [] if str(item).strip()]
     careers_roots = [str(item).strip() for item in entry.get("careers_roots") or [] if str(item).strip()]
     official_board_lead_count = max(0, int(entry.get("official_board_lead_count") or 0))
-    recent_fresh_role_count = max(0, int(entry.get("recent_fresh_role_count") or 0))
-    board_crawl_success_count = max(0, int(entry.get("board_crawl_success_count") or 0))
-    saturation_score = official_board_lead_count + recent_fresh_role_count + board_crawl_success_count * 4
+    saturation_score = _company_discovery_entry_saturation_score(entry)
     if board_identifiers and official_board_lead_count == 0:
         exploration_stage = 0
     elif careers_roots and official_board_lead_count == 0:
@@ -2219,6 +2312,19 @@ def _company_discovery_entry_seed_priority(entry: Mapping[str, object]) -> tuple
         -len(board_identifiers),
         str(entry.get("company_name") or "").lower(),
     )
+
+
+def _company_discovery_entry_frontier_priority(
+    entry: Mapping[str, object],
+    *,
+    company_key: str,
+    previously_reported_company_keys: set[str],
+) -> int:
+    official_board_lead_count = max(0, int(entry.get("official_board_lead_count") or 0))
+    novelty_boost = 2 if company_key and company_key not in previously_reported_company_keys else 0
+    exploration_boost = 2 if official_board_lead_count == 0 else 0
+    saturation_penalty = min(5, _company_discovery_entry_saturation_score(entry))
+    return max(4, min(12, 7 + novelty_boost + exploration_boost - saturation_penalty))
 
 
 def _watchlist_reason_count(entry: dict[str, object], reason_code: str) -> int:
@@ -2389,15 +2495,19 @@ def _select_watchlist_focus_companies(
         normalized_name = company_name.lower()
         if not company_name or not company_key or company_key in known_company_keys or company_key in seen_company_keys:
             continue
+        if not _focus_company_name_is_timeout_safe(company_name):
+            continue
         if any(pattern in normalized_name for pattern in ("hiring for client", "confidential", "stealth startup")):
             continue
         if not _watchlist_entry_is_focusable(entry):
+            continue
+        if not _focus_company_entry_supports_search_queries(entry):
             continue
         companies.append(company_name)
         seen_company_keys.add(company_key)
         if len(companies) >= limit:
             break
-    return companies
+    return _sanitize_focus_companies(companies)[:limit]
 
 
 def _apply_company_novelty_quota(
@@ -2517,6 +2627,7 @@ def _build_focus_company_queries(
     focus_companies = _sanitize_focus_companies(tuning.focus_companies)
     if not focus_companies or not focus_roles:
         return []
+    focus_entries = _merged_focus_company_entries(settings)
 
     recency_terms = _current_recency_terms(settings.timezone)
     salary_terms = [f"\"${settings.min_base_salary_usd:,}\"", *_salary_disclosure_terms()]
@@ -2528,16 +2639,29 @@ def _build_focus_company_queries(
 
     company_groups: list[list[str]] = []
     for company in focus_companies[:12]:
+        entry = focus_entries.get(_normalize_company_key(company))
+        if entry and not _focus_company_entry_supports_search_queries(entry):
+            continue
+        structured_site_hints = (
+            _site_hints_from_focus_company_entry(entry)
+            if entry and _watchlist_entry_is_focusable(entry)
+            else []
+        )
+        prefer_structured_site_hints = bool(structured_site_hints) and not include_site_domains
         company_term = f"\"{company}\""
         company_queries: list[str] = []
         for role_term in focus_roles[:6]:
-            company_queries.append(f"{company_term} {role_term} remote")
-            company_queries.append(f"{company_term} careers {role_term} remote")
-            company_queries.append(f"{company_term} {role_term} remote {_today_for_timezone(settings.timezone).strftime('%Y')}")
-            if tuning.prioritize_recency:
-                company_queries.append(f"{company_term} {role_term} remote {recency_terms[0]}")
-            if tuning.prioritize_salary:
-                company_queries.append(f"{company_term} {role_term} remote {salary_terms[0]}")
+            if not prefer_structured_site_hints:
+                company_queries.append(f"{company_term} {role_term} remote")
+                if include_site_domains:
+                    company_queries.append(f"{company_term} careers {role_term} remote")
+                    company_queries.append(
+                        f"{company_term} {role_term} remote {_today_for_timezone(settings.timezone).strftime('%Y')}"
+                    )
+                    if tuning.prioritize_recency:
+                        company_queries.append(f"{company_term} {role_term} remote {recency_terms[0]}")
+                    if tuning.prioritize_salary:
+                        company_queries.append(f"{company_term} {role_term} remote {salary_terms[0]}")
             if include_site_domains:
                 for domain in domain_window:
                     company_queries.append(f"{company_term} {role_term} remote site:{domain}")
@@ -2600,7 +2724,7 @@ def _build_watchlist_board_focus_queries(settings: Settings, tuning: SearchTunin
         entry = watchlist.get(_normalize_company_key(company))
         if not entry or not _watchlist_entry_is_focusable(entry):
             continue
-        site_hints = _site_hints_from_board_identifiers(entry)
+        site_hints = _site_hints_from_focus_company_entry(entry)
         if not site_hints:
             continue
         company_term = f"\"{company}\""
@@ -3048,6 +3172,12 @@ def _build_targeted_attempt_queries(settings: Settings, tuning: SearchTuning) ->
 def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = None) -> list[str]:
     tuning = tuning or SearchTuning(attempt_number=1)
     focus_companies = _sanitize_focus_companies(tuning.focus_companies)
+    focus_entries = _merged_focus_company_entries(settings) if focus_companies else {}
+    eligible_focus_companies = [
+        company
+        for company in focus_companies
+        if _focus_company_entry_supports_search_queries(focus_entries.get(_normalize_company_key(company)))
+    ]
     role_queries = _base_role_queries()
     scout_queries = _build_small_company_scout_queries(settings, tuning)
     portfolio_scout_queries = _build_portfolio_company_scout_queries(settings, tuning)
@@ -3130,7 +3260,7 @@ def _build_search_query_bank(settings: Settings, tuning: SearchTuning | None = N
                 salary_queries.append(f"{role_query} {salary_region} \"base salary\"")
 
     focus_queries.extend(_build_focus_company_queries(settings, tuning, include_site_domains=tuning.attempt_number > 1))
-    for company in focus_companies[:10]:
+    for company in eligible_focus_companies[:10]:
         company_term = f"\"{company}\""
         for role_term in (tuning.focus_roles or _default_focus_role_terms())[:6]:
             for domain in discovery_domains:
@@ -6505,8 +6635,12 @@ async def _collect_company_discovery_seed_leads(
     *,
     discovery_agent: Agent | None,
     run_id: str | None,
+    previously_reported_company_keys: set[str] | None = None,
 ) -> tuple[list[JobLead], dict[str, object]]:
     entries = load_company_discovery_entries(settings.data_dir)
+    previously_reported_company_keys = set(
+        previously_reported_company_keys or load_previously_reported_company_keys(settings.data_dir)
+    )
     frontier = load_company_discovery_frontier(settings.data_dir)
     _reactivate_repairable_board_frontier_tasks(frontier, entries=entries)
     crawl_history = load_company_discovery_crawl_history(settings.data_dir)
@@ -6919,20 +7053,19 @@ async def _collect_company_discovery_seed_leads(
             (company_key, entry)
             for company_key, entry in sorted(
                 entries.items(),
-                key=lambda item: _company_discovery_entry_seed_priority(item[1]),
+                key=lambda item: (
+                    1 if item[0] in previously_reported_company_keys else 0,
+                    *_company_discovery_entry_seed_priority(item[1]),
+                ),
             )
             if not is_low_value_company_discovery_entry(entry)
         ]
         for company_key, entry in ranked_entries[: max(60, settings.company_discovery_frontier_budget_per_run * 4)]:
             company_name = str(entry.get("company_name") or "").strip() or _title_case_company_name(company_key)
-            priority = max(
-                4,
-                min(
-                    12,
-                    4
-                    + int(entry.get("official_board_lead_count") or 0)
-                    + int(entry.get("recent_fresh_role_count") or 0),
-                ),
+            priority = _company_discovery_entry_frontier_priority(
+                entry,
+                company_key=company_key,
+                previously_reported_company_keys=previously_reported_company_keys,
             )
             for board_url in [str(item) for item in entry.get("board_urls") or [] if str(item).strip()][:4]:
                 _queue_frontier_url(
@@ -6947,7 +7080,7 @@ async def _collect_company_discovery_seed_leads(
                     url=careers_root,
                     company_name=company_name,
                     discovered_from="company_discovery_index",
-                    priority=max(6, priority - 1),
+                    priority=max(4, priority - 1),
                     preferred_task_type="careers_root",
                 )
 
@@ -11296,6 +11429,7 @@ async def find_matching_jobs(
                     settings,
                     discovery_agent=discovery_agent,
                     run_id=run_id,
+                    previously_reported_company_keys=previously_reported_company_keys,
                 )
                 diagnostics.new_companies_discovered_count += int(
                     discovery_metrics.get("new_companies_discovered_count") or 0

@@ -5049,6 +5049,44 @@ def test_select_watchlist_focus_companies_skips_saturated_repeat_failures(tmp_pa
     assert focus_companies == ["Fresh Startup"]
 
 
+def test_select_watchlist_focus_companies_skips_directory_only_discovery_entries(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "biltrewards": {
+                "company_key": "biltrewards",
+                "company_name": "Bilt Rewards",
+                "source_hosts": ["builtin.com"],
+                "careers_roots": ["https://builtin.com/company/bilt-rewards/jobs"],
+                "source_trust": 4,
+            },
+            "builtinboston": {
+                "company_key": "builtinboston",
+                "company_name": "BuiltinBoston",
+                "source_hosts": ["builtinboston.com"],
+                "careers_roots": ["https://builtinboston.com/company/tiny-ai/jobs"],
+                "source_trust": 4,
+            },
+            "tinyai": {
+                "company_key": "tinyai",
+                "company_name": "Tiny AI",
+                "source_hosts": ["jobs.ashbyhq.com"],
+                "careers_roots": ["https://jobs.ashbyhq.com/tinyai"],
+                "board_identifiers": ["ashby:tinyai"],
+                "source_trust": 8,
+            },
+        },
+    )
+
+    focus_companies = _select_watchlist_focus_companies(settings, set())
+
+    assert "Tiny AI" in focus_companies
+    assert "Bilt Rewards" not in focus_companies
+    assert all(not company.lower().startswith("builtin") for company in focus_companies)
+
+
 def test_small_company_scout_queries_bias_toward_direct_ats_hosts() -> None:
     settings = build_settings()
     queries = _build_small_company_scout_queries(
@@ -5097,6 +5135,36 @@ def test_watchlist_board_focus_queries_use_known_board_identifiers(tmp_path: Pat
     assert any("site:jobs.ashbyhq.com/tinyai" in query for query in queries)
 
 
+def test_watchlist_board_focus_queries_fall_back_to_careers_root_hosts(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "tinyai": {
+                "company_key": "tinyai",
+                "company_name": "Tiny AI",
+                "source_hosts": ["jobs.ashbyhq.com"],
+                "careers_roots": ["https://jobs.ashbyhq.com/tinyai"],
+                "source_trust": 8,
+            }
+        },
+    )
+
+    queries = _build_watchlist_board_focus_queries(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            prioritize_recency=True,
+            focus_companies=["Tiny AI"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    assert queries
+    assert any("site:jobs.ashbyhq.com" in query for query in queries)
+
+
 def test_portfolio_company_scout_queries_target_startup_network_boards() -> None:
     settings = build_settings()
     queries = _build_portfolio_company_scout_queries(
@@ -5137,6 +5205,61 @@ def test_local_query_rounds_prioritize_focus_companies_without_compound_site_que
     assert flat_queries
     assert any("Tiny AI" in query for query in flat_queries[:12])
     assert all(query.count("site:") <= 1 for query in flat_queries)
+
+
+def test_local_query_rounds_defer_open_web_focus_queries_when_structured_hints_exist(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+    settings.data_dir = tmp_path
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "tinyai": {
+                "company_key": "tinyai",
+                "company_name": "Tiny AI",
+                "source_hosts": ["jobs.ashbyhq.com"],
+                "careers_roots": ["https://jobs.ashbyhq.com/tinyai"],
+                "source_trust": 8,
+            }
+        },
+    )
+
+    rounds = _build_local_query_rounds(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            prioritize_recency=True,
+            focus_companies=["Tiny AI"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    flat_queries = [query for query_round in rounds for query in query_round]
+    assert flat_queries
+    assert any("site:jobs.ashbyhq.com" in query for query in flat_queries)
+    assert '"Tiny AI" "AI Product Manager" remote' not in flat_queries
+
+
+def test_local_query_rounds_first_attempt_avoid_timeout_prone_focus_variants_without_hints() -> None:
+    settings = build_settings()
+    settings.llm_provider = "ollama"
+
+    rounds = _build_local_query_rounds(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            prioritize_recency=True,
+            prioritize_salary=True,
+            focus_companies=["Alt"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    flat_queries = [query for query_round in rounds for query in query_round]
+    assert '"Alt" "AI Product Manager" remote' in flat_queries
+    assert '"Alt" careers "AI Product Manager" remote' not in flat_queries
+    assert '"Alt" "AI Product Manager" remote 2026' not in flat_queries
+    assert not any(query == '"Alt" "AI Product Manager" remote "$200,000"' for query in flat_queries)
 
 
 def test_local_query_rounds_use_site_scoped_focus_queries_on_late_attempts() -> None:
@@ -5192,6 +5315,93 @@ def test_local_query_rounds_ignore_builtin_focus_company_aliases() -> None:
     assert flat_queries
     assert any('"Tiny AI"' in query for query in flat_queries)
     assert not any("BuiltinBoston" in query for query in flat_queries)
+
+
+def test_build_search_query_bank_skips_directory_only_focus_company_queries(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "biltrewards": {
+                "company_key": "biltrewards",
+                "company_name": "Bilt Rewards",
+                "source_hosts": ["builtin.com"],
+                "careers_roots": ["https://builtin.com/company/bilt-rewards/jobs"],
+                "source_trust": 4,
+            },
+            "tinyai": {
+                "company_key": "tinyai",
+                "company_name": "Tiny AI",
+                "source_hosts": ["jobs.ashbyhq.com"],
+                "careers_roots": ["https://jobs.ashbyhq.com/tinyai"],
+                "board_identifiers": ["ashby:tinyai"],
+                "source_trust": 8,
+            },
+        },
+    )
+
+    query_bank = _build_search_query_bank(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            focus_companies=["Bilt Rewards", "Tiny AI"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    assert any('"Tiny AI"' in query for query in query_bank)
+    assert not any('"Bilt Rewards"' in query for query in query_bank)
+
+
+def test_build_search_query_bank_defers_open_web_focus_queries_when_structured_hints_exist(tmp_path: Path) -> None:
+    settings = build_settings()
+    settings.data_dir = tmp_path
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "tinyai": {
+                "company_key": "tinyai",
+                "company_name": "Tiny AI",
+                "source_hosts": ["jobs.ashbyhq.com"],
+                "careers_roots": ["https://jobs.ashbyhq.com/tinyai"],
+                "source_trust": 8,
+            }
+        },
+    )
+
+    query_bank = _build_search_query_bank(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            prioritize_recency=True,
+            focus_companies=["Tiny AI"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    assert any("site:jobs.ashbyhq.com" in query for query in query_bank)
+    assert '"Tiny AI" "AI Product Manager" remote' not in query_bank
+
+
+def test_build_search_query_bank_first_attempt_avoid_timeout_prone_focus_variants_without_hints() -> None:
+    settings = build_settings()
+
+    query_bank = _build_search_query_bank(
+        settings,
+        SearchTuning(
+            attempt_number=1,
+            prioritize_recency=True,
+            prioritize_salary=True,
+            focus_companies=["Alt"],
+            focus_roles=['"AI Product Manager"'],
+        ),
+    )
+
+    assert '"Alt" "AI Product Manager" remote' in query_bank
+    assert '"Alt" careers "AI Product Manager" remote' not in query_bank
+    assert '"Alt" "AI Product Manager" remote 2026' not in query_bank
+    assert not any(query == '"Alt" "AI Product Manager" remote "$200,000"' for query in query_bank)
 
 
 def test_select_focus_companies_skips_builtin_portal_aliases() -> None:
@@ -7160,6 +7370,101 @@ def test_collect_company_discovery_seed_leads_suppresses_geo_limited_official_bo
     assert metrics["official_board_leads_count"] == 0
     audit_entries = json.loads((settings.data_dir / "company-discovery-audit.json").read_text())
     assert any(entry.get("status") == "suppressed_out_of_scope" for entry in audit_entries)
+
+
+def test_collect_company_discovery_seed_leads_prioritizes_novel_company_index_entries(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.company_discovery_enabled = False
+    settings.company_discovery_indexer_enabled = True
+    settings.company_discovery_frontier_budget_per_run = 1
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 1
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "knownco": {
+                "company_key": "knownco",
+                "company_name": "Known Co",
+                "board_urls": ["https://jobs.smartrecruiters.com/known-co"],
+                "board_identifiers": ["smartrecruiters:known-co"],
+                "source_hosts": ["jobs.smartrecruiters.com"],
+                "source_trust": 9,
+                "official_board_lead_count": 0,
+                "recent_fresh_role_count": 0,
+                "board_crawl_success_count": 0,
+            },
+            "novelco": {
+                "company_key": "novelco",
+                "company_name": "Novel Co",
+                "board_urls": ["https://jobs.smartrecruiters.com/novel-co"],
+                "board_identifiers": ["smartrecruiters:novel-co"],
+                "source_hosts": ["jobs.smartrecruiters.com"],
+                "source_trust": 9,
+                "official_board_lead_count": 0,
+                "recent_fresh_role_count": 0,
+                "board_crawl_success_count": 0,
+            },
+        },
+    )
+
+    async def fake_fetch_smartrecruiters_board_jobs(board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "id": f"{board_token}-1",
+                "name": "Principal Product Manager, AI",
+                "releasedDate": "2026-04-02T12:00:00.000Z",
+                "location": {"city": "Remote", "country": "us", "remote": True},
+                "company": {
+                    "identifier": board_token,
+                    "name": "Novel Co" if board_token == "novel-co" else "Known Co",
+                },
+            }
+        ]
+
+    async def fake_fetch_smartrecruiters_posting_detail(board_token: str, _posting_id: str) -> dict[str, object] | None:
+        company_name = "Novel Co" if board_token == "novel-co" else "Known Co"
+        return {
+            "company": {"identifier": board_token, "name": company_name},
+            "location": {"city": "Remote", "country": "us", "remote": True},
+            "jobAd": {
+                "sections": {
+                    "jobDescription": {
+                        "title": "Job Description",
+                        "text": f"Lead remote AI product strategy for {company_name}.",
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("job_agent.job_search._fetch_smartrecruiters_board_jobs", fake_fetch_smartrecruiters_board_jobs)
+    monkeypatch.setattr(
+        "job_agent.job_search._fetch_smartrecruiters_posting_detail",
+        fake_fetch_smartrecruiters_posting_detail,
+    )
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+            previously_reported_company_keys={"knownco"},
+        )
+    )
+
+    assert metrics["official_board_crawl_attempt_count"] == 1
+    assert metrics["official_board_leads_count"] == 1
+    assert len(leads) == 1
+    assert leads[0].company_name == "Novel Co"
+    assert leads[0].direct_job_url == "https://jobs.smartrecruiters.com/novel-co/novel-co-1-principal-product-manager-ai"
 
 
 def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandard_careers_links(
