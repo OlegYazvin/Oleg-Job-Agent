@@ -9633,32 +9633,39 @@ async def _search_single_query_local(
     linkedin_error: Exception | None = None
     search_error: Exception | None = None
 
-    tasks = [
-        asyncio.create_task(
-            _run_named(
-                "builtin",
-                _builtin_search(query, settings),
-                timeout_seconds=min(max(settings.per_query_timeout_seconds / 2, 12), 20),
+    builtin_enabled = not _query_is_company_named_open_web_query(query)
+    tasks: list[asyncio.Task[tuple[str, object | None, Exception | None]]] = []
+    if builtin_enabled:
+        tasks.append(
+            asyncio.create_task(
+                _run_named(
+                    "builtin",
+                    _builtin_search(query, settings),
+                    timeout_seconds=min(max(settings.per_query_timeout_seconds / 2, 12), 20),
+                )
             )
-        ),
-        asyncio.create_task(
-            _run_named(
-                "linkedin",
-                _linkedin_guest_search(query, settings),
-                timeout_seconds=min(max(settings.per_query_timeout_seconds / 3, 8), 15),
-            )
-        ),
-        asyncio.create_task(
-            _run_named(
-                "search",
-                _run_local_search_engine_queries(
-                    query,
-                    max_results_per_query=max(settings.max_leads_per_query * 2, 12),
-                ),
-                timeout_seconds=min(max(settings.per_query_timeout_seconds, 20), 35),
-            )
-        ),
-    ]
+        )
+    tasks.extend(
+        [
+            asyncio.create_task(
+                _run_named(
+                    "linkedin",
+                    _linkedin_guest_search(query, settings),
+                    timeout_seconds=min(max(settings.per_query_timeout_seconds / 3, 8), 15),
+                )
+            ),
+            asyncio.create_task(
+                _run_named(
+                    "search",
+                    _run_local_search_engine_queries(
+                        query,
+                        max_results_per_query=max(settings.max_leads_per_query * 2, 12),
+                    ),
+                    timeout_seconds=min(max(settings.per_query_timeout_seconds, 20), 35),
+                )
+            ),
+        ]
+    )
 
     for task in asyncio.as_completed(tasks):
         name, result, error = await task
@@ -9672,12 +9679,18 @@ async def _search_single_query_local(
             search_error = error
             search_results = result or []
 
-    if not search_results and builtin_error is not None and linkedin_error is not None and search_error is not None:
-        raise LocalSearchBackendBlockedError(
-            f"Built In search failed ({_describe_exception(builtin_error)}); "
-            f"LinkedIn guest search failed ({_describe_exception(linkedin_error)}); "
-            f"search engine discovery failed ({_describe_exception(search_error)})"
-        ) from search_error
+    if (
+        not search_results
+        and linkedin_error is not None
+        and search_error is not None
+        and (not builtin_enabled or builtin_error is not None)
+    ):
+        failure_parts: list[str] = []
+        if builtin_enabled and builtin_error is not None:
+            failure_parts.append(f"Built In search failed ({_describe_exception(builtin_error)})")
+        failure_parts.append(f"LinkedIn guest search failed ({_describe_exception(linkedin_error)})")
+        failure_parts.append(f"search engine discovery failed ({_describe_exception(search_error)})")
+        raise LocalSearchBackendBlockedError("; ".join(failure_parts)) from search_error
 
     leads: list[JobLead] = []
     for url, title, snippet in search_results:

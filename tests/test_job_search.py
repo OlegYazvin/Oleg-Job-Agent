@@ -6240,31 +6240,15 @@ def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypa
     assert forced_calls == [(2, "forced_sample")]
 
 
-def test_search_single_query_local_filters_company_mismatched_builtin_leads_for_company_named_queries(
+def test_search_single_query_local_skips_builtin_backend_for_company_named_queries(
     monkeypatch,
 ) -> None:
     settings = build_settings()
-    matching = JobLead(
-        company_name="Duda",
-        role_title="Principal Product Manager, AI",
-        source_url="https://builtin.com/job/duda-ai/1",
-        source_type="builtin",
-        direct_job_url="https://jobs.lever.co/duda/abc123",
-        is_remote_hint=True,
-        posted_date_hint="today",
-        base_salary_min_usd_hint=220000,
-        evidence_notes="Remote AI product manager role.",
-    )
-    mismatched = matching.model_copy(
-        update={
-            "company_name": "Headway",
-            "source_url": "https://builtin.com/job/headway-ai/1",
-            "direct_job_url": "https://job-boards.greenhouse.io/headway/jobs/5627257004",
-        }
-    )
+    builtin_calls: list[str] = []
 
     async def fake_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
-        return [mismatched, matching]
+        builtin_calls.append(_query)
+        return []
 
     async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
         return []
@@ -6285,7 +6269,8 @@ def test_search_single_query_local_filters_company_mismatched_builtin_leads_for_
         )
     )
 
-    assert [lead.company_name for lead in leads] == ["Duda"]
+    assert builtin_calls == []
+    assert leads == []
 
 
 def test_search_single_query_local_skips_forced_ollama_sample_for_clean_direct_ats_bundle(monkeypatch) -> None:
