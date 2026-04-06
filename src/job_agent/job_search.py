@@ -5543,6 +5543,58 @@ def _board_resolution_candidate_score(expected_lead: JobLead, candidate_lead: Jo
     return score
 
 
+async def _enumerate_supported_board_leads(
+    board_identifier: str,
+    board_root: str,
+    company_name: str,
+) -> list[JobLead]:
+    prefix, _, token = board_identifier.partition(":")
+    if not prefix:
+        return []
+    try:
+        if prefix == "greenhouse" and token:
+            return [
+                candidate
+                for candidate in (
+                    _greenhouse_board_job_to_lead(token, company_name, job)
+                    for job in await _fetch_greenhouse_board_jobs(token)
+                )
+                if candidate is not None
+            ]
+        if prefix == "ashby" and token:
+            return [
+                candidate
+                for candidate in (
+                    _ashby_board_job_to_lead(token, company_name, job)
+                    for job in await _fetch_ashby_board_jobs(token)
+                )
+                if candidate is not None
+            ]
+        if prefix == "lever" and token:
+            return [
+                candidate
+                for candidate in (
+                    _lever_board_job_to_lead(token, company_name, job)
+                    for job in await _fetch_lever_board_jobs(token)
+                )
+                if candidate is not None
+            ]
+        if prefix == "smartrecruiters" and token:
+            return await _smartrecruiters_board_jobs_to_leads(token, company_name)
+        if prefix == "workday":
+            return [
+                candidate
+                for candidate in (
+                    _workday_board_job_to_lead(board_root, company_name, job)
+                    for job in await _fetch_workday_board_jobs(board_root)
+                )
+                if candidate is not None
+            ]
+    except Exception:
+        return []
+    return []
+
+
 async def _resolve_supported_board_job_url_from_lead(lead: JobLead) -> str | None:
     board_candidates: list[tuple[str, str]] = []
     seen_board_keys: set[tuple[str, str]] = set()
@@ -5563,49 +5615,7 @@ async def _resolve_supported_board_job_url_from_lead(lead: JobLead) -> str | Non
     best_url: str | None = None
     best_score = 0
     for board_identifier, board_root in board_candidates:
-        prefix, _, token = board_identifier.partition(":")
-        board_leads: list[JobLead] = []
-        try:
-            if prefix == "greenhouse" and token:
-                board_leads = [
-                    candidate
-                    for candidate in (
-                        _greenhouse_board_job_to_lead(token, lead.company_name, job)
-                        for job in await _fetch_greenhouse_board_jobs(token)
-                    )
-                    if candidate is not None
-                ]
-            elif prefix == "ashby" and token:
-                board_leads = [
-                    candidate
-                    for candidate in (
-                        _ashby_board_job_to_lead(token, lead.company_name, job)
-                        for job in await _fetch_ashby_board_jobs(token)
-                    )
-                    if candidate is not None
-                ]
-            elif prefix == "lever" and token:
-                board_leads = [
-                    candidate
-                    for candidate in (
-                        _lever_board_job_to_lead(token, lead.company_name, job)
-                        for job in await _fetch_lever_board_jobs(token)
-                    )
-                    if candidate is not None
-                ]
-            elif prefix == "smartrecruiters" and token:
-                board_leads = await _smartrecruiters_board_jobs_to_leads(token, lead.company_name)
-            elif prefix == "workday":
-                board_leads = [
-                    candidate
-                    for candidate in (
-                        _workday_board_job_to_lead(board_root, lead.company_name, job)
-                        for job in await _fetch_workday_board_jobs(board_root)
-                    )
-                    if candidate is not None
-                ]
-        except Exception:
-            continue
+        board_leads = await _enumerate_supported_board_leads(board_identifier, board_root, lead.company_name)
 
         for candidate_lead in board_leads:
             candidate_url = _normalize_direct_job_url(candidate_lead.direct_job_url or "")
@@ -5619,6 +5629,93 @@ async def _resolve_supported_board_job_url_from_lead(lead: JobLead) -> str | Non
     if best_score < 14:
         return None
     return best_url
+
+
+def _supported_board_name(board_identifier: str) -> str:
+    prefix, _, _token = board_identifier.partition(":")
+    names = {
+        "ashby": "Ashby",
+        "greenhouse": "Greenhouse",
+        "lever": "Lever",
+        "smartrecruiters": "SmartRecruiters",
+        "workday": "Workday",
+    }
+    return names.get(prefix, prefix.title() or "official board")
+
+
+async def _hydrate_supported_board_search_result(url: str, title: str, snippet: str, query: str) -> JobLead | None:
+    normalized_url = _normalize_direct_job_url(url)
+    if not normalized_url.startswith(("http://", "https://")):
+        return None
+    board_identifier = str(_extract_company_board_identifier(normalized_url) or board_identifier_from_url(normalized_url) or "").strip()
+    if not board_identifier:
+        return None
+    expected_lead = _build_lead_from_search_result(normalized_url, title, snippet, query)
+    if expected_lead is None:
+        return None
+    if expected_lead.source_type != "direct_ats":
+        return None
+
+    board_root = str(infer_careers_root(normalized_url) or normalized_url).strip()
+    company_hint = expected_lead.company_name
+    if not company_hint or company_hint == "Unknown":
+        company_hint = _company_hint_from_url(normalized_url) or "Unknown"
+    board_leads = await _enumerate_supported_board_leads(board_identifier, board_root, company_hint)
+    if not board_leads:
+        return None
+
+    normalized_title_role = _extract_role_company_from_title(title, normalized_url)[1]
+    search_job_key = _canonical_job_key(normalized_url)
+    best_match: JobLead | None = None
+    best_score = 0
+    exact_match = False
+    for candidate_lead in board_leads:
+        candidate_url = _normalize_direct_job_url(candidate_lead.direct_job_url or "")
+        if not candidate_url.startswith(("http://", "https://")):
+            continue
+        score = _board_resolution_candidate_score(expected_lead, candidate_lead)
+        candidate_job_key = _canonical_job_key(candidate_url)
+        candidate_exact_match = candidate_url == normalized_url or (
+            search_job_key is not None and candidate_job_key is not None and search_job_key == candidate_job_key
+        )
+        if candidate_exact_match:
+            score += 30
+        if normalized_title_role and _role_titles_align(normalized_title_role, candidate_lead.role_title):
+            score += 8
+        if candidate_lead.posted_date_hint:
+            score += 1
+        if candidate_lead.is_remote_hint is True:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_match = candidate_lead
+            exact_match = candidate_exact_match
+
+    if best_match is None:
+        return None
+    if exact_match:
+        threshold = 12
+    else:
+        threshold = 22
+    if best_score < threshold:
+        return None
+
+    board_name = _supported_board_name(board_identifier)
+    evidence_notes = " ".join(
+        part
+        for part in (
+            f"Hydrated from official {board_name} board data after search discovery of {normalized_url}.",
+            best_match.evidence_notes,
+        )
+        if part
+    )
+    return best_match.model_copy(
+        update={
+            "source_query": query,
+            "evidence_notes": evidence_notes,
+            "source_quality_score_hint": max(best_match.source_quality_score_hint or 0, 10),
+        }
+    )
 
 
 def _extract_greenhouse_board_token(url: str) -> str | None:
@@ -9721,12 +9818,19 @@ async def _search_single_query_local(
         failure_parts.append(f"search engine discovery failed ({_describe_exception(search_error)})")
         raise LocalSearchBackendBlockedError("; ".join(failure_parts)) from search_error
 
-    leads: list[JobLead] = []
-    for url, title, snippet in search_results:
-        lead = _build_lead_from_search_result(url, title, snippet, query)
-        if lead is None:
-            continue
-        leads.append(lead)
+    async def _lead_from_search_result(url: str, title: str, snippet: str) -> JobLead | None:
+        hydrated = await _hydrate_supported_board_search_result(url, title, snippet, query)
+        if hydrated is not None:
+            return hydrated
+        return _build_lead_from_search_result(url, title, snippet, query)
+
+    leads = [
+        lead
+        for lead in await asyncio.gather(
+            *(_lead_from_search_result(url, title, snippet) for url, title, snippet in search_results)
+        )
+        if lead is not None
+    ]
 
     builtin_leads = _normalize_and_filter_discovery_leads(builtin_leads, query)
     linkedin_leads = _normalize_and_filter_discovery_leads(linkedin_leads, query)

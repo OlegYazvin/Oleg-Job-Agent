@@ -68,6 +68,7 @@ from job_agent.job_search import (
     _is_duckduckgo_anomaly_page,
     _is_google_interstitial_page,
     _is_recent_enough,
+    _hydrate_supported_board_search_result,
     _persist_validated_jobs_checkpoint,
     _is_supported_discovery_source_url,
     _looks_like_careers_hub_url,
@@ -167,6 +168,10 @@ def build_settings() -> Settings:
         enable_progress_gui=False,
         ollama_inline_lead_refinement_enabled=True,
     )
+
+
+async def _no_hydrate_supported_board_search_result(*_args, **_kwargs) -> JobLead | None:
+    return None
 
 
 def test_allowed_direct_job_url_accepts_ats_hosts() -> None:
@@ -4635,6 +4640,49 @@ def test_build_lead_from_search_result_does_not_override_explicit_hybrid_signal_
     assert lead.is_remote_hint is False
 
 
+def test_hydrate_supported_board_search_result_prefers_exact_ashby_job_match(monkeypatch) -> None:
+    async def fake_fetch_ashby_board_jobs(_board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "title": "Principal Product Manager, AI",
+                "jobUrl": "https://jobs.ashbyhq.com/butterflymx/6f6f5da0-fb6c-4a6b-9fc1-21909f51f931",
+                "location": "US Remote",
+                "descriptionPlain": "Own the AI product strategy and roadmap.",
+                "isRemote": True,
+                "publishedAt": "2026-03-31T23:48:49.853+00:00",
+            },
+            {
+                "title": "Senior Product Manager, Operations",
+                "jobUrl": "https://jobs.ashbyhq.com/butterflymx/00000000-0000-0000-0000-000000000000",
+                "location": "New York, NY",
+                "descriptionPlain": "Operations product role.",
+                "isRemote": False,
+                "publishedAt": "2026-03-25T00:00:00.000+00:00",
+            },
+        ]
+
+    monkeypatch.setattr("job_agent.job_search._fetch_ashby_board_jobs", fake_fetch_ashby_board_jobs)
+
+    lead = asyncio.run(
+        _hydrate_supported_board_search_result(
+            "https://jobs.ashbyhq.com/butterflymx/6f6f5da0-fb6c-4a6b-9fc1-21909f51f931",
+            "ButterflyMX - Principal Product Manager, AI",
+            "US Remote role. Apply now.",
+            '"principal product manager" AI remote',
+        )
+    )
+
+    assert lead is not None
+    assert lead.company_name == "ButterflyMX"
+    assert lead.role_title == "Principal Product Manager, AI"
+    assert lead.source_url == "https://jobs.ashbyhq.com/butterflymx"
+    assert lead.direct_job_url == "https://jobs.ashbyhq.com/butterflymx/6f6f5da0-fb6c-4a6b-9fc1-21909f51f931"
+    assert lead.posted_date_hint == "2026-03-31"
+    assert lead.is_remote_hint is True
+    assert lead.source_query == '"principal product manager" AI remote'
+    assert "Hydrated from official Ashby board data" in lead.evidence_notes
+
+
 def test_dedupe_round_leads_keeps_best_source_for_same_role() -> None:
     settings = build_settings()
     linkedin = JobLead(
@@ -6486,6 +6534,7 @@ def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypa
     monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
     monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
     monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
@@ -6514,6 +6563,63 @@ def test_search_single_query_local_forces_one_ollama_sample_per_attempt(monkeypa
     assert forced_calls == [(2, "forced_sample")]
 
 
+def test_search_single_query_local_prefers_supported_board_hydration_before_snippet_builder(monkeypatch) -> None:
+    settings = build_settings()
+    hydrated_lead = JobLead(
+        company_name="ButterflyMX",
+        role_title="Principal Product Manager, AI",
+        source_url="https://jobs.ashbyhq.com/butterflymx",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.ashbyhq.com/butterflymx/6f6f5da0-fb6c-4a6b-9fc1-21909f51f931",
+        location_hint="US Remote",
+        posted_date_hint="2026-03-31",
+        is_remote_hint=True,
+        source_query='"principal product manager" AI remote',
+        evidence_notes="Hydrated from official Ashby board data after search discovery.",
+        source_quality_score_hint=10,
+    )
+
+    async def fake_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_local_search(_query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+        return [
+            (
+                hydrated_lead.direct_job_url or hydrated_lead.source_url,
+                "ButterflyMX - Principal Product Manager, AI",
+                "US Remote role.",
+            )
+        ]
+
+    async def fake_hydrate(url: str, title: str, snippet: str, query: str) -> JobLead | None:
+        assert "ButterflyMX" in title
+        return hydrated_lead
+
+    monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
+    monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
+    monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", fake_hydrate)
+    monkeypatch.setattr(
+        "job_agent.job_search._build_lead_from_search_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("snippet builder should not run for hydrated board results")),
+    )
+
+    leads, _average_confidence = asyncio.run(
+        _search_single_query_local(
+            settings,
+            '"principal product manager" AI remote',
+            attempt_number=1,
+            run_id="run-1",
+        )
+    )
+
+    assert len(leads) == 1
+    assert leads[0].direct_job_url == hydrated_lead.direct_job_url
+
+
 def test_search_single_query_local_skips_builtin_backend_for_company_named_queries(
     monkeypatch,
 ) -> None:
@@ -6533,6 +6639,7 @@ def test_search_single_query_local_skips_builtin_backend_for_company_named_queri
     monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
 
     leads, _average_confidence = asyncio.run(
         _search_single_query_local(
@@ -6580,6 +6687,7 @@ def test_search_single_query_local_skips_low_trust_listing_results_for_company_n
     monkeypatch.setattr("job_agent.job_search._builtin_search", fail_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: built_lead)
 
     leads, _average_confidence = asyncio.run(
@@ -6627,6 +6735,7 @@ def test_search_single_query_local_skips_low_trust_builtin_results_with_direct_u
     monkeypatch.setattr("job_agent.job_search._builtin_search", fail_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: built_lead)
 
     leads, _average_confidence = asyncio.run(
@@ -6702,6 +6811,7 @@ def test_search_single_query_local_skips_forced_ollama_sample_for_clean_direct_a
     monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
     monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
     monkeypatch.setattr("job_agent.job_search._refine_local_leads_with_ollama", fake_refine)
@@ -6772,6 +6882,7 @@ def test_search_single_query_local_uses_company_careers_trusted_bundle_early_ref
     monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
     monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -6843,6 +6954,7 @@ def test_search_single_query_local_uses_generic_clean_direct_bundle_early_refine
     monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: lead_map[url])
     monkeypatch.setattr("job_agent.job_search._ollama_refinement_mode_for_local_leads", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -6909,6 +7021,7 @@ def test_search_single_query_local_uses_trusted_direct_bundle_for_single_high_co
     monkeypatch.setattr("job_agent.job_search._builtin_search", fake_builtin_search)
     monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
     monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._hydrate_supported_board_search_result", _no_hydrate_supported_board_search_result)
     monkeypatch.setattr(
         "job_agent.job_search._build_lead_from_search_result",
         lambda url, title, snippet, query: lead,
