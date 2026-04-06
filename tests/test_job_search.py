@@ -96,6 +96,7 @@ from job_agent.job_search import (
     _replay_seed_leads,
     _refine_local_leads_with_ollama,
     _resolve_greenhouse_board_job_url_from_lead,
+    _resolve_lead_to_direct_job_url,
     _resolve_lead_via_company_careers_pages,
     _workday_board_job_to_lead,
     _salary_is_base_salary,
@@ -5452,6 +5453,68 @@ def test_resolve_lead_via_company_careers_pages_uses_builtin_company_slug_fallba
 
     assert resolution is not None
     assert resolution.direct_job_url == "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
+
+
+def test_resolve_lead_to_direct_job_url_prefers_company_careers_path_for_builtin_leads_without_direct_urls(
+    monkeypatch,
+) -> None:
+    lead = JobLead(
+        company_name="Domino Data Lab",
+        role_title="Principal Product Manager, AI Factory",
+        source_url="https://builtin.com/job/principal-product-manager-ai-factory/8208619",
+        source_type="builtin",
+        evidence_notes="Remote AI PM role with salary disclosure.",
+    )
+
+    async def fail_local_extract(_lead: JobLead) -> str | None:
+        raise AssertionError("Local Built In extraction should not run first for Built In leads without a direct URL.")
+
+    async def fake_company_careers_resolution(_lead: JobLead) -> DirectJobResolution | None:
+        return DirectJobResolution(
+            accepted=True,
+            direct_job_url="https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004",
+            ats_platform="job-boards.greenhouse.io",
+            evidence_notes="Resolved via company careers fallback.",
+        )
+
+    monkeypatch.setattr("job_agent.job_search._extract_direct_job_url_from_source", fail_local_extract)
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_via_company_careers_pages",
+        fake_company_careers_resolution,
+    )
+
+    resolution = asyncio.run(_resolve_lead_to_direct_job_url(None, lead))
+
+    assert resolution is not None
+    assert resolution.direct_job_url == "https://job-boards.greenhouse.io/dominodatalab/jobs/5624592004"
+
+
+def test_resolve_lead_to_direct_job_url_still_prefers_local_extract_for_direct_ats_leads(monkeypatch) -> None:
+    lead = JobLead(
+        company_name="Trusted Co",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.lever.co/trusted/abc123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/trusted/abc123",
+        evidence_notes="Direct ATS role.",
+    )
+
+    async def fake_local_extract(_lead: JobLead) -> str | None:
+        return "https://jobs.lever.co/trusted/abc123"
+
+    async def fail_company_careers_resolution(_lead: JobLead) -> DirectJobResolution | None:
+        raise AssertionError("Company careers fallback should not run after a successful local extract.")
+
+    monkeypatch.setattr("job_agent.job_search._extract_direct_job_url_from_source", fake_local_extract)
+    monkeypatch.setattr(
+        "job_agent.job_search._resolve_lead_via_company_careers_pages",
+        fail_company_careers_resolution,
+    )
+
+    resolution = asyncio.run(_resolve_lead_to_direct_job_url(None, lead))
+
+    assert resolution is not None
+    assert resolution.direct_job_url == "https://jobs.lever.co/trusted/abc123"
 
 
 def test_repair_direct_job_url_uses_company_careers_resolution_before_agent(monkeypatch) -> None:

@@ -10363,6 +10363,11 @@ async def _resolve_lead_via_company_careers_pages(lead: JobLead) -> DirectJobRes
 
 
 async def _resolve_lead_to_direct_job_url(agent: Agent | None, lead: JobLead) -> DirectJobResolution | None:
+    if lead.source_type == "builtin" and not lead.direct_job_url:
+        company_site_resolution = await _resolve_lead_via_company_careers_pages(lead)
+        if company_site_resolution:
+            return company_site_resolution
+
     locally_resolved_url = await _extract_direct_job_url_from_source(lead)
     if locally_resolved_url:
         return DirectJobResolution(
@@ -10372,9 +10377,10 @@ async def _resolve_lead_to_direct_job_url(agent: Agent | None, lead: JobLead) ->
             evidence_notes="Resolved locally from the discovered source page.",
         )
 
-    company_site_resolution = await _resolve_lead_via_company_careers_pages(lead)
-    if company_site_resolution:
-        return company_site_resolution
+    if lead.source_type != "builtin" or lead.direct_job_url:
+        company_site_resolution = await _resolve_lead_via_company_careers_pages(lead)
+        if company_site_resolution:
+            return company_site_resolution
 
     if agent is None:
         return None
