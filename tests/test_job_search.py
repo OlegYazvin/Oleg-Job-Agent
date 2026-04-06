@@ -4386,7 +4386,30 @@ def test_annotate_and_filter_resolution_leads_caps_low_trust_direct_candidates()
 
     ranked = _annotate_and_filter_resolution_leads([*low_trust_leads, trusted], settings, {})
 
-    assert [lead.company_name for lead in ranked] == ["Trusted Co", "Low Trust A", "Low Trust B"]
+    assert [lead.company_name for lead in ranked] == ["Trusted Co"]
+
+
+def test_annotate_and_filter_resolution_leads_allows_capped_low_trust_direct_candidates_without_trusted_alternatives() -> None:
+    settings = build_settings()
+    low_trust_leads = [
+        JobLead(
+            company_name=f"Low Trust {label}",
+            role_title="Senior Product Manager, AI",
+            source_url=f"https://builtin.com/job/low-trust-{label.lower()}/1",
+            source_type="builtin",
+            direct_job_url=f"https://jobs.lever.co/lowtrust{label.lower()}/abc123",
+            location_hint="Remote - United States",
+            posted_date_hint="today",
+            is_remote_hint=True,
+            salary_text_hint="$210,000 - $240,000",
+            evidence_notes="This role is fully remote with published salary.",
+        )
+        for label in ("A", "B", "C")
+    ]
+
+    ranked = _annotate_and_filter_resolution_leads(low_trust_leads, settings, {})
+
+    assert [lead.company_name for lead in ranked] == ["Low Trust A", "Low Trust B"]
 
 
 def test_annotate_and_filter_resolution_leads_skips_low_trust_company_named_query_intermediaries() -> None:

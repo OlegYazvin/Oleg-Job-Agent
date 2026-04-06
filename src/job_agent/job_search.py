@@ -2345,9 +2345,12 @@ def _annotate_and_filter_resolution_leads(
         )
     )
     capped: list[JobLead] = []
+    has_trusted_resolution_candidate = any(lead.source_type in {"direct_ats", "company_site"} for lead in annotated)
     low_trust_direct_count = 0
     for lead in annotated:
         if lead.source_type in {"builtin", "linkedin", "other"} and lead.direct_job_url:
+            if has_trusted_resolution_candidate:
+                continue
             if low_trust_direct_count >= MAX_LOW_TRUST_DIRECT_RESOLUTION_LEADS:
                 continue
             low_trust_direct_count += 1
