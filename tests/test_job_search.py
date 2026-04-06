@@ -4171,6 +4171,40 @@ def test_dedupe_round_leads_keeps_best_source_for_same_role() -> None:
     assert deduped == [direct]
 
 
+def test_dedupe_round_leads_limits_company_concentration() -> None:
+    settings = build_settings()
+    leads = [
+        JobLead(
+            company_name="ServiceNow",
+            role_title=f"Principal Product Manager, AI Variant {index}",
+            source_url=f"https://jobs.smartrecruiters.com/ServiceNow/{index}",
+            source_type="direct_ats",
+            direct_job_url=f"https://jobs.smartrecruiters.com/ServiceNow/{index}",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            evidence_notes="Direct ATS result.",
+        )
+        for index in range(4)
+    ]
+    leads.append(
+        JobLead(
+            company_name="Inspiren",
+            role_title="Principal Product Manager, AI",
+            source_url="https://jobs.ashbyhq.com/inspiren/123",
+            source_type="direct_ats",
+            direct_job_url="https://jobs.ashbyhq.com/inspiren/123",
+            is_remote_hint=True,
+            posted_date_hint="today",
+            evidence_notes="Direct ATS result.",
+        )
+    )
+
+    deduped = _dedupe_round_leads(leads, settings)
+
+    assert len([lead for lead in deduped if lead.company_name == "ServiceNow"]) == 3
+    assert any(lead.company_name == "Inspiren" for lead in deduped)
+
+
 def test_extract_linkedin_guest_search_leads_parses_public_cards() -> None:
     html = """
     <div class="base-search-card">

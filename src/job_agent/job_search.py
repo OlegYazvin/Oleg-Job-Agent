@@ -338,6 +338,7 @@ TIMEOUT_SENSITIVE_QUERY_MARKERS = (
     "site:wellfound.com/jobs",
 )
 TIMEOUT_SENSITIVE_QUERY_SKIP_THRESHOLD = 2
+MAX_ROUND_LEADS_PER_COMPANY = 3
 
 LOCAL_OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
 BUILTIN_PRIMARY_BASE_URL = "https://builtin.com"
@@ -8124,7 +8125,17 @@ def _dedupe_round_leads(leads: list[JobLead], settings: Settings) -> list[JobLea
         existing = best_by_role.get(role_key)
         if existing is None or _lead_priority(lead, settings) < _lead_priority(existing, settings):
             best_by_role[role_key] = lead
-    return sorted(best_by_role.values(), key=lambda lead: _lead_priority(lead, settings))
+    deduped = sorted(best_by_role.values(), key=lambda lead: _lead_priority(lead, settings))
+    balanced: list[JobLead] = []
+    company_counts: Counter[str] = Counter()
+    for lead in deduped:
+        company_key = _normalize_company_key(lead.company_name)
+        if company_key and company_counts[company_key] >= MAX_ROUND_LEADS_PER_COMPANY:
+            continue
+        if company_key:
+            company_counts[company_key] += 1
+        balanced.append(lead)
+    return balanced
 
 
 def _load_seed_leads_from_file(settings: Settings) -> list[JobLead]:
