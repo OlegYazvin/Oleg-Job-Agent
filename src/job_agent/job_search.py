@@ -2191,6 +2191,12 @@ def _should_skip_low_trust_direct_remote_lead(lead: JobLead) -> bool:
     return not _lead_has_explicit_broad_remote_evidence(lead)
 
 
+def _should_skip_low_trust_company_named_query_lead(lead: JobLead) -> bool:
+    if not _query_is_company_named_open_web_query(lead.source_query or ""):
+        return False
+    return _normalize_source_type(lead.source_url) in {"builtin", "linkedin", "glassdoor", "other"}
+
+
 def _lead_host_is_js_blank_prone(lead: JobLead) -> bool:
     host = (urlparse(lead.direct_job_url or lead.source_url).netloc or "").lower()
     return any(fragment in host for fragment in ("myworkdayjobs.com", "careers.workday.com", "getro.com"))
@@ -2320,6 +2326,8 @@ def _annotate_and_filter_resolution_leads(
     annotated: list[JobLead] = []
     for lead in leads:
         watchlist_entry = company_watchlist.get(_normalize_company_key(lead.company_name), {})
+        if _should_skip_low_trust_company_named_query_lead(lead):
+            continue
         if _watchlist_entry_should_skip_resolution(lead, settings, watchlist_entry):
             continue
         if _should_skip_low_trust_direct_remote_lead(lead):

@@ -4389,6 +4389,49 @@ def test_annotate_and_filter_resolution_leads_caps_low_trust_direct_candidates()
     assert [lead.company_name for lead in ranked] == ["Trusted Co", "Low Trust A", "Low Trust B"]
 
 
+def test_annotate_and_filter_resolution_leads_skips_low_trust_company_named_query_intermediaries() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Block",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/block-ai/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/block/abc123",
+        source_query='"Block Inc" "AI Product Manager" remote',
+        location_hint="Remote - United States",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="This role is fully remote with published salary.",
+    )
+
+    ranked = _annotate_and_filter_resolution_leads([lead], settings, {})
+
+    assert ranked == []
+
+
+def test_annotate_and_filter_resolution_leads_keeps_direct_ats_for_company_named_queries() -> None:
+    settings = build_settings()
+    lead = JobLead(
+        company_name="Block",
+        role_title="Senior Product Manager, AI",
+        source_url="https://jobs.lever.co/block/abc123",
+        source_type="direct_ats",
+        direct_job_url="https://jobs.lever.co/block/abc123",
+        source_query='"Block Inc" "AI Product Manager" remote',
+        location_hint="Remote - United States",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$220,000 - $260,000",
+        evidence_notes="Direct ATS role with explicit remote evidence.",
+    )
+
+    ranked = _annotate_and_filter_resolution_leads([lead], settings, {})
+
+    assert len(ranked) == 1
+    assert ranked[0].direct_job_url == "https://jobs.lever.co/block/abc123"
+
+
 def test_annotate_and_filter_resolution_leads_skips_repeat_not_remote_companies_without_broad_remote_override() -> None:
     settings = build_settings()
     listing_only_remote = JobLead(
