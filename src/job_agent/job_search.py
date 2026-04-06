@@ -4278,6 +4278,9 @@ Rules:
 
 def _normalize_and_filter_discovery_leads(leads: list[JobLead], query: str) -> list[JobLead]:
     normalized_leads: list[JobLead] = []
+    expected_company_marker = (
+        _company_focused_query_marker(query) if _query_is_company_named_open_web_query(query) else None
+    )
     for lead in leads:
         normalized_direct = _normalize_direct_job_url(lead.direct_job_url) if lead.direct_job_url else None
         normalized = lead.model_copy(
@@ -4297,6 +4300,17 @@ def _normalize_and_filter_discovery_leads(leads: list[JobLead], query: str) -> l
             continue
         if not _lead_is_ai_related_product_manager(normalized):
             continue
+        if expected_company_marker:
+            company_hints = [
+                normalized.company_name,
+                _company_hint_from_url(normalized.direct_job_url or ""),
+                _company_hint_from_url(normalized.source_url),
+            ]
+            if not any(
+                hint and _company_names_match(expected_company_marker, hint)
+                for hint in company_hints
+            ):
+                continue
 
         normalized_leads.append(normalized)
     return normalized_leads

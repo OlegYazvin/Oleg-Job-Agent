@@ -4141,6 +4141,32 @@ def test_normalize_and_filter_discovery_leads_keeps_supported_job_board_pages_wi
     assert len(normalized) == 1
 
 
+def test_normalize_and_filter_discovery_leads_skips_company_mismatches_for_company_named_open_web_queries() -> None:
+    matching = JobLead(
+        company_name="Block",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/block-ai/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/block/abc123",
+        is_remote_hint=True,
+        evidence_notes="Remote AI product manager role.",
+    )
+    mismatched = matching.model_copy(
+        update={
+            "company_name": "Headway",
+            "source_url": "https://builtin.com/job/headway-ai/1",
+            "direct_job_url": "https://job-boards.greenhouse.io/headway/jobs/5627257004",
+        }
+    )
+
+    normalized = _normalize_and_filter_discovery_leads(
+        [mismatched, matching],
+        '"Block Inc" "AI Product Manager" remote',
+    )
+
+    assert [lead.company_name for lead in normalized] == ["Block"]
+
+
 def test_build_lead_from_search_result_uses_title_or_url_for_remote_hint() -> None:
     lead = _build_lead_from_search_result(
         "https://jobs.twilio.com/careers/job/1099549995199-senior-product-manager-enterprise-ai-remote-us",
