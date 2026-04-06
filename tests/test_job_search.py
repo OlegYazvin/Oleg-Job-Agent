@@ -2431,6 +2431,16 @@ def test_builtin_paginated_category_urls_expand_page_numbers() -> None:
 def test_builtin_remote_hint_requires_explicit_remote_evidence() -> None:
     assert _extract_builtin_remote_hint("United States", "Product Manager, AI", source_is_remote_listing=True) is None
     assert _extract_builtin_remote_hint("Remote - United States", "Product Manager, AI", source_is_remote_listing=True) is True
+    assert _extract_builtin_remote_hint(
+        "United States",
+        "Collaborate with remote teams across the company.",
+        source_is_remote_listing=True,
+    ) is None
+    assert _extract_builtin_remote_hint(
+        "United States",
+        "This role is fully remote across the US.",
+        source_is_remote_listing=True,
+    ) is True
     assert _extract_builtin_remote_hint("San Francisco", "Hybrid AI product role", source_is_remote_listing=True) is False
 
 

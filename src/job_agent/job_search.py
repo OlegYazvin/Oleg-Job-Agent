@@ -7768,10 +7768,22 @@ def _extract_builtin_remote_hint(
     *,
     source_is_remote_listing: bool = False,
 ) -> bool | None:
-    haystack = " ".join(part for part in (location_text or "", description_text) if part).lower()
+    location_haystack = str(location_text or "").lower()
+    description_haystack = str(description_text or "").lower()
+    haystack = " ".join(part for part in (location_haystack, description_haystack) if part)
     if "hybrid" in haystack or "in-office" in haystack or "onsite" in haystack or "on-site" in haystack:
         return False
-    if "remote" in haystack or "work from home" in haystack:
+    if "remote" in location_haystack or "work from home" in location_haystack:
+        return True
+    strong_description_markers = (
+        *BROAD_REMOTE_OVERRIDE_MARKERS,
+        "location: remote",
+        "this role is remote",
+        "this position is remote",
+        "remote position",
+        "remote role",
+    )
+    if any(marker in description_haystack for marker in strong_description_markers):
         return True
     if source_is_remote_listing:
         return None
