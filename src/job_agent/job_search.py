@@ -4396,6 +4396,12 @@ def _normalize_and_filter_discovery_leads(leads: list[JobLead], query: str) -> l
 
         if not normalized.direct_job_url and not _is_supported_discovery_source_url(normalized.source_url):
             continue
+        if (
+            expected_company_marker
+            and normalized.source_type in {"builtin", "linkedin", "glassdoor", "other"}
+            and not normalized.direct_job_url
+        ):
+            continue
         if "product manager" not in normalized.role_title.lower():
             continue
         if not _lead_is_ai_related_product_manager(normalized):

@@ -4463,6 +4463,34 @@ def test_normalize_and_filter_discovery_leads_skips_company_mismatches_for_compa
     assert [lead.company_name for lead in normalized] == ["Block"]
 
 
+def test_normalize_and_filter_discovery_leads_skips_low_trust_listing_pages_for_company_named_queries() -> None:
+    listing_page = JobLead(
+        company_name="Block",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/block-ai/1",
+        source_type="builtin",
+        direct_job_url=None,
+        is_remote_hint=True,
+        evidence_notes="Built In listing page for a remote AI product manager role.",
+    )
+    direct_match = listing_page.model_copy(
+        update={
+            "source_url": "https://jobs.lever.co/block/abc123",
+            "source_type": "direct_ats",
+            "direct_job_url": "https://jobs.lever.co/block/abc123",
+            "evidence_notes": "Direct ATS role.",
+        }
+    )
+
+    normalized = _normalize_and_filter_discovery_leads(
+        [listing_page, direct_match],
+        '"Block Inc" "AI Product Manager" remote',
+    )
+
+    assert [lead.source_type for lead in normalized] == ["direct_ats"]
+    assert [lead.direct_job_url for lead in normalized] == ["https://jobs.lever.co/block/abc123"]
+
+
 def test_normalize_and_filter_discovery_leads_drops_jobicy_mirror_results() -> None:
     url = "https://jobicy.com/jobs/141212-principal-product-manager-ai-data"
     assert _is_allowed_direct_job_url(url) is False
@@ -6270,6 +6298,53 @@ def test_search_single_query_local_skips_builtin_backend_for_company_named_queri
     )
 
     assert builtin_calls == []
+    assert leads == []
+
+
+def test_search_single_query_local_skips_low_trust_listing_results_for_company_named_queries(
+    monkeypatch,
+) -> None:
+    settings = build_settings()
+
+    async def fail_builtin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        raise AssertionError("Built In backend should be skipped.")
+
+    async def fake_linkedin_search(_query: str, _settings: Settings) -> list[JobLead]:
+        return []
+
+    async def fake_local_search(_query: str, *, max_results_per_query: int) -> list[tuple[str, str, str]]:
+        return [
+            (
+                "https://builtin.com/job/block-ai/1",
+                "Senior Product Manager, AI - Block - Built In",
+                "Remote AI product manager role.",
+            )
+        ]
+
+    built_lead = JobLead(
+        company_name="Block",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/block-ai/1",
+        source_type="builtin",
+        direct_job_url=None,
+        is_remote_hint=True,
+        evidence_notes="Built In listing page.",
+    )
+
+    monkeypatch.setattr("job_agent.job_search._builtin_search", fail_builtin_search)
+    monkeypatch.setattr("job_agent.job_search._linkedin_guest_search", fake_linkedin_search)
+    monkeypatch.setattr("job_agent.job_search._run_local_search_engine_queries", fake_local_search)
+    monkeypatch.setattr("job_agent.job_search._build_lead_from_search_result", lambda url, title, snippet, query: built_lead)
+
+    leads, _average_confidence = asyncio.run(
+        _search_single_query_local(
+            settings,
+            '"Block Inc" "AI Product Manager" remote',
+            attempt_number=1,
+            run_id="run-1",
+        )
+    )
+
     assert leads == []
 
 
