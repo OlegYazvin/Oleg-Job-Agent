@@ -7716,7 +7716,7 @@ def _extract_builtin_remote_hint(
     if "remote" in haystack or "work from home" in haystack:
         return True
     if source_is_remote_listing:
-        return True
+        return None
     return None
 
 

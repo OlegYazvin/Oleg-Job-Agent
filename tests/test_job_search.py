@@ -2428,8 +2428,9 @@ def test_builtin_paginated_category_urls_expand_page_numbers() -> None:
     ]
 
 
-def test_builtin_remote_hint_trusts_remote_listing_context_unless_explicitly_negative() -> None:
-    assert _extract_builtin_remote_hint("United States", "Product Manager, AI", source_is_remote_listing=True) is True
+def test_builtin_remote_hint_requires_explicit_remote_evidence() -> None:
+    assert _extract_builtin_remote_hint("United States", "Product Manager, AI", source_is_remote_listing=True) is None
+    assert _extract_builtin_remote_hint("Remote - United States", "Product Manager, AI", source_is_remote_listing=True) is True
     assert _extract_builtin_remote_hint("San Francisco", "Hybrid AI product role", source_is_remote_listing=True) is False
 
 
@@ -4096,6 +4097,35 @@ def test_annotate_and_filter_resolution_leads_skips_repeat_stale_companies_witho
     with_override = _annotate_and_filter_resolution_leads([fresh_override], settings, watchlist)
     assert len(with_override) == 1
     assert with_override[0].company_name == "RepeatCo"
+
+
+def test_annotate_and_filter_resolution_leads_prefers_explicit_remote_evidence() -> None:
+    settings = build_settings()
+    explicit_remote = JobLead(
+        company_name="Remote Co",
+        role_title="Senior Product Manager, AI",
+        source_url="https://builtin.com/job/remote-co/1",
+        source_type="builtin",
+        direct_job_url="https://jobs.lever.co/remoteco/abc123",
+        posted_date_hint="today",
+        is_remote_hint=True,
+        salary_text_hint="$210,000 - $240,000",
+        evidence_notes="Remote AI product manager role with published salary.",
+    )
+    listing_only_remote = explicit_remote.model_copy(
+        update={
+            "company_name": "Listing Co",
+            "source_url": "https://builtin.com/job/listing-co/1",
+            "direct_job_url": "https://jobs.lever.co/listingco/abc123",
+            "is_remote_hint": None,
+            "evidence_notes": "AI product manager role discovered on a Built In remote listing.",
+        }
+    )
+
+    ranked = _annotate_and_filter_resolution_leads([listing_only_remote, explicit_remote], settings, {})
+
+    assert [lead.company_name for lead in ranked] == ["Remote Co", "Listing Co"]
+    assert ranked[0].source_quality_score_hint > ranked[1].source_quality_score_hint
 
 
 def test_normalize_and_filter_discovery_leads_keeps_supported_job_board_pages_without_direct_urls() -> None:
