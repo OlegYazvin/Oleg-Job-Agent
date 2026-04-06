@@ -6691,7 +6691,7 @@ async def _collect_company_discovery_seed_leads(
                 board_identifier=board_identifier,
                 source_kind="board_url",
                 source_trust=source_trust,
-                priority=max(priority, 9),
+                priority=max(0, int(priority)),
                 discovered_from=discovered_from,
             )
             

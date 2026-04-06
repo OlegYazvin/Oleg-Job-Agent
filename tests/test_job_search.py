@@ -7501,6 +7501,98 @@ def test_collect_company_discovery_seed_leads_prioritizes_novel_company_index_en
     assert leads[0].direct_job_url == "https://jobs.smartrecruiters.com/novel-co/novel-co-1-principal-product-manager-ai"
 
 
+def test_collect_company_discovery_seed_leads_demotes_saturated_reported_board_tasks(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = build_settings()
+    settings.project_root = tmp_path
+    settings.data_dir = tmp_path / "data"
+    settings.output_dir = tmp_path / "output"
+    settings.company_discovery_directory_crawl_budget_per_run = 0
+    settings.company_discovery_board_crawl_budget_per_run = 1
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_company_discovery_entries(
+        settings.data_dir,
+        {
+            "knownco": {
+                "company_key": "knownco",
+                "company_name": "Known Co",
+                "board_urls": ["https://jobs.smartrecruiters.com/known-co"],
+                "board_identifiers": ["smartrecruiters:known-co"],
+                "source_hosts": ["jobs.smartrecruiters.com"],
+                "source_trust": 9,
+                "official_board_lead_count": 120,
+                "recent_fresh_role_count": 120,
+                "board_crawl_success_count": 8,
+            },
+            "novelco": {
+                "company_key": "novelco",
+                "company_name": "Novel Co",
+                "board_urls": ["https://jobs.smartrecruiters.com/novel-co"],
+                "board_identifiers": ["smartrecruiters:novel-co"],
+                "source_hosts": ["jobs.smartrecruiters.com"],
+                "source_trust": 9,
+                "official_board_lead_count": 0,
+                "recent_fresh_role_count": 0,
+                "board_crawl_success_count": 0,
+            },
+        },
+    )
+
+    async def fake_fetch_smartrecruiters_board_jobs(board_token: str) -> list[dict[str, object]]:
+        return [
+            {
+                "id": f"{board_token}-1",
+                "name": "Principal Product Manager, AI",
+                "releasedDate": "2026-04-02T12:00:00.000Z",
+                "location": {"city": "Remote", "country": "us", "remote": True},
+                "company": {
+                    "identifier": board_token,
+                    "name": "Novel Co" if board_token == "novel-co" else "Known Co",
+                },
+            }
+        ]
+
+    async def fake_fetch_smartrecruiters_posting_detail(board_token: str, _posting_id: str) -> dict[str, object] | None:
+        company_name = "Novel Co" if board_token == "novel-co" else "Known Co"
+        return {
+            "company": {"identifier": board_token, "name": company_name},
+            "location": {"city": "Remote", "country": "us", "remote": True},
+            "jobAd": {
+                "sections": {
+                    "jobDescription": {
+                        "title": "Job Description",
+                        "text": f"Lead remote AI product strategy for {company_name}.",
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("job_agent.job_search._fetch_smartrecruiters_board_jobs", fake_fetch_smartrecruiters_board_jobs)
+    monkeypatch.setattr(
+        "job_agent.job_search._fetch_smartrecruiters_posting_detail",
+        fake_fetch_smartrecruiters_posting_detail,
+    )
+
+    leads, metrics = asyncio.run(
+        _collect_company_discovery_seed_leads(
+            settings,
+            discovery_agent=None,
+            run_id="run-company-discovery",
+            previously_reported_company_keys={"knownco"},
+        )
+    )
+
+    assert metrics["official_board_crawl_attempt_count"] == 1
+    assert metrics["official_board_leads_count"] == 1
+    assert len(leads) == 1
+    assert leads[0].company_name == "Novel Co"
+    assert leads[0].direct_job_url == "https://jobs.smartrecruiters.com/novel-co/novel-co-1-principal-product-manager-ai"
+
+
 def test_collect_company_discovery_seed_leads_uses_ollama_sidecar_for_nonstandard_careers_links(
     monkeypatch,
     tmp_path: Path,
