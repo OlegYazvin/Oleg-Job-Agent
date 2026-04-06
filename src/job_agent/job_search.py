@@ -682,7 +682,10 @@ def _unwrap_direct_job_url(url: str) -> str:
             candidate = decoded
             continue
 
-        parsed = urlparse(candidate)
+        try:
+            parsed = urlparse(candidate)
+        except ValueError:
+            break
         next_candidate: str | None = None
         for key, value in parse_qsl(parsed.query, keep_blank_values=True):
             if key.lower() not in REDIRECT_QUERY_PARAM_NAMES:
@@ -715,7 +718,10 @@ def _normalize_direct_job_url(url: str) -> str:
     unwrapped_url = _unwrap_direct_job_url(url)
     if not unwrapped_url:
         return ""
-    parsed = urlparse(unwrapped_url)
+    try:
+        parsed = urlparse(unwrapped_url)
+    except ValueError:
+        return ""
     host = (parsed.netloc or "").lower()
     path = parsed.path.rstrip("/")
     query = _strip_tracking_query_params(parsed.query)
@@ -745,7 +751,10 @@ def _normalize_direct_job_url(url: str) -> str:
     if not path:
         path = "/"
 
-    return urlunparse(parsed._replace(path=path, query=query, fragment=""))
+    try:
+        return urlunparse(parsed._replace(path=path, query=query, fragment=""))
+    except ValueError:
+        return ""
 
 
 def _direct_job_url_matches_expected_company(url: str, expected_company_name: str | None) -> bool:
