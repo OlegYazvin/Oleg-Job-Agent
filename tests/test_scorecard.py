@@ -294,6 +294,93 @@ def test_run_scorecard_history_bootstraps_from_run_artifacts(tmp_path: Path) -> 
     assert load_latest_run_scorecard(tmp_path).run_id == "run-boot"
 
 
+def test_load_latest_run_scorecard_repairs_stale_existing_entry_from_run_artifact(tmp_path: Path) -> None:
+    stale = build_run_scorecard(
+        run_id="run-repair",
+        status="completed",
+        generated_at=datetime(2026, 3, 31, 1, 20, 0),
+    )
+    save_run_scorecard(tmp_path, stale)
+    (tmp_path / "run-history.json").write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "run-repair",
+                    "status": "completed",
+                    "started_at": "2026-03-31T01:00:00+00:00",
+                    "ended_at": "2026-03-31T01:20:00+00:00",
+                    "jobs_found_by_search": 12,
+                    "jobs_kept_after_validation": 0,
+                    "novel_validated_jobs_count": 0,
+                    "reacquired_validated_jobs_count": 2,
+                    "total_current_validated_jobs_count": 2,
+                    "jobs_with_any_messages": 0,
+                    "message_docx_path": "/tmp/messages.docx",
+                    "summary_docx_path": "/tmp/summary.docx",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "run-20260331-012000.json").write_text(
+        json.dumps(
+            {
+                "manifest": {
+                    "run_id": "run-repair",
+                    "generated_at": "2026-03-31T01:20:00+00:00",
+                    "message_docx_path": "/tmp/messages.docx",
+                    "summary_docx_path": "/tmp/summary.docx",
+                    "jobs_found_by_search": 12,
+                    "jobs_kept_after_validation": 0,
+                    "novel_validated_jobs_count": 0,
+                    "reacquired_validated_jobs_count": 2,
+                    "total_current_validated_jobs_count": 2,
+                    "jobs_with_any_messages": 0,
+                },
+                "reacquired_jobs": [
+                    {"company_name": "Acme AI", "role_title": "Staff Product Manager, AI"},
+                    {"company_name": "Bravo AI", "role_title": "Principal Product Manager, AI"},
+                ],
+                "search_diagnostics": {
+                    "run_id": "run-repair",
+                    "minimum_qualifying_jobs": 5,
+                    "unique_leads_discovered": 12,
+                    "seed_replayed_lead_count": 3,
+                    "reacquisition_attempt_count": 2,
+                    "new_companies_discovered_count": 1,
+                    "official_board_leads_count": 4,
+                    "frontier_tasks_consumed_count": 5,
+                    "frontier_backlog_count": 9,
+                    "source_adapter_yields": {"directory_source": 2, "smartrecruiters": 4},
+                    "failures": [{"stage": "discovery", "reason_code": "query_timeout", "detail": "timed out"}],
+                    "passes": [{"attempt_number": 1, "unique_leads_discovered": 12, "qualifying_jobs": 0, "query_count": 7}],
+                    "near_misses": [],
+                    "false_negative_audit": [],
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    latest = load_latest_run_scorecard(tmp_path)
+    entries = load_run_scorecard_entries(tmp_path, bootstrap=False)
+
+    assert latest is not None
+    assert latest.run_id == "run-repair"
+    assert latest.outcome.unique_leads_discovered_count == 12
+    assert latest.outcome.fresh_new_leads_count == 7
+    assert latest.outcome.reacquired_validated_jobs_count == 2
+    assert latest.discovery.official_board_leads_count == 4
+    assert latest.discovery.frontier_backlog_count == 9
+    assert latest.discovery.query_timeout_count == 1
+    assert latest.discovery.source_adapter_yields["smartrecruiters"] == 4
+    assert entries[0].outcome.unique_leads_discovered_count == 12
+    latest_payload = json.loads((tmp_path / "run-scorecard-latest.json").read_text(encoding="utf-8"))
+    assert latest_payload["outcome"]["fresh_new_leads_count"] == 7
+
+
 def test_save_failed_run_scorecard_uses_matching_latest_artifacts(tmp_path: Path) -> None:
     (tmp_path / "search-diagnostics-latest.json").write_text(
         json.dumps(

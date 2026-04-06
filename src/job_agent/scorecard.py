@@ -25,6 +25,7 @@ from .models import (
 
 RUN_SCORECARD_LATEST_FILENAME = "run-scorecard-latest.json"
 RUN_SCORECARDS_HISTORY_FILENAME = "run-scorecards.jsonl"
+RUN_HISTORY_FILENAME = "run-history.json"
 ACTIONABLE_NEAR_MISS_REASON_CODES = {
     "missing_salary",
     "fetch_non_200",
@@ -140,6 +141,18 @@ def _reacquired_job_items(payload: Mapping[str, Any] | None) -> list[dict[str, A
     return [dict(item) for item in items if isinstance(item, Mapping)]
 
 
+def _artifact_reacquired_jobs_payload(artifact: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if not isinstance(artifact, Mapping):
+        return None
+    payload = artifact.get("reacquired_jobs_payload")
+    if isinstance(payload, Mapping):
+        return payload
+    items = artifact.get("reacquired_jobs")
+    if isinstance(items, list):
+        return {"items": items}
+    return None
+
+
 def _bundle_jobs(bundles: list[JobOutreachBundle] | list[Mapping[str, Any]] | None) -> list[dict[str, Any]]:
     if not bundles:
         return []
@@ -239,6 +252,56 @@ def _time_to_first_validated_job_seconds(status_payload: Mapping[str, Any] | Non
             continue
         return round(max(0.0, (event_time - started_at).total_seconds()), 3)
     return None
+
+
+def _scorecard_signal_total(scorecard: RunScorecard) -> int:
+    return sum(
+        (
+            int(scorecard.outcome.total_current_validated_jobs_count or 0),
+            int(scorecard.outcome.reacquired_validated_jobs_count or 0),
+            int(scorecard.outcome.validated_jobs_count or 0),
+            int(scorecard.outcome.unique_leads_discovered_count or 0),
+            int(scorecard.outcome.fresh_new_leads_count or 0),
+            int(scorecard.discovery.new_companies_discovered_count or 0),
+            int(scorecard.discovery.new_boards_discovered_count or 0),
+            int(scorecard.discovery.official_board_leads_count or 0),
+            int(scorecard.discovery.companies_with_ai_pm_leads_count or 0),
+            int(scorecard.discovery.frontier_tasks_consumed_count or 0),
+            int(scorecard.discovery.frontier_backlog_count or 0),
+            int(scorecard.discovery.executed_query_count or 0),
+            int(scorecard.discovery.query_timeout_count or 0),
+            int(scorecard.discovery.query_skipped_timeout_budget_count or 0),
+            int(scorecard.discovery.zero_yield_pass_count or 0),
+            sum(int(value or 0) for value in scorecard.discovery.source_adapter_yields.values()),
+            int(scorecard.validation.official_roles_missed_count or 0),
+            int(scorecard.validation.company_mismatch_count or 0),
+            int(scorecard.validation.not_specific_job_page_count or 0),
+            int(scorecard.validation.not_remote_count or 0),
+            int(bool(scorecard.message_docx_path)),
+            int(bool(scorecard.summary_docx_path)),
+            int(bool(scorecard.near_miss_docx_path)),
+            int(bool(scorecard.company_discovery_json_path)),
+            int(bool(scorecard.company_discovery_frontier_json_path)),
+            int(bool(scorecard.company_discovery_audit_json_path)),
+        )
+    )
+
+
+def _scorecard_has_less_signal(current: RunScorecard, candidate: RunScorecard) -> bool:
+    return _scorecard_signal_total(candidate) > _scorecard_signal_total(current)
+
+
+def _merge_preserved_scorecard_fields(current: RunScorecard, candidate: RunScorecard) -> RunScorecard:
+    coverage_retention_rate = current.validation.coverage_retention_rate
+    if coverage_retention_rate is None:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "validation": candidate.validation.model_copy(
+                update={"coverage_retention_rate": coverage_retention_rate}
+            )
+        }
+    )
 
 
 def build_run_scorecard(
@@ -539,6 +602,8 @@ def _bootstrap_run_scorecards(data_dir: Path) -> list[RunScorecard]:
     run_history = load_run_history_entries(data_dir)
     artifact_payloads: dict[str, dict[str, Any]] = {}
     for artifact_path in sorted(data_dir.glob("run-*.json")):
+        if artifact_path.name in {RUN_HISTORY_FILENAME, RUN_SCORECARD_LATEST_FILENAME}:
+            continue
         payload = _load_json(artifact_path, default={})
         if not isinstance(payload, dict):
             continue
@@ -552,7 +617,7 @@ def _bootstrap_run_scorecards(data_dir: Path) -> list[RunScorecard]:
     changed = False
     for entry in run_history:
         run_id = str(entry.get("run_id") or "").strip()
-        if not run_id or run_id in existing_entries:
+        if not run_id:
             continue
         artifact = artifact_payloads.get(run_id, {})
         manifest_payload = artifact.get("manifest") if isinstance(artifact.get("manifest"), Mapping) else None
@@ -561,7 +626,7 @@ def _bootstrap_run_scorecards(data_dir: Path) -> list[RunScorecard]:
             status=str(entry.get("status") or "completed"),
             manifest=manifest_payload,
             bundles=artifact.get("bundles") if isinstance(artifact.get("bundles"), list) else None,
-            reacquired_jobs_payload=artifact.get("reacquired_jobs_payload") if isinstance(artifact.get("reacquired_jobs_payload"), Mapping) else None,
+            reacquired_jobs_payload=_artifact_reacquired_jobs_payload(artifact),
             search_diagnostics=artifact.get("search_diagnostics") if isinstance(artifact.get("search_diagnostics"), Mapping) else None,
             near_miss_payload=artifact.get("near_misses") if isinstance(artifact.get("near_misses"), Mapping) else None,
             ollama_summary_payload=artifact.get("ollama_summary") if isinstance(artifact.get("ollama_summary"), Mapping) else None,
@@ -576,8 +641,14 @@ def _bootstrap_run_scorecards(data_dir: Path) -> list[RunScorecard]:
             },
             generated_at=_parse_datetime(str(entry.get("ended_at") or "").strip() or None),
         )
-        existing_entries[run_id] = scorecard
-        changed = True
+        existing = existing_entries.get(run_id)
+        if existing is None:
+            existing_entries[run_id] = scorecard
+            changed = True
+            continue
+        if _scorecard_has_less_signal(existing, scorecard):
+            existing_entries[run_id] = _merge_preserved_scorecard_fields(existing, scorecard)
+            changed = True
     ordered_entries = sorted(
         existing_entries.values(),
         key=lambda item: (
@@ -611,7 +682,17 @@ def load_latest_run_scorecard(data_dir: Path) -> RunScorecard | None:
     payload = _load_json(_scorecard_latest_path(data_dir), default=None)
     if isinstance(payload, Mapping):
         try:
-            return RunScorecard.model_validate(payload)
+            latest = RunScorecard.model_validate(payload)
+            entries = load_run_scorecard_entries(data_dir)
+            if entries:
+                current = entries[0]
+                if current.run_id != latest.run_id or _scorecard_has_less_signal(latest, current):
+                    _scorecard_latest_path(data_dir).write_text(
+                        json.dumps(current.model_dump(mode="json"), indent=2),
+                        encoding="utf-8",
+                    )
+                    return current
+            return latest
         except Exception:
             pass
     entries = load_run_scorecard_entries(data_dir)
